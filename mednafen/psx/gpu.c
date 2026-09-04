@@ -20,9 +20,9 @@
 #include "irq.h"
 #include "timer.h"
 #include "FastFIFO.h"
-#include <rthreads/rthreads.h>
 
 #include <retro_miscellaneous.h>
+#include <rthreads/rthreads.h>
 
 #if defined(__SSE2__)
 #include <emmintrin.h>
@@ -131,7 +131,6 @@ typedef struct CTEntry CTEntry;
  * TexCache entry sits inside a single line (see gpu.h). */
 MDFN_ALIGN(64) PS_GPU GPU;
 
-/* --- Threaded GPU Worker Subsystem --- */
 typedef enum
 {
    GPU_CMD_GP0,
@@ -145,11 +144,18 @@ typedef struct
    uint32_t addr;
 } gpu_cmd_t;
 
-#define GPU_QUEUE_SIZE (64 * 1024)
+#define GPU_QUEUE_SIZE (128 * 1024)
+#define GPU_QUEUE_MASK (GPU_QUEUE_SIZE - 1)
+
 static gpu_cmd_t gpu_queue[GPU_QUEUE_SIZE];
-static uint32_t gpu_queue_head = 0;
-static uint32_t gpu_queue_tail = 0;
-static volatile uint32_t gpu_queue_count = 0;
+static volatile uint32_t gpu_queue_head = 0;
+static volatile uint32_t gpu_queue_tail = 0;
+
+static volatile bool gpu_worker_idle = true;
+static volatile bool gpu_worker_running = false;
+static volatile bool gpu_worker_stopping = false;
+static volatile bool gpu_worker_enabled = true;
+static volatile bool gpu_worker_irq_pending = false;
 
 static slock_t *gpu_queue_lock = NULL;
 static scond_t *gpu_queue_not_empty = NULL;
@@ -157,16 +163,16 @@ static scond_t *gpu_queue_not_full = NULL;
 static scond_t *gpu_queue_drained = NULL;
 static sthread_t *gpu_thread = NULL;
 
-static bool gpu_worker_enabled = true;
-static bool gpu_worker_running = false;
-static bool gpu_worker_stopping = false;
-static bool gpu_worker_idle = true;
-static volatile bool gpu_worker_irq_pending = false;
-
 static void GPU_WriteGP0_Internal(uint32_t InData, uint32_t addr);
 static void GPU_WriteGP1_Internal(uint32_t V);
-static void GPU_Worker_QueueGP0(uint32_t data, uint32_t addr);
-static void GPU_Worker_QueueGP1(uint32_t data);
+static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr);
+
+static INLINE uint32_t GPU_Queue_Count(void)
+{
+   uint32_t h = gpu_queue_head;
+   uint32_t t = gpu_queue_tail;
+   return (h - t) & GPU_QUEUE_MASK;
+}
 
 /* Scratch handles for PS1-state save/load and resolution rescale.
  * Used as a swap buffer between the GPU.vram (which is at the current
@@ -611,6 +617,9 @@ static void Command_FBFill(PS_GPU* gpu, const uint32_t *cb)
 
    if (RectOverlapsDisplay(destX, destY, width, height))
       GPU.display_possibly_dirty = true;
+
+   if (gpu_worker_running && gpu->DrawTimeAvail < 0)
+      gpu->DrawTimeAvail = 0;
 }
 
 static void Command_FBCopy(PS_GPU* g, const uint32_t *cb)
@@ -681,6 +690,9 @@ static void Command_FBCopy(PS_GPU* g, const uint32_t *cb)
 
    if (RectOverlapsDisplay(destX, destY, width, height))
       GPU.display_possibly_dirty = true;
+
+   if (gpu_worker_running && g->DrawTimeAvail < 0)
+      g->DrawTimeAvail = 0;
 }
 
 static void Command_FBWrite(PS_GPU* g, const uint32_t *cb)
@@ -1212,9 +1224,6 @@ bool GPU_Init(bool pal_clock_and_tv,
 
    GPU.killQuadPart = 0;
 
-   if (gpu_worker_enabled)
-      GPU_Worker_Init();
-
    return true;
 }
 
@@ -1229,7 +1238,6 @@ void GPU_RecalcClockRatio(void) {
 
 void GPU_Destroy(void)
 {
-   GPU_Worker_Kill();
    free(GPU.vram);
    GPU.vram = NULL;
 }
@@ -1251,9 +1259,6 @@ void GPU_Destroy(void)
  */
 bool GPU_Rescale(uint8_t ushift)
 {
-   if (gpu_worker_enabled && gpu_worker_running)
-      GPU_Worker_Sync();
-
    uint16_t *old_vram = GPU.vram;
    uint8_t     old_shift = GPU.upscale_shift;
    uint16_t *new_vram;
@@ -1380,9 +1385,6 @@ static void GPU_SoftReset(void) /* Control command 0x00 */
 
 void GPU_Power(void)
 {
-   if (gpu_worker_enabled && gpu_worker_running)
-      GPU_Worker_Sync();
-
    memset(GPU.vram, 0, 512 * 1024 * UPSCALE(&GPU) * UPSCALE(&GPU) * sizeof(*GPU.vram));
 
    memset(GPU.CLUT_Cache, 0, sizeof(GPU.CLUT_Cache));
@@ -1619,6 +1621,9 @@ static void ProcessFIFO(uint32_t in_count)
       if (command->func[GPU.abr][GPU.TexMode])
          command->func[GPU.abr][GPU.TexMode | (GPU.MaskEvalAND ? 0x4 : 0x0)](&GPU, CB);
    }
+
+   if (gpu_worker_running && GPU.DrawTimeAvail < 0)
+      GPU.DrawTimeAvail = 0;
 }
 
 static INLINE void GPU_WriteCB(uint32_t InData, uint32_t addr)
@@ -1649,19 +1654,16 @@ static void GPU_WriteGP1_Internal(uint32_t V)
 
    switch(command)
    {
-      /*
-         0x40-0xFF do NOT appear to be mirrors, at least not on my PS1's GPU.
-         */
       default:
          break;
       case 0x00:  /* Reset GPU */
          GPU_SoftReset();
          rhi_intf_set_draw_area(GPU.ClipX0, GPU.ClipY0,
                                 GPU.ClipX1, GPU.ClipY1);
-         rhi_intf_toggle_display(GPU.DisplayOff); /* `true` set by GPU_SoftReset() */
-         rhi_intf_set_vram_framebuffer_coords(GPU.DisplayFB_XStart, GPU.DisplayFB_YStart); /* (0, 0) set by GPU_SoftReset() */
-         rhi_intf_set_horizontal_display_range(GPU.HorizStart, GPU.HorizEnd); /* 0x200, 0xC00 set by GPU_SoftReset() */
-         rhi_intf_set_vertical_display_range(GPU.VertStart, GPU.VertEnd); /* 0x10, 0x100 set by GPU_SoftReset() */
+         rhi_intf_toggle_display(GPU.DisplayOff);
+         rhi_intf_set_vram_framebuffer_coords(GPU.DisplayFB_XStart, GPU.DisplayFB_YStart);
+         rhi_intf_set_horizontal_display_range(GPU.HorizStart, GPU.HorizEnd);
+         rhi_intf_set_vertical_display_range(GPU.VertStart, GPU.VertEnd);
          RHI_UpdateDisplayMode();
          break;
 
@@ -1690,7 +1692,7 @@ static void GPU_WriteGP1_Internal(uint32_t V)
          break;
 
       case 0x05:  /* Start of display area in framebuffer */
-         GPU.DisplayFB_XStart = V & 0x3FE; /* Lower bit is apparently ignored. */
+         GPU.DisplayFB_XStart = V & 0x3FE;
          GPU.DisplayFB_YStart = (V >> 10) & 0x1FF;
          GPU.display_change_count++;
          rhi_intf_set_vram_framebuffer_coords(GPU.DisplayFB_XStart, GPU.DisplayFB_YStart);
@@ -1702,13 +1704,13 @@ static void GPU_WriteGP1_Internal(uint32_t V)
          rhi_intf_set_horizontal_display_range(GPU.HorizStart, GPU.HorizEnd);
          break;
 
-      case 0x07:
+      case 0x07:  /* Vertical display range */
          GPU.VertStart = V & 0x3FF;
          GPU.VertEnd = (V >> 10) & 0x3FF;
          rhi_intf_set_vertical_display_range(GPU.VertStart, GPU.VertEnd);
          break;
 
-      case 0x08:
+      case 0x08:  /* Display Mode */
          GPU.DisplayMode = V & 0xFF;
          RHI_UpdateDisplayMode();
          break;
@@ -1717,10 +1719,9 @@ static void GPU_WriteGP1_Internal(uint32_t V)
          GPU.TexDisableAllowChange = V & 1;
          break;
 
-      case 0x10:  /* GPU info(?) */
+      case 0x10:  /* GPU info */
          switch(V & 0xF)
          {
-            /* DataReadBuffer must remain unchanged for any unhandled GPU info index. */
             default:
                break;
             case 0x2:
@@ -1765,47 +1766,53 @@ static void gpu_worker_thread_loop(void *arg)
    (void)arg;
    while (1)
    {
-      gpu_cmd_t batch[64];
-      uint32_t batch_count = 0;
-
-      slock_lock(gpu_queue_lock);
-      while (gpu_queue_count == 0 && !gpu_worker_stopping)
+      if (gpu_queue_head == gpu_queue_tail)
       {
-         gpu_worker_idle = true;
-         scond_signal(gpu_queue_drained);
-         scond_wait(gpu_queue_not_empty, gpu_queue_lock);
-      }
-
-      if (gpu_worker_stopping && gpu_queue_count == 0)
-      {
-         gpu_worker_idle = true;
-         scond_signal(gpu_queue_drained);
+         slock_lock(gpu_queue_lock);
+         while (gpu_queue_head == gpu_queue_tail && !gpu_worker_stopping)
+         {
+            gpu_worker_idle = true;
+            scond_signal(gpu_queue_drained);
+            scond_wait(gpu_queue_not_empty, gpu_queue_lock);
+         }
+         if (gpu_worker_stopping && gpu_queue_head == gpu_queue_tail)
+         {
+            gpu_worker_idle = true;
+            scond_signal(gpu_queue_drained);
+            slock_unlock(gpu_queue_lock);
+            break;
+         }
+         gpu_worker_idle = false;
          slock_unlock(gpu_queue_lock);
-         break;
       }
 
       gpu_worker_idle = false;
-      batch_count = gpu_queue_count;
-      if (batch_count > 64)
-         batch_count = 64;
 
-      for (uint32_t i = 0; i < batch_count; i++)
+      uint32_t tail = gpu_queue_tail;
+      uint32_t head = gpu_queue_head;
+      uint32_t count = (head - tail) & GPU_QUEUE_MASK;
+      if (count > 256)
+         count = 256;
+
+      for (uint32_t i = 0; i < count; i++)
       {
-         batch[i] = gpu_queue[gpu_queue_tail];
-         gpu_queue_tail = (gpu_queue_tail + 1) % GPU_QUEUE_SIZE;
-      }
-      gpu_queue_count -= batch_count;
-
-      scond_signal(gpu_queue_not_full);
-      slock_unlock(gpu_queue_lock);
-
-      for (uint32_t i = 0; i < batch_count; i++)
-      {
-         if (batch[i].type == GPU_CMD_GP0)
-            GPU_WriteGP0_Internal(batch[i].data, batch[i].addr);
+         uint32_t idx = (tail + i) & GPU_QUEUE_MASK;
+         if (gpu_queue[idx].type == GPU_CMD_GP0)
+            GPU_WriteGP0_Internal(gpu_queue[idx].data, gpu_queue[idx].addr);
          else
-            GPU_WriteGP1_Internal(batch[i].data);
+            GPU_WriteGP1_Internal(gpu_queue[idx].data);
       }
+
+      gpu_queue_tail = (tail + count) & GPU_QUEUE_MASK;
+
+      slock_lock(gpu_queue_lock);
+      scond_signal(gpu_queue_not_full);
+      if (gpu_queue_head == gpu_queue_tail)
+      {
+         gpu_worker_idle = true;
+         scond_signal(gpu_queue_drained);
+      }
+      slock_unlock(gpu_queue_lock);
    }
 }
 
@@ -1814,8 +1821,11 @@ void GPU_Worker_Sync(void)
    if (!gpu_worker_running || !gpu_queue_lock)
       return;
 
+   if (gpu_queue_head == gpu_queue_tail && gpu_worker_idle)
+      return;
+
    slock_lock(gpu_queue_lock);
-   while (gpu_queue_count > 0 || !gpu_worker_idle)
+   while (gpu_queue_head != gpu_queue_tail || !gpu_worker_idle)
    {
       scond_wait(gpu_queue_drained, gpu_queue_lock);
    }
@@ -1829,7 +1839,6 @@ void GPU_Worker_Init(void)
 
    gpu_queue_head = 0;
    gpu_queue_tail = 0;
-   gpu_queue_count = 0;
    gpu_worker_idle = true;
    gpu_worker_stopping = false;
    gpu_worker_irq_pending = false;
@@ -1865,6 +1874,7 @@ void GPU_Worker_Kill(void)
       slock_lock(gpu_queue_lock);
       gpu_worker_stopping = true;
       scond_signal(gpu_queue_not_empty);
+      scond_signal(gpu_queue_not_full);
       slock_unlock(gpu_queue_lock);
    }
 
@@ -1907,46 +1917,34 @@ bool GPU_GetThreaded(void)
    return gpu_worker_enabled;
 }
 
-static void GPU_Worker_QueueGP0(uint32_t data, uint32_t addr)
+static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
 {
-   slock_lock(gpu_queue_lock);
-   while (gpu_queue_count >= GPU_QUEUE_SIZE && !gpu_worker_stopping)
+   while (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
    {
-      scond_wait(gpu_queue_not_full, gpu_queue_lock);
+      slock_lock(gpu_queue_lock);
+      if (gpu_worker_idle)
+         scond_signal(gpu_queue_not_empty);
+      if (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
+         scond_wait(gpu_queue_not_full, gpu_queue_lock);
+      slock_unlock(gpu_queue_lock);
    }
 
-   if (!gpu_worker_stopping)
+   if (gpu_worker_stopping)
+      return;
+
+   uint32_t head = gpu_queue_head;
+   gpu_queue[head].type = type;
+   gpu_queue[head].data = data;
+   gpu_queue[head].addr = addr;
+
+   gpu_queue_head = (head + 1) & GPU_QUEUE_MASK;
+
+   if (gpu_worker_idle)
    {
-      gpu_cmd_t *cmd = &gpu_queue[gpu_queue_head];
-      cmd->type = GPU_CMD_GP0;
-      cmd->data = data;
-      cmd->addr = addr;
-      gpu_queue_head = (gpu_queue_head + 1) % GPU_QUEUE_SIZE;
-      gpu_queue_count++;
+      slock_lock(gpu_queue_lock);
       scond_signal(gpu_queue_not_empty);
+      slock_unlock(gpu_queue_lock);
    }
-   slock_unlock(gpu_queue_lock);
-}
-
-static void GPU_Worker_QueueGP1(uint32_t data)
-{
-   slock_lock(gpu_queue_lock);
-   while (gpu_queue_count >= GPU_QUEUE_SIZE && !gpu_worker_stopping)
-   {
-      scond_wait(gpu_queue_not_full, gpu_queue_lock);
-   }
-
-   if (!gpu_worker_stopping)
-   {
-      gpu_cmd_t *cmd = &gpu_queue[gpu_queue_head];
-      cmd->type = GPU_CMD_GP1;
-      cmd->data = data;
-      cmd->addr = 0;
-      gpu_queue_head = (gpu_queue_head + 1) % GPU_QUEUE_SIZE;
-      gpu_queue_count++;
-      scond_signal(gpu_queue_not_empty);
-   }
-   slock_unlock(gpu_queue_lock);
 }
 
 void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
@@ -1956,18 +1954,24 @@ void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
 
    if(A & 4)   /* GP1 ("Control") */
    {
+      if ((V >> 24) == 0x02) /* Ack IRQ immediately on CPU thread as well */
+      {
+         gpu_worker_irq_pending = false;
+         GPU.IRQPending = false;
+         IRQ_Assert(IRQ_GPU, false);
+      }
       if (gpu_worker_enabled && gpu_worker_running)
       {
-         GPU_Worker_QueueGP1(V);
+         GPU_Worker_Push(GPU_CMD_GP1, V, 0);
          return;
       }
       GPU_WriteGP1_Internal(V);
    }
-   else     /* GP0 ("Data") */
+   else        /* GP0 ("Data") */
    {
       if (gpu_worker_enabled && gpu_worker_running)
       {
-         GPU_Worker_QueueGP0(V, A);
+         GPU_Worker_Push(GPU_CMD_GP0, V, A);
          return;
       }
       GPU_WriteGP0_Internal(V, A);
@@ -1978,7 +1982,7 @@ void GPU_WriteDMA(uint32_t V, uint32_t addr)
 {
    if (gpu_worker_enabled && gpu_worker_running)
    {
-      GPU_Worker_QueueGP0(V, addr);
+      GPU_Worker_Push(GPU_CMD_GP0, V, addr);
       return;
    }
    GPU_WriteGP0_Internal(V, addr);
@@ -2027,9 +2031,6 @@ uint32_t GPU_Read(const int32_t timestamp, uint32_t A)
 {
    uint32_t ret = 0;
 
-   if (gpu_worker_enabled && gpu_worker_running)
-      GPU_Worker_Sync();
-
 
    if(A & 4)   /* Status */
    {
@@ -2051,14 +2052,26 @@ uint32_t GPU_Read(const int32_t timestamp, uint32_t A)
       ret |= GPU.DisplayOff << 23;
 
       /* GPU idle bit */
-      if(GPU.InCmd == INCMD_NONE && GPU.DrawTimeAvail >= 0
-            && GPU_BlitterFIFO.in_count == 0x00)
-         ret |= 1 << 26;
+      if (gpu_worker_running)
+      {
+         if (GPU.InCmd == INCMD_NONE && GPU_BlitterFIFO.in_count == 0 &&
+             GPU_Queue_Count() == 0 && gpu_worker_idle)
+            ret |= 1 << 26;
+      }
+      else
+      {
+         if(GPU.InCmd == INCMD_NONE && GPU.DrawTimeAvail >= 0
+               && GPU_BlitterFIFO.in_count == 0x00)
+            ret |= 1 << 26;
+      }
 
       if(GPU.InCmd == INCMD_FBREAD) /* Might want to more accurately emulate this in the future? */
          ret |= (1 << 27);
 
-      ret |= CalcFIFOReadyBit() << 28;    /* FIFO has room bit? (kinda). */
+      if (gpu_worker_running)
+         ret |= (GPU_Queue_Count() < (GPU_QUEUE_SIZE - 1024)) << 28;
+      else
+         ret |= CalcFIFOReadyBit() << 28;    /* FIFO has room bit? (kinda). */
 
       /* */
       /* */
@@ -2080,6 +2093,12 @@ uint32_t GPU_Read(const int32_t timestamp, uint32_t A)
    }
    else     /* "Data" */
    {
+      if (gpu_worker_enabled && gpu_worker_running)
+      {
+         if (GPU.InCmd == INCMD_FBREAD || GPU_Queue_Count() > 0 || !gpu_worker_idle)
+            GPU_Worker_Sync();
+      }
+
       if(GPU.InCmd == INCMD_FBREAD)
          ret = GPU_ReadData();
       else
@@ -3213,7 +3232,7 @@ uint8_t GPU_get_upscale_shift(void)
 bool GPU_DMACanWrite(void)
 {
    if (gpu_worker_enabled && gpu_worker_running)
-      return (gpu_queue_count < GPU_QUEUE_SIZE - 256);
+      return (GPU_Queue_Count() < (GPU_QUEUE_SIZE - 1024));
    return CalcFIFOReadyBit();
 }
 
