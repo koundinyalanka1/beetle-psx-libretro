@@ -156,6 +156,7 @@ static volatile bool gpu_worker_running = false;
 static volatile bool gpu_worker_stopping = false;
 static volatile bool gpu_worker_enabled = true;
 static volatile bool gpu_worker_irq_pending = false;
+static volatile bool last_gpu_irq_state = false;
 
 static slock_t *gpu_queue_lock = NULL;
 static scond_t *gpu_queue_not_empty = NULL;
@@ -1677,7 +1678,10 @@ static void GPU_WriteGP1_Internal(uint32_t V)
       case 0x02:  /* Acknowledge IRQ */
          GPU.IRQPending = false;
          if (gpu_worker_running)
+         {
             gpu_worker_irq_pending = false;
+            last_gpu_irq_state = false;
+         }
          else
             IRQ_Assert(IRQ_GPU, GPU.IRQPending);
          break;
@@ -1842,6 +1846,7 @@ void GPU_Worker_Init(void)
    gpu_worker_idle = true;
    gpu_worker_stopping = false;
    gpu_worker_irq_pending = false;
+   last_gpu_irq_state = false;
 
    gpu_queue_lock = slock_new();
    gpu_queue_not_empty = scond_new();
@@ -1868,6 +1873,8 @@ void GPU_Worker_Kill(void)
 {
    if (!gpu_worker_running && !gpu_thread)
       return;
+
+   last_gpu_irq_state = false;
 
    if (gpu_queue_lock)
    {
@@ -1954,18 +1961,34 @@ void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
 
    if(A & 4)   /* GP1 ("Control") */
    {
-      if ((V >> 24) == 0x02) /* Ack IRQ immediately on CPU thread as well */
+      uint32_t command = V >> 24;
+      switch(command)
       {
-         gpu_worker_irq_pending = false;
-         GPU.IRQPending = false;
-         IRQ_Assert(IRQ_GPU, false);
+         case 0x00:  /* Reset GPU */
+         case 0x01:  /* Reset command buffer */
+         case 0x10:  /* GPU info (writes to DataReadBuffer) */
+            if (gpu_worker_enabled && gpu_worker_running)
+               GPU_Worker_Sync();
+            GPU_WriteGP1_Internal(V);
+            break;
+
+         case 0x02:  /* Acknowledge IRQ */
+            gpu_worker_irq_pending = false;
+            GPU.IRQPending = false;
+            IRQ_Assert(IRQ_GPU, false);
+            last_gpu_irq_state = false;
+            GPU_WriteGP1_Internal(V);
+            break;
+
+         case 0x04:  /* DMA Setup */
+            GPU.DMAControl = (V & 0x00FFFFFF) & 0x3;
+            GPU_WriteGP1_Internal(V);
+            break;
+
+         default:
+            GPU_WriteGP1_Internal(V);
+            break;
       }
-      if (gpu_worker_enabled && gpu_worker_running)
-      {
-         GPU_Worker_Push(GPU_CMD_GP1, V, 0);
-         return;
-      }
-      GPU_WriteGP1_Internal(V);
    }
    else        /* GP0 ("Data") */
    {
@@ -2005,7 +2028,11 @@ static INLINE uint32_t GPU_ReadData(void)
       if(GPU.FBRW_CurX == (GPU.FBRW_X + GPU.FBRW_W))
       {
          if((GPU.FBRW_CurY + 1) == (GPU.FBRW_Y + GPU.FBRW_H))
+         {
             GPU.InCmd = INCMD_NONE;
+            if(GPU_BlitterFIFO.in_count)
+               ProcessFIFO(GPU_BlitterFIFO.in_count);
+         }
          else
          {
             GPU.FBRW_CurY++;
@@ -2054,24 +2081,28 @@ uint32_t GPU_Read(const int32_t timestamp, uint32_t A)
       /* GPU idle bit */
       if (gpu_worker_running)
       {
-         if (GPU.InCmd == INCMD_NONE && GPU_BlitterFIFO.in_count == 0 &&
-             GPU_Queue_Count() == 0 && gpu_worker_idle)
+         if (GPU_Queue_Count() > 0 || !gpu_worker_idle)
+            GPU_Worker_Sync();
+
+         if (GPU.InCmd == INCMD_NONE && GPU_BlitterFIFO.in_count == 0)
             ret |= 1 << 26;
+
+         if (GPU.InCmd == INCMD_FBREAD)
+            ret |= (1 << 27);
+
+         ret |= (GPU_Queue_Count() < (GPU_QUEUE_SIZE - 1024)) << 28;
       }
       else
       {
          if(GPU.InCmd == INCMD_NONE && GPU.DrawTimeAvail >= 0
                && GPU_BlitterFIFO.in_count == 0x00)
             ret |= 1 << 26;
-      }
 
-      if(GPU.InCmd == INCMD_FBREAD) /* Might want to more accurately emulate this in the future? */
-         ret |= (1 << 27);
+         if(GPU.InCmd == INCMD_FBREAD) /* Might want to more accurately emulate this in the future? */
+            ret |= (1 << 27);
 
-      if (gpu_worker_running)
-         ret |= (GPU_Queue_Count() < (GPU_QUEUE_SIZE - 1024)) << 28;
-      else
          ret |= CalcFIFOReadyBit() << 28;    /* FIFO has room bit? (kinda). */
+      }
 
       /* */
       /* */
@@ -2299,7 +2330,6 @@ int32_t GPU_Update(const int32_t sys_timestamp)
 
    if(gpu_worker_running)
    {
-      static bool last_gpu_irq_state = false;
       if (gpu_worker_irq_pending != last_gpu_irq_state)
       {
          last_gpu_irq_state = gpu_worker_irq_pending;
@@ -3232,7 +3262,11 @@ uint8_t GPU_get_upscale_shift(void)
 bool GPU_DMACanWrite(void)
 {
    if (gpu_worker_enabled && gpu_worker_running)
+   {
+      if (GPU.InCmd & (INCMD_FBREAD | INCMD_FBWRITE | INCMD_PLINE | INCMD_QUAD))
+         return false;
       return (GPU_Queue_Count() < (GPU_QUEUE_SIZE - 1024));
+   }
    return CalcFIFOReadyBit();
 }
 

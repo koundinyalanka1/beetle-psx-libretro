@@ -1652,6 +1652,9 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
 
   void SPU_WriteDMA(uint32_t V)
 {
+   if (spu_worker_enabled && spu_worker_running)
+      SPU_Worker_Sync();
+
    SPU_WriteSPURAM(RWAddr, V);
    RWAddr = (RWAddr + 1) & 0x3FFFF;
 
@@ -1664,6 +1667,9 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
 
   uint32_t SPU_ReadDMA(void)
 {
+   if (spu_worker_enabled && spu_worker_running)
+      SPU_Worker_Sync();
+
    uint32_t ret = (uint16_t)SPU_ReadSPURAM(RWAddr);
    RWAddr = (RWAddr + 1) & 0x3FFFF;
 
@@ -2071,6 +2077,9 @@ void SPU_Kill(void)
 
   uint16_t SPU_Read(int32_t timestamp, uint32_t A)
 {
+   if (spu_worker_enabled && spu_worker_running)
+      SPU_Worker_Sync();
+
    A &= 0x3FF;
 
    if(A >= 0x200)

@@ -1489,7 +1489,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
          { "run_interpreter", "Lightrec Interpreter" },
          { NULL, NULL },
       },
-      "execute"
+      "disabled"
    },
    {
       BEETLE_OPT(dynarec_invalidate),
