@@ -91,6 +91,7 @@
 #include "irq.h"
 #include "cdc.h"
 #include "spu.h"
+#include <rthreads/rthreads.h>
 
 uint32_t IntermediateBufferPos;
 int16_t IntermediateBuffer[4096][2];
@@ -466,6 +467,59 @@ static int32_t clock_divider;
 
 static uint16_t SPURAM[524288 / sizeof(uint16_t)];
 
+/* --- Threaded SPU Worker Subsystem --- */
+typedef enum
+{
+   SPU_CMD_SYNTH,
+   SPU_CMD_WRITE,
+   SPU_CMD_WRITE_DMA
+} spu_cmd_type_t;
+
+typedef struct
+{
+   uint8_t type;
+   uint16_t a;
+   uint32_t v;
+   int32_t sample_clocks;
+   int32_t cda[16][2];
+} spu_cmd_t;
+
+#define SPU_QUEUE_SIZE 4096
+static spu_cmd_t spu_queue[SPU_QUEUE_SIZE];
+static uint32_t spu_queue_head = 0;
+static uint32_t spu_queue_tail = 0;
+static uint32_t spu_queue_count = 0;
+
+static slock_t *spu_queue_lock = NULL;
+static scond_t *spu_queue_not_empty = NULL;
+static scond_t *spu_queue_not_full = NULL;
+static scond_t *spu_queue_drained = NULL;
+static sthread_t *spu_thread = NULL;
+
+static bool spu_worker_enabled = true;
+static bool spu_worker_running = false;
+static bool spu_worker_stopping = false;
+static bool spu_worker_idle = true;
+static volatile bool spu_worker_irq_pending = false;
+
+static INLINE void SPU_TriggerIRQ(void)
+{
+   IRQAsserted = true;
+   if (spu_worker_running)
+      spu_worker_irq_pending = true;
+   else
+      IRQ_Assert(IRQ_SPU, true);
+}
+
+static void SPU_SynthesizeSamples_Internal(int32_t sample_clocks, const int32_t cda[16][2]);
+static void SPU_Write_Internal(uint32_t A, uint16_t V);
+static void SPU_WriteDMA_Internal(uint32_t V);
+static uint16_t SPU_Read_Internal(int32_t timestamp, uint32_t A);
+static uint32_t SPU_ReadDMA_Internal(void);
+static void SPU_Worker_QueueWrite(uint32_t A, uint16_t V);
+static void SPU_Worker_QueueWriteDMA(uint32_t V);
+static void SPU_Worker_QueueSynth(int32_t sample_clocks, const int32_t cda[16][2]);
+
 /* Forward declarations for SPU_Sweep operations; defined further down. */
 static INLINE void SPU_Sweep_Power(SPU_Sweep *sweep);
 static INLINE void SPU_Sweep_WriteControl(SPU_Sweep *sweep, uint16_t value);
@@ -480,6 +534,8 @@ static INLINE void SPU_WR_RVB(uint16_t raw_offs, int16_t sample);
   void SPU_Power(void)
 {
    int i;
+   if (spu_worker_enabled && spu_worker_running)
+      SPU_Worker_Sync();
    clock_divider = 768;
 
    memset(SPURAM, 0, sizeof(SPURAM));
@@ -685,8 +741,7 @@ static void SPU_RunDecoder(SPU_Voice *voice)
          unsigned test_addr = (voice->CurAddr - 1) & 0x3FFFF;
          if(IRQAddr == test_addr || IRQAddr == (test_addr & 0x3FFF8))
          {
-            IRQAsserted = true;
-            IRQ_Assert(IRQ_SPU, IRQAsserted);
+            SPU_TriggerIRQ();
          }
       }
       return;
@@ -724,8 +779,7 @@ static void SPU_RunDecoder(SPU_Voice *voice)
       unsigned test_addr = voice->CurAddr & 0x3FFFF;
       if(IRQAddr == test_addr || IRQAddr == (test_addr & 0x3FFF8))
       {
-         IRQAsserted = true;
-         IRQ_Assert(IRQ_SPU, IRQAsserted);
+         SPU_TriggerIRQ();
       }
    }
 
@@ -913,8 +967,7 @@ static INLINE void SPU_CheckIRQAddr(uint32_t addr)
       if(IRQAddr != addr)
          return;
 
-      IRQAsserted = true;
-      IRQ_Assert(IRQ_SPU, IRQAsserted);
+      SPU_TriggerIRQ();
    }
 }
 
@@ -1243,17 +1296,9 @@ static INLINE void SPU_RunNoise(void)
    }
 }
 
-  int32_t SPU_UpdateFromCDC(int32_t clocks)
+static void SPU_SynthesizeSamples_Internal(int32_t sample_clocks, const int32_t cda[16][2])
 {
-   int32_t sample_clocks = 0;
-
-   clock_divider -= clocks;
-
-   while(clock_divider <= 0)
-   {
-      clock_divider += spu_samples*768;
-      sample_clocks += spu_samples;
-   }
+   int cda_idx = 0;
 
    while(sample_clocks > 0)
    {
@@ -1520,7 +1565,17 @@ static INLINE void SPU_RunNoise(void)
          int32_t cdav[2];
          unsigned i;
 
-         CDC_GetCDAudioSample(cda_raw);
+         if (cda)
+         {
+            int idx = (cda_idx < 16) ? cda_idx : 15;
+            cda_raw[0] = cda[idx][0];
+            cda_raw[1] = cda[idx][1];
+            cda_idx++;
+         }
+         else
+         {
+            CDC_GetCDAudioSample(cda_raw);
+         }
 
          SPU_WriteSPURAM(CWA | 0x000, cda_raw[0]);
          SPU_WriteSPURAM(CWA | 0x200, cda_raw[1]);
@@ -1610,11 +1665,47 @@ static INLINE void SPU_RunNoise(void)
             GlobalSweep[lr].Current = (GlobalSweep[lr].Control & 0x7FFF) << 1;
       }
    }
+}
+
+int32_t SPU_UpdateFromCDC(int32_t clocks)
+{
+   int32_t sample_clocks = 0;
+
+   clock_divider -= clocks;
+
+   while(clock_divider <= 0)
+   {
+      clock_divider += spu_samples*768;
+      sample_clocks += spu_samples;
+   }
+
+   if (spu_worker_enabled && spu_worker_running)
+   {
+      while (sample_clocks > 0)
+      {
+         int chunk = (sample_clocks > 16) ? 16 : sample_clocks;
+         int32_t cda[16][2];
+         for (int i = 0; i < chunk; i++)
+            CDC_GetCDAudioSample(cda[i]);
+         SPU_Worker_QueueSynth(chunk, cda);
+         sample_clocks -= chunk;
+      }
+
+      if (spu_worker_irq_pending)
+      {
+         spu_worker_irq_pending = false;
+         IRQ_Assert(IRQ_SPU, true);
+      }
+
+      return clock_divider;
+   }
+
+   SPU_SynthesizeSamples_Internal(sample_clocks, NULL);
 
    return clock_divider;
 }
 
-  void SPU_WriteDMA(uint32_t V)
+static void SPU_WriteDMA_Internal(uint32_t V)
 {
    SPU_WriteSPURAM(RWAddr, V);
    RWAddr = (RWAddr + 1) & 0x3FFFF;
@@ -1622,11 +1713,20 @@ static INLINE void SPU_RunNoise(void)
    SPU_WriteSPURAM(RWAddr, V >> 16);
    RWAddr = (RWAddr + 1) & 0x3FFFF;
 
-
    SPU_CheckIRQAddr(RWAddr);
 }
 
-  uint32_t SPU_ReadDMA(void)
+void SPU_WriteDMA(uint32_t V)
+{
+   if (spu_worker_enabled && spu_worker_running)
+   {
+      SPU_Worker_QueueWriteDMA(V);
+      return;
+   }
+   SPU_WriteDMA_Internal(V);
+}
+
+static uint32_t SPU_ReadDMA_Internal(void)
 {
    uint32_t ret = (uint16_t)SPU_ReadSPURAM(RWAddr);
    RWAddr = (RWAddr + 1) & 0x3FFFF;
@@ -1636,8 +1736,234 @@ static INLINE void SPU_RunNoise(void)
 
    SPU_CheckIRQAddr(RWAddr);
 
-
    return(ret);
+}
+
+uint32_t SPU_ReadDMA(void)
+{
+   if (spu_worker_enabled && spu_worker_running)
+      SPU_Worker_Sync();
+   return SPU_ReadDMA_Internal();
+}
+
+static void spu_worker_thread_loop(void *arg)
+{
+   (void)arg;
+   while (1)
+   {
+      spu_cmd_t batch[32];
+      uint32_t batch_count = 0;
+
+      slock_lock(spu_queue_lock);
+      while (spu_queue_count == 0 && !spu_worker_stopping)
+      {
+         spu_worker_idle = true;
+         scond_signal(spu_queue_drained);
+         scond_wait(spu_queue_not_empty, spu_queue_lock);
+      }
+
+      if (spu_worker_stopping && spu_queue_count == 0)
+      {
+         spu_worker_idle = true;
+         scond_signal(spu_queue_drained);
+         slock_unlock(spu_queue_lock);
+         break;
+      }
+
+      spu_worker_idle = false;
+      batch_count = spu_queue_count;
+      if (batch_count > 32)
+         batch_count = 32;
+
+      for (uint32_t i = 0; i < batch_count; i++)
+      {
+         batch[i] = spu_queue[spu_queue_tail];
+         spu_queue_tail = (spu_queue_tail + 1) % SPU_QUEUE_SIZE;
+      }
+      spu_queue_count -= batch_count;
+
+      scond_signal(spu_queue_not_full);
+      slock_unlock(spu_queue_lock);
+
+      for (uint32_t i = 0; i < batch_count; i++)
+      {
+         switch (batch[i].type)
+         {
+            case SPU_CMD_SYNTH:
+               SPU_SynthesizeSamples_Internal(batch[i].sample_clocks, batch[i].cda);
+               break;
+            case SPU_CMD_WRITE:
+               SPU_Write_Internal(batch[i].a, (uint16_t)batch[i].v);
+               break;
+            case SPU_CMD_WRITE_DMA:
+               SPU_WriteDMA_Internal(batch[i].v);
+               break;
+         }
+      }
+   }
+}
+
+void SPU_Worker_Sync(void)
+{
+   if (!spu_worker_running || !spu_queue_lock)
+      return;
+
+   slock_lock(spu_queue_lock);
+   while (spu_queue_count > 0 || !spu_worker_idle)
+   {
+      scond_wait(spu_queue_drained, spu_queue_lock);
+   }
+   slock_unlock(spu_queue_lock);
+}
+
+void SPU_Worker_Init(void)
+{
+   if (spu_worker_running)
+      return;
+
+   spu_queue_head = 0;
+   spu_queue_tail = 0;
+   spu_queue_count = 0;
+   spu_worker_idle = true;
+   spu_worker_stopping = false;
+   spu_worker_irq_pending = false;
+
+   spu_queue_lock = slock_new();
+   spu_queue_not_empty = scond_new();
+   spu_queue_not_full = scond_new();
+   spu_queue_drained = scond_new();
+
+   if (!spu_queue_lock || !spu_queue_not_empty || !spu_queue_not_full || !spu_queue_drained)
+   {
+      SPU_Worker_Kill();
+      return;
+   }
+
+   spu_thread = sthread_create(spu_worker_thread_loop, NULL);
+   if (!spu_thread)
+   {
+      SPU_Worker_Kill();
+      return;
+   }
+
+   spu_worker_running = true;
+}
+
+void SPU_Worker_Kill(void)
+{
+   if (!spu_worker_running && !spu_thread)
+      return;
+
+   if (spu_queue_lock)
+   {
+      slock_lock(spu_queue_lock);
+      spu_worker_stopping = true;
+      scond_signal(spu_queue_not_empty);
+      slock_unlock(spu_queue_lock);
+   }
+
+   if (spu_thread)
+   {
+      sthread_join(spu_thread);
+      spu_thread = NULL;
+   }
+
+   if (spu_queue_lock) { slock_free(spu_queue_lock); spu_queue_lock = NULL; }
+   if (spu_queue_not_empty) { scond_free(spu_queue_not_empty); spu_queue_not_empty = NULL; }
+   if (spu_queue_not_full) { scond_free(spu_queue_not_full); spu_queue_not_full = NULL; }
+   if (spu_queue_drained) { scond_free(spu_queue_drained); spu_queue_drained = NULL; }
+
+   spu_worker_running = false;
+   spu_worker_stopping = false;
+}
+
+void SPU_SetThreaded(bool enabled)
+{
+   if (spu_worker_enabled == enabled)
+      return;
+
+   if (spu_worker_running)
+   {
+      SPU_Worker_Sync();
+      if (!enabled)
+         SPU_Worker_Kill();
+   }
+   else if (enabled)
+   {
+      SPU_Worker_Init();
+   }
+
+   spu_worker_enabled = enabled;
+}
+
+bool SPU_GetThreaded(void)
+{
+   return spu_worker_enabled;
+}
+
+static void SPU_Worker_QueueWrite(uint32_t A, uint16_t V)
+{
+   slock_lock(spu_queue_lock);
+   while (spu_queue_count >= SPU_QUEUE_SIZE && !spu_worker_stopping)
+   {
+      scond_wait(spu_queue_not_full, spu_queue_lock);
+   }
+
+   if (!spu_worker_stopping)
+   {
+      spu_cmd_t *cmd = &spu_queue[spu_queue_head];
+      cmd->type = SPU_CMD_WRITE;
+      cmd->a = (uint16_t)A;
+      cmd->v = V;
+      spu_queue_head = (spu_queue_head + 1) % SPU_QUEUE_SIZE;
+      spu_queue_count++;
+      scond_signal(spu_queue_not_empty);
+   }
+   slock_unlock(spu_queue_lock);
+}
+
+static void SPU_Worker_QueueWriteDMA(uint32_t V)
+{
+   slock_lock(spu_queue_lock);
+   while (spu_queue_count >= SPU_QUEUE_SIZE && !spu_worker_stopping)
+   {
+      scond_wait(spu_queue_not_full, spu_queue_lock);
+   }
+
+   if (!spu_worker_stopping)
+   {
+      spu_cmd_t *cmd = &spu_queue[spu_queue_head];
+      cmd->type = SPU_CMD_WRITE_DMA;
+      cmd->v = V;
+      spu_queue_head = (spu_queue_head + 1) % SPU_QUEUE_SIZE;
+      spu_queue_count++;
+      scond_signal(spu_queue_not_empty);
+   }
+   slock_unlock(spu_queue_lock);
+}
+
+static void SPU_Worker_QueueSynth(int32_t sample_clocks, const int32_t cda[16][2])
+{
+   slock_lock(spu_queue_lock);
+   while (spu_queue_count >= SPU_QUEUE_SIZE && !spu_worker_stopping)
+   {
+      scond_wait(spu_queue_not_full, spu_queue_lock);
+   }
+
+   if (!spu_worker_stopping)
+   {
+      spu_cmd_t *cmd = &spu_queue[spu_queue_head];
+      cmd->type = SPU_CMD_SYNTH;
+      cmd->sample_clocks = sample_clocks;
+      if (cda)
+         memcpy(cmd->cda, cda, sizeof(int32_t) * 2 * ((sample_clocks > 16) ? 16 : sample_clocks));
+      else
+         memset(cmd->cda, 0, sizeof(cmd->cda));
+      spu_queue_head = (spu_queue_head + 1) % SPU_QUEUE_SIZE;
+      spu_queue_count++;
+      scond_signal(spu_queue_not_empty);
+   }
+   slock_unlock(spu_queue_lock);
 }
 
 /*
@@ -1687,13 +2013,17 @@ void SPU_Init(void)
 
    IntermediateBufferPos = 0;
    memset(IntermediateBuffer, 0, sizeof(IntermediateBuffer));
+
+   if (spu_worker_enabled)
+      SPU_Worker_Init();
 }
 
-  void SPU_Kill(void)
+void SPU_Kill(void)
 {
+   SPU_Worker_Kill();
 }
 
-  void SPU_Write(int32_t timestamp, uint32_t A, uint16_t V)
+static void SPU_Write_Internal(uint32_t A, uint16_t V)
 {
    A &= 0x3FF;
 
@@ -1863,7 +2193,18 @@ void SPU_Init(void)
    regs.Regs[(A & 0x1FF) >> 1] = V;
 }
 
-  uint16_t SPU_Read(int32_t timestamp, uint32_t A)
+void SPU_Write(int32_t timestamp, uint32_t A, uint16_t V)
+{
+   (void)timestamp;
+   if (spu_worker_enabled && spu_worker_running)
+   {
+      SPU_Worker_QueueWrite(A, V);
+      return;
+   }
+   SPU_Write_Internal(A, V);
+}
+
+static uint16_t SPU_Read_Internal(int32_t timestamp, uint32_t A)
 {
    A &= 0x3FF;
 
@@ -1928,8 +2269,17 @@ void SPU_Init(void)
    return(regs.Regs[(A & 0x1FF) >> 1]);
 }
 
+uint16_t SPU_Read(int32_t timestamp, uint32_t A)
+{
+   if (spu_worker_enabled && spu_worker_running)
+      SPU_Worker_Sync();
+   return SPU_Read_Internal(timestamp, A);
+}
+
   int SPU_StateAction(StateMem *sm, int load, int data_only)
 {
+   if (spu_worker_enabled && spu_worker_running)
+      SPU_Worker_Sync();
    static SFORMAT StateRegs[] =
    {
 #define SFSWEEP(r) SFVAR((r).Control),	\

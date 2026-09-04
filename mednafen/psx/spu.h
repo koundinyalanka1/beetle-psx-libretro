@@ -103,4 +103,10 @@ int32_t  SPU_UpdateFromCDC(int32_t clocks);
 
 int      SPU_StateAction(StateMem *sm, int load, int data_only);
 
+void     SPU_Worker_Sync(void);
+void     SPU_Worker_Init(void);
+void     SPU_Worker_Kill(void);
+void     SPU_SetThreaded(bool enabled);
+bool     SPU_GetThreaded(void);
+
 #endif

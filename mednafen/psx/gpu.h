@@ -329,6 +329,12 @@ int GPU_StateAction(StateMem *sm, int load, int data_only);
 
 void GPU_set_visible_scanlines(int sls, int sle); // Beetle PSX addition
 
+void GPU_Worker_Sync(void);
+void GPU_Worker_Init(void);
+void GPU_Worker_Kill(void);
+void GPU_SetThreaded(bool enabled);
+bool GPU_GetThreaded(void);
+
 #ifdef __cplusplus
 }
 #endif

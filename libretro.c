@@ -4545,6 +4545,18 @@ static void check_variables(bool startup)
    }
 #endif
 
+   var.key = BEETLE_OPT(threaded_spu);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      SPU_SetThreaded(strcmp(var.value, "disabled") != 0);
+   else
+      SPU_SetThreaded(true);
+
+   var.key = BEETLE_OPT(threaded_gpu);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      GPU_SetThreaded(strcmp(var.value, "disabled") != 0);
+   else
+      GPU_SetThreaded(true);
+
 #ifdef HAVE_LIGHTREC
    var.key = BEETLE_OPT(cpu_dynarec);
 
@@ -6263,6 +6275,9 @@ bool retro_load_game(const struct retro_game_info *info)
 
 void retro_unload_game(void)
 {
+   GPU_Worker_Kill();
+   SPU_Worker_Kill();
+
    VCD_SetMode(VCD_MODE_OFF);
    VCD_Reset();
 
@@ -6578,7 +6593,10 @@ void retro_run(void)
     * and psx_gpu_rasterize_both_fields - this is the safe point
     * to read VRAM since rasterisation for this frame is finished
     * and the frontend hasn't yet read the surface for display. */
+   GPU_Worker_Sync();
    GPU_FlushDeferredScanout();
+
+   SPU_Worker_Sync();
 
    espec->SoundBufSize = IntermediateBufferPos;
    IntermediateBufferPos = 0;
@@ -6809,10 +6827,16 @@ void retro_run(void)
       vcd_fb = VCD_GetVideo(&vcd_w, &vcd_h, &vcd_pitch);
 
       if (vcd_fb)
+      {
+         GPU_Worker_Sync();
          rhi_intf_finalize_frame(vcd_fb, vcd_w, vcd_h, (unsigned)vcd_pitch);
+      }
       else
+      {
+         GPU_Worker_Sync();
          rhi_intf_finalize_frame(NULL, width, height,
                MEDNAFEN_CORE_GEOMETRY_MAX_W << (2 + upscale_shift));
+      }
 
       if (audio_batch_cb)
       {
@@ -6825,6 +6849,7 @@ void retro_run(void)
    }
    else
    {
+   GPU_Worker_Sync();
    rhi_intf_finalize_frame(fb, width, height,
 		   MEDNAFEN_CORE_GEOMETRY_MAX_W << (2 + upscale_shift));
 
@@ -6842,6 +6867,10 @@ void retro_run(void)
    /* LED interface */
    if (led_state_cb)
       retro_led_interface();
+
+   #if defined(__GNUC__) || defined(__clang__)
+   __sync_synchronize();
+   #endif
 }
 
 void retro_get_system_info(struct retro_system_info *info)
@@ -6879,6 +6908,9 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
  * caused subtle misbehavior. */
 void retro_deinit(void)
 {
+   GPU_Worker_Kill();
+   SPU_Worker_Kill();
+
    VCD_Kill();
 
    if (surf)
@@ -7072,6 +7104,9 @@ bool retro_serialize(void *data, size_t size)
    bool     ret;
    uint8_t *scratch;
 
+   GPU_Worker_Sync();
+   SPU_Worker_Sync();
+
    if (!data || size == 0)
       return false;
 
@@ -7119,6 +7154,9 @@ bool retro_serialize(void *data, size_t size)
 
 bool retro_unserialize(const void *data, size_t size)
 {
+   GPU_Worker_Sync();
+   SPU_Worker_Sync();
+
    /* The fog sidecar ring is keyed by a push counter that restarts with the
     * loaded state while counts inside RAM shadows survive; stale slots must
     * not satisfy post-load lookups. */

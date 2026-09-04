@@ -206,6 +206,34 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       },
       "disabled"
    },
+   {
+      BEETLE_OPT(threaded_spu),
+      "Threaded SPU (Audio)",
+      NULL,
+      "Offload SPU audio synthesis and mixing to an asynchronous worker thread. Eliminates audio-related CPU stalls on multicore systems.",
+      NULL,
+      "system",
+      {
+         { "disabled", NULL },
+         { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "enabled"
+   },
+   {
+      BEETLE_OPT(threaded_gpu),
+      "Threaded GPU (Graphics)",
+      NULL,
+      "Offload GPU drawing commands and DMA processing to an asynchronous worker thread. Eliminates rendering-related CPU bottlenecks on multicore systems.",
+      NULL,
+      "system",
+      {
+         { "disabled", NULL },
+         { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "enabled"
+   },
 #ifndef EMSCRIPTEN
    {
       BEETLE_OPT(cd_access_method),

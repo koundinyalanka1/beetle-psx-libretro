@@ -5884,7 +5884,9 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
 
 
          ImageHandle last_scanout;
-         ImageHandle reuseable_scanout;
+#define RHI_SCANOUT_RING_SIZE 3
+         ImageHandle reuseable_scanout[RHI_SCANOUT_RING_SIZE];
+         unsigned scanout_ring_index;
          /* Analog path intermediates. sig holds the modulated signal at the
           * CRTC base clock, sep the separated luma/chroma; both are RG16F and
           * bipolar (composite swings negative and the comb produces negative
@@ -5896,7 +5898,7 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
          ImageHandle analog_sep;
          ImageHandle analog_dec;   /* decoded (luma,C1,C2) at base rate */
          ImageHandle analog_rgb;   /* after the chroma trap, RGB at base rate */
-         ImageHandle analog_out;
+         ImageHandle analog_out[RHI_SCANOUT_RING_SIZE];
          /* Running subcarrier phase, in cycles, kept in [0,1).
           *
           * Advanced once per field by the field's *total* line count times the
@@ -5969,12 +5971,12 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
    {
       commandbuffer_end_render_pass(cbh_get(&self->cmd));
 
-      commandbuffer_image_barrier(cbh_get(&self->cmd), ih_get(&self->reuseable_scanout), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      commandbuffer_image_barrier(cbh_get(&self->cmd), ih_get(&self->reuseable_scanout[self->scanout_ring_index]), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                          VK_ACCESS_SHADER_READ_BIT);
 
-      ih_assign(&self->last_scanout, &self->reuseable_scanout);
+      ih_assign(&self->last_scanout, &self->reuseable_scanout[self->scanout_ring_index]);
    }
    static ImageHandle renderer_scanout_to_texture(Renderer *self);
    static VkFormat renderer_hdr_scanout_format(Renderer *self);
@@ -6558,7 +6560,11 @@ static void renderer_init(Renderer *self,
    opaque_queue_init(&self->queue);
    imageview_vec_init(&self->scaled_views); /* was default-constructed; now a plain struct */
    self->last_scanout.data            = NULL;
-   self->reuseable_scanout.data       = NULL;
+   { unsigned _ri; for (_ri = 0; _ri < RHI_SCANOUT_RING_SIZE; _ri++) {
+      self->reuseable_scanout[_ri].data = NULL;
+      self->analog_out[_ri].data        = NULL;
+   } }
+   self->scanout_ring_index           = 0;
    fbatlas_init(&self->atlas);
    self->tracker = NULL; /* created below via texture_tracker_new once the GPU backend is up */
    /* Sanity check settings, 16x IR with 16x MSAA will exhaust most GPUs VRAM alone. */
@@ -7567,17 +7573,17 @@ static ImageHandle renderer_scanout_vram_to_texture(Renderer *self, bool scaled)
 
    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
    info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-   ih_move(&self->reuseable_scanout, device_create_image(self->device, &info, NULL));
+   ih_move(&self->reuseable_scanout[self->scanout_ring_index], device_create_image(self->device, &info, NULL));
 
    render_pass_info_defaults(&rp);
-   rp.color_attachments[0] = image_get_view(ih_get(&self->reuseable_scanout));
+   rp.color_attachments[0] = image_get_view(ih_get(&self->reuseable_scanout[self->scanout_ring_index]));
    rp.num_color_attachments = 1;
    rp.store_attachments = 1;
 
    memset(&rp.clear_color[0], 0, sizeof(rp.clear_color[0]));
    rp.clear_attachments = 1;
 
-   commandbuffer_image_barrier(cbh_get(&self->cmd), ih_get(&self->reuseable_scanout), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+   commandbuffer_image_barrier(cbh_get(&self->cmd), ih_get(&self->reuseable_scanout[self->scanout_ring_index]), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 
@@ -7659,7 +7665,7 @@ static ImageHandle renderer_scanout_vram_to_texture(Renderer *self, bool scaled)
 
    renderer_finish_reuseable_scanout(self);
 
-   return self->reuseable_scanout;
+   return self->reuseable_scanout[self->scanout_ring_index];
    }
    }
    }
@@ -7763,7 +7769,7 @@ static ImageHandle renderer_analog_apply(Renderer *self, unsigned native_w, unsi
    const float field_adv = (float)self->analog_phase;
 
    if (out_w == 0 || out_h == 0 || sig_w == 0 || sig_h == 0)
-      return self->reuseable_scanout;
+      return self->reuseable_scanout[self->scanout_ring_index];
 
    /* ---- pass 0: resolve supersampling down to native ----
     * Skipped at 1x, where the scanout already is native. */
@@ -7797,7 +7803,7 @@ static ImageHandle renderer_analog_apply(Renderer *self, unsigned native_w, unsi
       commandbuffer_set_viewport(cbh_get(&self->cmd), &vp);
       commandbuffer_set_program(cbh_get(&self->cmd), self->pipelines.analog_downsample);
       commandbuffer_set_texture_view_stock(cbh_get(&self->cmd), 0, 0,
-         image_get_view(ih_get(&self->reuseable_scanout)), StockSampler_NearestClamp);
+         image_get_view(ih_get(&self->reuseable_scanout[self->scanout_ring_index])), StockSampler_NearestClamp);
       commandbuffer_push_constants(cbh_get(&self->cmd), &push, 0, sizeof(push));
       commandbuffer_set_vertex_binding(cbh_get(&self->cmd), 0, bh_get(&self->quad), 0, 8, VK_VERTEX_INPUT_RATE_VERTEX);
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 0, 0, VK_FORMAT_R32G32_SFLOAT, 0);
@@ -7822,7 +7828,7 @@ static ImageHandle renderer_analog_apply(Renderer *self, unsigned native_w, unsi
          psx_hdr_active ? renderer_hdr_scanout_format(self) : VK_FORMAT_R8G8B8A8_UNORM);
    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
    info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-   ih_move(&self->analog_out, device_create_image(self->device, &info, NULL));
+   ih_move(&self->analog_out[self->scanout_ring_index], device_create_image(self->device, &info, NULL));
    }
 
    /* ---- RGB/SCART: one band-limit pass, then straight to the resolve ----
@@ -7864,7 +7870,7 @@ static ImageHandle renderer_analog_apply(Renderer *self, unsigned native_w, unsi
          pal ? self->pipelines.analog_rgb_pal : self->pipelines.analog_rgb);
       commandbuffer_set_texture_view_stock(cbh_get(&self->cmd), 0, 0,
          image_get_view(resolve_ss ? ih_get(&self->analog_native)
-                                   : ih_get(&self->reuseable_scanout)), StockSampler_NearestClamp);
+                                   : ih_get(&self->reuseable_scanout[self->scanout_ring_index])), StockSampler_NearestClamp);
       commandbuffer_push_constants(cbh_get(&self->cmd), &push, 0, sizeof(push));
       commandbuffer_set_vertex_binding(cbh_get(&self->cmd), 0, bh_get(&self->quad), 0, 8, VK_VERTEX_INPUT_RATE_VERTEX);
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 0, 0, VK_FORMAT_R32G32_SFLOAT, 0);
@@ -7921,7 +7927,7 @@ static ImageHandle renderer_analog_apply(Renderer *self, unsigned native_w, unsi
       pal ? self->pipelines.analog_encode_pal : self->pipelines.analog_encode);
    commandbuffer_set_texture_view_stock(cbh_get(&self->cmd), 0, 0,
       image_get_view(resolve_ss ? ih_get(&self->analog_native)
-                                : ih_get(&self->reuseable_scanout)), StockSampler_NearestClamp);
+                                : ih_get(&self->reuseable_scanout[self->scanout_ring_index])), StockSampler_NearestClamp);
    commandbuffer_push_constants(cbh_get(&self->cmd), &push, 0, sizeof(push));
    commandbuffer_set_vertex_binding(cbh_get(&self->cmd), 0, bh_get(&self->quad), 0, 8, VK_VERTEX_INPUT_RATE_VERTEX);
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 0, 0, VK_FORMAT_R32G32_SFLOAT, 0);
@@ -8146,13 +8152,13 @@ resolve:
    push.shoulder         = psx_hdr_shoulder;
    push.src_primaries    = psx_src_primaries;
 
-   commandbuffer_image_barrier(cbh_get(&self->cmd), ih_get(&self->analog_out),
+   commandbuffer_image_barrier(cbh_get(&self->cmd), ih_get(&self->analog_out[self->scanout_ring_index]),
       VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 
    render_pass_info_defaults(&rp);
-   rp.color_attachments[0]  = image_get_view(ih_get(&self->analog_out));
+   rp.color_attachments[0]  = image_get_view(ih_get(&self->analog_out[self->scanout_ring_index]));
    rp.num_color_attachments = 1;
    rp.store_attachments     = 1;
    commandbuffer_begin_render_pass(cbh_get(&self->cmd), &rp, VK_SUBPASS_CONTENTS_INLINE);
@@ -8170,14 +8176,14 @@ resolve:
    commandbuffer_set_primitive_topology(cbh_get(&self->cmd), VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
    commandbuffer_draw(cbh_get(&self->cmd), 4, 1, 0, 0);
    commandbuffer_end_render_pass(cbh_get(&self->cmd));
-   commandbuffer_image_barrier(cbh_get(&self->cmd), ih_get(&self->analog_out),
+   commandbuffer_image_barrier(cbh_get(&self->cmd), ih_get(&self->analog_out[self->scanout_ring_index]),
       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
       VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
    }
 
-   ih_assign(&self->last_scanout, &self->analog_out);
-   return self->analog_out;
+   ih_assign(&self->last_scanout, &self->analog_out[self->scanout_ring_index]);
+   return self->analog_out[self->scanout_ring_index];
 }
 
 static VkFormat renderer_hdr_scanout_format(Renderer *self)
@@ -8239,22 +8245,22 @@ static ImageHandle renderer_scanout_to_texture(Renderer *self)
       info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
       info.usage =
           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-      ih_move(&self->reuseable_scanout, device_create_image(self->device, &info, NULL));
+      ih_move(&self->reuseable_scanout[self->scanout_ring_index], device_create_image(self->device, &info, NULL));
 
       { RenderPassInfo rp;
       render_pass_info_defaults(&rp);
-      rp.color_attachments[0] = image_get_view(ih_get(&self->reuseable_scanout));
+      rp.color_attachments[0] = image_get_view(ih_get(&self->reuseable_scanout[self->scanout_ring_index]));
       rp.num_color_attachments = 1;
       rp.clear_attachments = 1;
       rp.store_attachments = 1;
 
-      commandbuffer_image_barrier(cbh_get(&self->cmd), ih_get(&self->reuseable_scanout), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      commandbuffer_image_barrier(cbh_get(&self->cmd), ih_get(&self->reuseable_scanout[self->scanout_ring_index]), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 
       commandbuffer_begin_render_pass(cbh_get(&self->cmd), &rp, VK_SUBPASS_CONTENTS_INLINE);
       renderer_finish_reuseable_scanout(self);
-      return self->reuseable_scanout;
+      return self->reuseable_scanout[self->scanout_ring_index];
       }
       }
    }
@@ -8361,10 +8367,10 @@ static ImageHandle renderer_scanout_to_texture(Renderer *self)
 
    info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
    info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-   ih_move(&self->reuseable_scanout, device_create_image(self->device, &info, NULL));
+   ih_move(&self->reuseable_scanout[self->scanout_ring_index], device_create_image(self->device, &info, NULL));
 
    render_pass_info_defaults(&rp);
-   rp.color_attachments[0] = image_get_view(ih_get(&self->reuseable_scanout));
+   rp.color_attachments[0] = image_get_view(ih_get(&self->reuseable_scanout[self->scanout_ring_index]));
    rp.num_color_attachments = 1;
    rp.store_attachments = 1;
 
@@ -8372,7 +8378,7 @@ static ImageHandle renderer_scanout_to_texture(Renderer *self)
    /* rp.clear_color[0] = {60.0f/256.0f, 230.0f/256.0f, 60.0f/256.0f, 0}; */
    rp.clear_attachments = 1;
 
-   commandbuffer_image_barrier(cbh_get(&self->cmd), ih_get(&self->reuseable_scanout), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+   commandbuffer_image_barrier(cbh_get(&self->cmd), ih_get(&self->reuseable_scanout[self->scanout_ring_index]), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 
@@ -8636,7 +8642,7 @@ static ImageHandle renderer_scanout_to_texture(Renderer *self)
             display_rect.height * render_scale);
    }
 
-   return self->reuseable_scanout;
+   return self->reuseable_scanout[self->scanout_ring_index];
    }
    }
    }
@@ -10421,7 +10427,10 @@ static void renderer_fini(Renderer *self)
    ih_reset(&self->framebuffer_ssaa);
    ih_reset(&self->dither_lut);
    ih_reset(&self->last_scanout);
-   ih_reset(&self->reuseable_scanout);
+   { unsigned _ri; for (_ri = 0; _ri < RHI_SCANOUT_RING_SIZE; _ri++) {
+      ih_reset(&self->reuseable_scanout[_ri]);
+      ih_reset(&self->analog_out[_ri]);
+   } }
    /* Analog path intermediates. These are recreated every frame, so ih_move
     * drops the previous one and nothing accumulates while running - but this
     * list is what releases the last set, and it is maintained by hand. */
@@ -10430,7 +10439,6 @@ static void renderer_fini(Renderer *self)
    ih_reset(&self->analog_sep);
    ih_reset(&self->analog_dec);
    ih_reset(&self->analog_rgb);
-   ih_reset(&self->analog_out);
    bh_reset(&self->quad);
    imageview_vec_destroy(&self->scaled_views); /* release scaled image views (was member teardown) */
    /* Free the per-frame draw-self->queue arrays (POD_VEC backing storage). */
@@ -19747,6 +19755,8 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
 
    ih_assign(&scanout_handles.items[index], &scanout);
    video_refresh_cb(RETRO_HW_FRAME_BUFFER_VALID, image_get_width(ih_get(&scanout), 0), image_get_height(ih_get(&scanout), 0), 0);
+   if (renderer)
+      renderer->scanout_ring_index = (renderer->scanout_ring_index + 1) % RHI_SCANOUT_RING_SIZE;
    inside_frame = false;
 
    prev_frame_width = image_get_width(ih_get(&scanout), 0);

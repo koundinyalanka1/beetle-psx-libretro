@@ -20,6 +20,7 @@
 #include "irq.h"
 #include "timer.h"
 #include "FastFIFO.h"
+#include <rthreads/rthreads.h>
 
 #include <retro_miscellaneous.h>
 
@@ -129,6 +130,43 @@ typedef struct CTEntry CTEntry;
  * lines: CLUT_Cache spans exactly 8 lines and each padded 16-byte
  * TexCache entry sits inside a single line (see gpu.h). */
 MDFN_ALIGN(64) PS_GPU GPU;
+
+/* --- Threaded GPU Worker Subsystem --- */
+typedef enum
+{
+   GPU_CMD_GP0,
+   GPU_CMD_GP1
+} gpu_cmd_type_t;
+
+typedef struct
+{
+   uint8_t type;
+   uint32_t data;
+   uint32_t addr;
+} gpu_cmd_t;
+
+#define GPU_QUEUE_SIZE (64 * 1024)
+static gpu_cmd_t gpu_queue[GPU_QUEUE_SIZE];
+static uint32_t gpu_queue_head = 0;
+static uint32_t gpu_queue_tail = 0;
+static volatile uint32_t gpu_queue_count = 0;
+
+static slock_t *gpu_queue_lock = NULL;
+static scond_t *gpu_queue_not_empty = NULL;
+static scond_t *gpu_queue_not_full = NULL;
+static scond_t *gpu_queue_drained = NULL;
+static sthread_t *gpu_thread = NULL;
+
+static bool gpu_worker_enabled = true;
+static bool gpu_worker_running = false;
+static bool gpu_worker_stopping = false;
+static bool gpu_worker_idle = true;
+static volatile bool gpu_worker_irq_pending = false;
+
+static void GPU_WriteGP0_Internal(uint32_t InData, uint32_t addr);
+static void GPU_WriteGP1_Internal(uint32_t V);
+static void GPU_Worker_QueueGP0(uint32_t data, uint32_t addr);
+static void GPU_Worker_QueueGP1(uint32_t data);
 
 /* Scratch handles for PS1-state save/load and resolution rescale.
  * Used as a swap buffer between the GPU.vram (which is at the current
@@ -447,7 +485,10 @@ static void Command_ClearCache(PS_GPU* g, const uint32_t *cb)
 static void Command_IRQ(PS_GPU* g, const uint32_t *cb)
 {
    g->IRQPending = true;
-   IRQ_Assert(IRQ_GPU, g->IRQPending);
+   if (gpu_worker_running)
+      gpu_worker_irq_pending = true;
+   else
+      IRQ_Assert(IRQ_GPU, g->IRQPending);
 }
 
 /* Special RAM write mode(16 pixels at a time), */
@@ -1171,6 +1212,9 @@ bool GPU_Init(bool pal_clock_and_tv,
 
    GPU.killQuadPart = 0;
 
+   if (gpu_worker_enabled)
+      GPU_Worker_Init();
+
    return true;
 }
 
@@ -1185,6 +1229,7 @@ void GPU_RecalcClockRatio(void) {
 
 void GPU_Destroy(void)
 {
+   GPU_Worker_Kill();
    free(GPU.vram);
    GPU.vram = NULL;
 }
@@ -1206,6 +1251,9 @@ void GPU_Destroy(void)
  */
 bool GPU_Rescale(uint8_t ushift)
 {
+   if (gpu_worker_enabled && gpu_worker_running)
+      GPU_Worker_Sync();
+
    uint16_t *old_vram = GPU.vram;
    uint8_t     old_shift = GPU.upscale_shift;
    uint16_t *new_vram;
@@ -1332,6 +1380,9 @@ static void GPU_SoftReset(void) /* Control command 0x00 */
 
 void GPU_Power(void)
 {
+   if (gpu_worker_enabled && gpu_worker_running)
+      GPU_Worker_Sync();
+
    memset(GPU.vram, 0, 512 * 1024 * UPSCALE(&GPU) * UPSCALE(&GPU) * sizeof(*GPU.vram));
 
    memset(GPU.CLUT_Cache, 0, sizeof(GPU.CLUT_Cache));
@@ -1500,14 +1551,14 @@ static void ProcessFIFO(uint32_t in_count)
          return;
 
       case INCMD_QUAD:
-         if(GPU.DrawTimeAvail < 0)
+         if(!gpu_worker_running && GPU.DrawTimeAvail < 0)
             return;
 
          command_len      = 1 + (bool)(cc & 0x4) + (bool)(cc & 0x10);
          read_fifo = true;
          break;
       case INCMD_PLINE:
-         if(GPU.DrawTimeAvail < 0)
+         if(!gpu_worker_running && GPU.DrawTimeAvail < 0)
             return;
 
          command_len        = 1 + (bool)(GPU.InCmd_CC & 0x10);
@@ -1529,7 +1580,7 @@ static void ProcessFIFO(uint32_t in_count)
       command     = &Commands[cc];
       command_len = command->len;
 
-      if(GPU.DrawTimeAvail < 0 && !command->ss_cmd)
+      if(!gpu_worker_running && GPU.DrawTimeAvail < 0 && !command->ss_cmd)
          return;
    }
 
@@ -1585,136 +1636,352 @@ static INLINE void GPU_WriteCB(uint32_t InData, uint32_t addr)
       ProcessFIFO(GPU_BlitterFIFO.in_count);
 }
 
+static void GPU_WriteGP0_Internal(uint32_t InData, uint32_t addr)
+{
+   GPU_WriteCB(InData, addr);
+}
+
+static void GPU_WriteGP1_Internal(uint32_t V)
+{
+   uint32_t command = V >> 24;
+
+   V &= 0x00FFFFFF;
+
+   switch(command)
+   {
+      /*
+         0x40-0xFF do NOT appear to be mirrors, at least not on my PS1's GPU.
+         */
+      default:
+         break;
+      case 0x00:  /* Reset GPU */
+         GPU_SoftReset();
+         rhi_intf_set_draw_area(GPU.ClipX0, GPU.ClipY0,
+                                GPU.ClipX1, GPU.ClipY1);
+         rhi_intf_toggle_display(GPU.DisplayOff); /* `true` set by GPU_SoftReset() */
+         rhi_intf_set_vram_framebuffer_coords(GPU.DisplayFB_XStart, GPU.DisplayFB_YStart); /* (0, 0) set by GPU_SoftReset() */
+         rhi_intf_set_horizontal_display_range(GPU.HorizStart, GPU.HorizEnd); /* 0x200, 0xC00 set by GPU_SoftReset() */
+         rhi_intf_set_vertical_display_range(GPU.VertStart, GPU.VertEnd); /* 0x10, 0x100 set by GPU_SoftReset() */
+         RHI_UpdateDisplayMode();
+         break;
+
+      case 0x01:  /* Reset command buffer */
+         if(GPU.DrawTimeAvail < 0)
+            GPU.DrawTimeAvail = 0;
+         FastFIFO_Flush(&GPU_BlitterFIFO);
+         GPU.InCmd = INCMD_NONE;
+         break;
+
+      case 0x02:  /* Acknowledge IRQ */
+         GPU.IRQPending = false;
+         if (gpu_worker_running)
+            gpu_worker_irq_pending = false;
+         else
+            IRQ_Assert(IRQ_GPU, GPU.IRQPending);
+         break;
+
+      case 0x03:  /* Display enable */
+         GPU.DisplayOff = V & 1;
+         rhi_intf_toggle_display(GPU.DisplayOff);
+         break;
+
+      case 0x04:  /* DMA Setup */
+         GPU.DMAControl = V & 0x3;
+         break;
+
+      case 0x05:  /* Start of display area in framebuffer */
+         GPU.DisplayFB_XStart = V & 0x3FE; /* Lower bit is apparently ignored. */
+         GPU.DisplayFB_YStart = (V >> 10) & 0x1FF;
+         GPU.display_change_count++;
+         rhi_intf_set_vram_framebuffer_coords(GPU.DisplayFB_XStart, GPU.DisplayFB_YStart);
+         break;
+
+      case 0x06:  /* Horizontal display range */
+         GPU.HorizStart = V & 0xFFF;
+         GPU.HorizEnd = (V >> 12) & 0xFFF;
+         rhi_intf_set_horizontal_display_range(GPU.HorizStart, GPU.HorizEnd);
+         break;
+
+      case 0x07:
+         GPU.VertStart = V & 0x3FF;
+         GPU.VertEnd = (V >> 10) & 0x3FF;
+         rhi_intf_set_vertical_display_range(GPU.VertStart, GPU.VertEnd);
+         break;
+
+      case 0x08:
+         GPU.DisplayMode = V & 0xFF;
+         RHI_UpdateDisplayMode();
+         break;
+
+      case 0x09:
+         GPU.TexDisableAllowChange = V & 1;
+         break;
+
+      case 0x10:  /* GPU info(?) */
+         switch(V & 0xF)
+         {
+            /* DataReadBuffer must remain unchanged for any unhandled GPU info index. */
+            default:
+               break;
+            case 0x2:
+               GPU.DataReadBufferEx &= 0xFFF00000;
+               GPU.DataReadBufferEx |= (GPU.tww << 0) | (GPU.twh << 5) | (GPU.twx << 10) | (GPU.twy << 15);
+               GPU.DataReadBuffer    = GPU.DataReadBufferEx;
+               break;
+            case 0x3:
+               GPU.DataReadBufferEx &= 0xFFF00000;
+               GPU.DataReadBufferEx |= (GPU.ClipY0 << 10) | GPU.ClipX0;
+               GPU.DataReadBuffer = GPU.DataReadBufferEx;
+               break;
+
+            case 0x4:
+               GPU.DataReadBufferEx &= 0xFFF00000;
+               GPU.DataReadBufferEx |= (GPU.ClipY1 << 10) | GPU.ClipX1;
+               GPU.DataReadBuffer = GPU.DataReadBufferEx;
+               break;
+
+            case 0x5:
+               GPU.DataReadBufferEx &= 0xFFC00000;
+               GPU.DataReadBufferEx |= (GPU.OffsX & 2047) | ((GPU.OffsY & 2047) << 11);
+               GPU.DataReadBuffer = GPU.DataReadBufferEx;
+               break;
+
+            case 0x7:
+               GPU.DataReadBufferEx = 2;
+               GPU.DataReadBuffer = GPU.DataReadBufferEx;
+               break;
+
+            case 0x8:
+               GPU.DataReadBufferEx = 0;
+               GPU.DataReadBuffer = GPU.DataReadBufferEx;
+               break;
+         }
+         break;
+   }
+}
+
+static void gpu_worker_thread_loop(void *arg)
+{
+   (void)arg;
+   while (1)
+   {
+      gpu_cmd_t batch[64];
+      uint32_t batch_count = 0;
+
+      slock_lock(gpu_queue_lock);
+      while (gpu_queue_count == 0 && !gpu_worker_stopping)
+      {
+         gpu_worker_idle = true;
+         scond_signal(gpu_queue_drained);
+         scond_wait(gpu_queue_not_empty, gpu_queue_lock);
+      }
+
+      if (gpu_worker_stopping && gpu_queue_count == 0)
+      {
+         gpu_worker_idle = true;
+         scond_signal(gpu_queue_drained);
+         slock_unlock(gpu_queue_lock);
+         break;
+      }
+
+      gpu_worker_idle = false;
+      batch_count = gpu_queue_count;
+      if (batch_count > 64)
+         batch_count = 64;
+
+      for (uint32_t i = 0; i < batch_count; i++)
+      {
+         batch[i] = gpu_queue[gpu_queue_tail];
+         gpu_queue_tail = (gpu_queue_tail + 1) % GPU_QUEUE_SIZE;
+      }
+      gpu_queue_count -= batch_count;
+
+      scond_signal(gpu_queue_not_full);
+      slock_unlock(gpu_queue_lock);
+
+      for (uint32_t i = 0; i < batch_count; i++)
+      {
+         if (batch[i].type == GPU_CMD_GP0)
+            GPU_WriteGP0_Internal(batch[i].data, batch[i].addr);
+         else
+            GPU_WriteGP1_Internal(batch[i].data);
+      }
+   }
+}
+
+void GPU_Worker_Sync(void)
+{
+   if (!gpu_worker_running || !gpu_queue_lock)
+      return;
+
+   slock_lock(gpu_queue_lock);
+   while (gpu_queue_count > 0 || !gpu_worker_idle)
+   {
+      scond_wait(gpu_queue_drained, gpu_queue_lock);
+   }
+   slock_unlock(gpu_queue_lock);
+}
+
+void GPU_Worker_Init(void)
+{
+   if (gpu_worker_running)
+      return;
+
+   gpu_queue_head = 0;
+   gpu_queue_tail = 0;
+   gpu_queue_count = 0;
+   gpu_worker_idle = true;
+   gpu_worker_stopping = false;
+   gpu_worker_irq_pending = false;
+
+   gpu_queue_lock = slock_new();
+   gpu_queue_not_empty = scond_new();
+   gpu_queue_not_full = scond_new();
+   gpu_queue_drained = scond_new();
+
+   if (!gpu_queue_lock || !gpu_queue_not_empty || !gpu_queue_not_full || !gpu_queue_drained)
+   {
+      GPU_Worker_Kill();
+      return;
+   }
+
+   gpu_thread = sthread_create(gpu_worker_thread_loop, NULL);
+   if (!gpu_thread)
+   {
+      GPU_Worker_Kill();
+      return;
+   }
+
+   gpu_worker_running = true;
+}
+
+void GPU_Worker_Kill(void)
+{
+   if (!gpu_worker_running && !gpu_thread)
+      return;
+
+   if (gpu_queue_lock)
+   {
+      slock_lock(gpu_queue_lock);
+      gpu_worker_stopping = true;
+      scond_signal(gpu_queue_not_empty);
+      slock_unlock(gpu_queue_lock);
+   }
+
+   if (gpu_thread)
+   {
+      sthread_join(gpu_thread);
+      gpu_thread = NULL;
+   }
+
+   if (gpu_queue_lock) { slock_free(gpu_queue_lock); gpu_queue_lock = NULL; }
+   if (gpu_queue_not_empty) { scond_free(gpu_queue_not_empty); gpu_queue_not_empty = NULL; }
+   if (gpu_queue_not_full) { scond_free(gpu_queue_not_full); gpu_queue_not_full = NULL; }
+   if (gpu_queue_drained) { scond_free(gpu_queue_drained); gpu_queue_drained = NULL; }
+
+   gpu_worker_running = false;
+   gpu_worker_stopping = false;
+}
+
+void GPU_SetThreaded(bool enabled)
+{
+   if (gpu_worker_enabled == enabled)
+      return;
+
+   if (gpu_worker_running)
+   {
+      GPU_Worker_Sync();
+      if (!enabled)
+         GPU_Worker_Kill();
+   }
+   else if (enabled)
+   {
+      GPU_Worker_Init();
+   }
+
+   gpu_worker_enabled = enabled;
+}
+
+bool GPU_GetThreaded(void)
+{
+   return gpu_worker_enabled;
+}
+
+static void GPU_Worker_QueueGP0(uint32_t data, uint32_t addr)
+{
+   slock_lock(gpu_queue_lock);
+   while (gpu_queue_count >= GPU_QUEUE_SIZE && !gpu_worker_stopping)
+   {
+      scond_wait(gpu_queue_not_full, gpu_queue_lock);
+   }
+
+   if (!gpu_worker_stopping)
+   {
+      gpu_cmd_t *cmd = &gpu_queue[gpu_queue_head];
+      cmd->type = GPU_CMD_GP0;
+      cmd->data = data;
+      cmd->addr = addr;
+      gpu_queue_head = (gpu_queue_head + 1) % GPU_QUEUE_SIZE;
+      gpu_queue_count++;
+      scond_signal(gpu_queue_not_empty);
+   }
+   slock_unlock(gpu_queue_lock);
+}
+
+static void GPU_Worker_QueueGP1(uint32_t data)
+{
+   slock_lock(gpu_queue_lock);
+   while (gpu_queue_count >= GPU_QUEUE_SIZE && !gpu_worker_stopping)
+   {
+      scond_wait(gpu_queue_not_full, gpu_queue_lock);
+   }
+
+   if (!gpu_worker_stopping)
+   {
+      gpu_cmd_t *cmd = &gpu_queue[gpu_queue_head];
+      cmd->type = GPU_CMD_GP1;
+      cmd->data = data;
+      cmd->addr = 0;
+      gpu_queue_head = (gpu_queue_head + 1) % GPU_QUEUE_SIZE;
+      gpu_queue_count++;
+      scond_signal(gpu_queue_not_empty);
+   }
+   slock_unlock(gpu_queue_lock);
+}
+
 void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
 {
+   (void)timestamp;
    V <<= (A & 3) * 8;
 
    if(A & 4)   /* GP1 ("Control") */
    {
-      uint32_t command = V >> 24;
-
-      V &= 0x00FFFFFF;
-
-
-      switch(command)
+      if (gpu_worker_enabled && gpu_worker_running)
       {
-         /*
-            0x40-0xFF do NOT appear to be mirrors, at least not on my PS1's GPU.
-            */
-         default:
-            break;
-         case 0x00:  /* Reset GPU */
-            GPU_SoftReset();
-            rhi_intf_set_draw_area(GPU.ClipX0, GPU.ClipY0,
-                                   GPU.ClipX1, GPU.ClipY1);
-            rhi_intf_toggle_display(GPU.DisplayOff); /* `true` set by GPU_SoftReset() */
-            rhi_intf_set_vram_framebuffer_coords(GPU.DisplayFB_XStart, GPU.DisplayFB_YStart); /* (0, 0) set by GPU_SoftReset() */
-            rhi_intf_set_horizontal_display_range(GPU.HorizStart, GPU.HorizEnd); /* 0x200, 0xC00 set by GPU_SoftReset() */
-            rhi_intf_set_vertical_display_range(GPU.VertStart, GPU.VertEnd); /* 0x10, 0x100 set by GPU_SoftReset() */
-            RHI_UpdateDisplayMode();
-            break;
-
-         case 0x01:  /* Reset command buffer */
-            if(GPU.DrawTimeAvail < 0)
-               GPU.DrawTimeAvail = 0;
-            FastFIFO_Flush(&GPU_BlitterFIFO);
-            GPU.InCmd = INCMD_NONE;
-            break;
-
-         case 0x02:  /* Acknowledge IRQ */
-            GPU.IRQPending = false;
-            IRQ_Assert(IRQ_GPU, GPU.IRQPending);
-            break;
-
-         case 0x03:  /* Display enable */
-            GPU.DisplayOff = V & 1;
-            rhi_intf_toggle_display(GPU.DisplayOff);
-            break;
-
-         case 0x04:  /* DMA Setup */
-            GPU.DMAControl = V & 0x3;
-            break;
-
-         case 0x05:  /* Start of display area in framebuffer */
-            GPU.DisplayFB_XStart = V & 0x3FE; /* Lower bit is apparently ignored. */
-            GPU.DisplayFB_YStart = (V >> 10) & 0x1FF;
-            GPU.display_change_count++;
-            rhi_intf_set_vram_framebuffer_coords(GPU.DisplayFB_XStart, GPU.DisplayFB_YStart);
-            break;
-
-         case 0x06:  /* Horizontal display range */
-            GPU.HorizStart = V & 0xFFF;
-            GPU.HorizEnd = (V >> 12) & 0xFFF;
-            rhi_intf_set_horizontal_display_range(GPU.HorizStart, GPU.HorizEnd);
-            break;
-
-         case 0x07:
-            GPU.VertStart = V & 0x3FF;
-            GPU.VertEnd = (V >> 10) & 0x3FF;
-            rhi_intf_set_vertical_display_range(GPU.VertStart, GPU.VertEnd);
-            break;
-
-         case 0x08:
-            GPU.DisplayMode = V & 0xFF;
-            RHI_UpdateDisplayMode();
-            break;
-
-         case 0x09:
-            GPU.TexDisableAllowChange = V & 1;
-            break;
-
-         case 0x10:  /* GPU info(?) */
-            switch(V & 0xF)
-            {
-               /* DataReadBuffer must remain unchanged for any unhandled GPU info index. */
-               default:
-                  break;
-               case 0x2:
-                  GPU.DataReadBufferEx &= 0xFFF00000;
-                  GPU.DataReadBufferEx |= (GPU.tww << 0) | (GPU.twh << 5) | (GPU.twx << 10) | (GPU.twy << 15);
-                  GPU.DataReadBuffer    = GPU.DataReadBufferEx;
-                  break;
-               case 0x3:
-                  GPU.DataReadBufferEx &= 0xFFF00000;
-                  GPU.DataReadBufferEx |= (GPU.ClipY0 << 10) | GPU.ClipX0;
-                  GPU.DataReadBuffer = GPU.DataReadBufferEx;
-                  break;
-
-               case 0x4:
-                  GPU.DataReadBufferEx &= 0xFFF00000;
-                  GPU.DataReadBufferEx |= (GPU.ClipY1 << 10) | GPU.ClipX1;
-                  GPU.DataReadBuffer = GPU.DataReadBufferEx;
-                  break;
-
-               case 0x5:
-                  GPU.DataReadBufferEx &= 0xFFC00000;
-                  GPU.DataReadBufferEx |= (GPU.OffsX & 2047) | ((GPU.OffsY & 2047) << 11);
-                  GPU.DataReadBuffer = GPU.DataReadBufferEx;
-                  break;
-
-               case 0x7:
-                  GPU.DataReadBufferEx = 2;
-                  GPU.DataReadBuffer = GPU.DataReadBufferEx;
-                  break;
-
-               case 0x8:
-                  GPU.DataReadBufferEx = 0;
-                  GPU.DataReadBuffer = GPU.DataReadBufferEx;
-                  break;
-            }
-            break;
-
+         GPU_Worker_QueueGP1(V);
+         return;
       }
+      GPU_WriteGP1_Internal(V);
    }
    else     /* GP0 ("Data") */
    {
-      GPU_WriteCB(V, A);
+      if (gpu_worker_enabled && gpu_worker_running)
+      {
+         GPU_Worker_QueueGP0(V, A);
+         return;
+      }
+      GPU_WriteGP0_Internal(V, A);
    }
 }
 
 void GPU_WriteDMA(uint32_t V, uint32_t addr)
 {
-   GPU_WriteCB(V, addr);
+   if (gpu_worker_enabled && gpu_worker_running)
+   {
+      GPU_Worker_QueueGP0(V, addr);
+      return;
+   }
+   GPU_WriteGP0_Internal(V, addr);
 }
 
 static INLINE uint32_t GPU_ReadData(void)
@@ -1748,6 +2015,9 @@ static INLINE uint32_t GPU_ReadData(void)
 
 uint32_t GPU_ReadDMA(void)
 {
+   if (gpu_worker_enabled && gpu_worker_running)
+      GPU_Worker_Sync();
+
    if(GPU.InCmd != INCMD_FBREAD)
       return GPU.DataReadBuffer;
    return GPU_ReadData();
@@ -1756,6 +2026,9 @@ uint32_t GPU_ReadDMA(void)
 uint32_t GPU_Read(const int32_t timestamp, uint32_t A)
 {
    uint32_t ret = 0;
+
+   if (gpu_worker_enabled && gpu_worker_running)
+      GPU_Worker_Sync();
 
 
    if(A & 4)   /* Status */
@@ -2000,7 +2273,20 @@ int32_t GPU_Update(const int32_t sys_timestamp)
       GPU.DrawTimeAvail = (2*EventCycles << psx_gpu_overclock_shift);
 
    if(GPU_BlitterFIFO.in_count && GPU.InCmd != INCMD_FBREAD)
-      ProcessFIFO(GPU_BlitterFIFO.in_count);
+   {
+      if(!gpu_worker_running)
+         ProcessFIFO(GPU_BlitterFIFO.in_count);
+   }
+
+   if(gpu_worker_running)
+   {
+      static bool last_gpu_irq_state = false;
+      if (gpu_worker_irq_pending != last_gpu_irq_state)
+      {
+         last_gpu_irq_state = gpu_worker_irq_pending;
+         IRQ_Assert(IRQ_GPU, last_gpu_irq_state);
+      }
+   }
 
    /*puts("GPU Update Start"); */
 
@@ -2483,6 +2769,9 @@ TheEnd:
 
 void GPU_StartFrame(EmulateSpecStruct *espec_arg)
 {
+   if (gpu_worker_enabled && gpu_worker_running)
+      GPU_Worker_Sync();
+
    GPU.sl_zero_reached = false;
    GPU.espec           = espec_arg;
    GPU.surface         = GPU.espec->surface;
@@ -2730,6 +3019,9 @@ void GPU_RestoreStateP3(void)
 
 int GPU_StateAction(StateMem *sm, int load, int data_only)
 {
+   if (gpu_worker_enabled && gpu_worker_running)
+      GPU_Worker_Sync();
+
    GPU_RestoreStateP1(load);
 
    SFORMAT StateRegs[] =
@@ -2920,6 +3212,8 @@ uint8_t GPU_get_upscale_shift(void)
 
 bool GPU_DMACanWrite(void)
 {
+   if (gpu_worker_enabled && gpu_worker_running)
+      return (gpu_queue_count < GPU_QUEUE_SIZE - 256);
    return CalcFIFOReadyBit();
 }
 
