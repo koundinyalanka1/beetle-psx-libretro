@@ -1961,33 +1961,44 @@ void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
 
    if(A & 4)   /* GP1 ("Control") */
    {
-      uint32_t command = V >> 24;
-      switch(command)
+      if (gpu_worker_enabled && gpu_worker_running)
       {
-         case 0x00:  /* Reset GPU */
-         case 0x01:  /* Reset command buffer */
-         case 0x10:  /* GPU info (writes to DataReadBuffer) */
-            if (gpu_worker_enabled && gpu_worker_running)
+         uint32_t command = V >> 24;
+         switch(command)
+         {
+            case 0x00:  /* Reset GPU — CPU must see cleared InCmd/FIFO/status */
+            case 0x01:  /* Reset command buffer — CPU must see cleared InCmd */
+            case 0x10:  /* GPU info — CPU reads DataReadBuffer immediately */
                GPU_Worker_Sync();
-            GPU_WriteGP1_Internal(V);
-            break;
+               GPU_WriteGP1_Internal(V);
+               break;
 
-         case 0x02:  /* Acknowledge IRQ */
-            gpu_worker_irq_pending = false;
-            GPU.IRQPending = false;
-            IRQ_Assert(IRQ_GPU, false);
-            last_gpu_irq_state = false;
-            GPU_WriteGP1_Internal(V);
-            break;
+            case 0x02:  /* Acknowledge IRQ — clear flags on CPU thread for instant visibility */
+               gpu_worker_irq_pending = false;
+               GPU.IRQPending = false;
+               IRQ_Assert(IRQ_GPU, false);
+               last_gpu_irq_state = false;
+               /* Also queue to worker so its copy stays consistent */
+               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
+               break;
 
-         case 0x04:  /* DMA Setup */
-            GPU.DMAControl = (V & 0x00FFFFFF) & 0x3;
-            GPU_WriteGP1_Internal(V);
-            break;
+            case 0x04:  /* DMA Setup — GPUSTAT exposes DMAControl, update for CPU reads */
+               GPU.DMAControl = (V & 0x00FFFFFF) & 0x3;
+               /* Queue so worker-side GP1 handler stays in sync */
+               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
+               break;
 
-         default:
-            GPU_WriteGP1_Internal(V);
-            break;
+            default:
+               /* Display commands (0x03, 0x05-0x08) and others:
+                * queue to worker so rhi_intf_* calls execute on the
+                * same thread as GP0 draw commands — no Vulkan race. */
+               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
+               break;
+         }
+      }
+      else
+      {
+         GPU_WriteGP1_Internal(V);
       }
    }
    else        /* GP0 ("Data") */
