@@ -2028,11 +2028,7 @@ static INLINE uint32_t GPU_ReadData(void)
       if(GPU.FBRW_CurX == (GPU.FBRW_X + GPU.FBRW_W))
       {
          if((GPU.FBRW_CurY + 1) == (GPU.FBRW_Y + GPU.FBRW_H))
-         {
             GPU.InCmd = INCMD_NONE;
-            if(GPU_BlitterFIFO.in_count)
-               ProcessFIFO(GPU_BlitterFIFO.in_count);
-         }
          else
          {
             GPU.FBRW_CurY++;
@@ -2081,10 +2077,8 @@ uint32_t GPU_Read(const int32_t timestamp, uint32_t A)
       /* GPU idle bit */
       if (gpu_worker_running)
       {
-         if (GPU_Queue_Count() > 0 || !gpu_worker_idle)
-            GPU_Worker_Sync();
-
-         if (GPU.InCmd == INCMD_NONE && GPU_BlitterFIFO.in_count == 0)
+         if (GPU_Queue_Count() == 0 && gpu_worker_idle
+               && GPU.InCmd == INCMD_NONE && GPU_BlitterFIFO.in_count == 0)
             ret |= 1 << 26;
 
          if (GPU.InCmd == INCMD_FBREAD)
