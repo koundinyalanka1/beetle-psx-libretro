@@ -170,8 +170,8 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr);
 
 static INLINE uint32_t GPU_Queue_Count(void)
 {
-   uint32_t h = gpu_queue_head;
-   uint32_t t = gpu_queue_tail;
+   uint32_t h = __atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE);
+   uint32_t t = __atomic_load_n(&gpu_queue_tail, __ATOMIC_ACQUIRE);
    return (h - t) & GPU_QUEUE_MASK;
 }
 
@@ -1768,32 +1768,26 @@ static void GPU_WriteGP1_Internal(uint32_t V)
 static void gpu_worker_thread_loop(void *arg)
 {
    (void)arg;
-   while (1)
+
+   slock_lock(gpu_queue_lock);
+
+   while (!gpu_worker_stopping)
    {
-      if (gpu_queue_head == gpu_queue_tail)
+      while (__atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE) == gpu_queue_tail && !gpu_worker_stopping)
       {
-         slock_lock(gpu_queue_lock);
-         while (gpu_queue_head == gpu_queue_tail && !gpu_worker_stopping)
-         {
-            gpu_worker_idle = true;
-            scond_signal(gpu_queue_drained);
-            scond_wait(gpu_queue_not_empty, gpu_queue_lock);
-         }
-         if (gpu_worker_stopping && gpu_queue_head == gpu_queue_tail)
-         {
-            gpu_worker_idle = true;
-            scond_signal(gpu_queue_drained);
-            slock_unlock(gpu_queue_lock);
-            break;
-         }
-         gpu_worker_idle = false;
-         slock_unlock(gpu_queue_lock);
+         __atomic_store_n(&gpu_worker_idle, true, __ATOMIC_RELEASE);
+         scond_signal(gpu_queue_drained);
+         scond_wait(gpu_queue_not_empty, gpu_queue_lock);
       }
 
-      gpu_worker_idle = false;
+      if (gpu_worker_stopping && __atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE) == gpu_queue_tail)
+         break;
+
+      __atomic_store_n(&gpu_worker_idle, false, __ATOMIC_RELEASE);
+      slock_unlock(gpu_queue_lock);
 
       uint32_t tail = gpu_queue_tail;
-      uint32_t head = gpu_queue_head;
+      uint32_t head = __atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE);
       uint32_t count = (head - tail) & GPU_QUEUE_MASK;
       if (count > 256)
          count = 256;
@@ -1808,16 +1802,15 @@ static void gpu_worker_thread_loop(void *arg)
       }
 
       gpu_queue_tail = (tail + count) & GPU_QUEUE_MASK;
+      __atomic_store_n(&gpu_queue_tail, (tail + count) & GPU_QUEUE_MASK, __ATOMIC_RELEASE);
 
       slock_lock(gpu_queue_lock);
       scond_signal(gpu_queue_not_full);
-      if (gpu_queue_head == gpu_queue_tail)
-      {
-         gpu_worker_idle = true;
-         scond_signal(gpu_queue_drained);
-      }
-      slock_unlock(gpu_queue_lock);
    }
+
+   __atomic_store_n(&gpu_worker_idle, true, __ATOMIC_RELEASE);
+   scond_signal(gpu_queue_drained);
+   slock_unlock(gpu_queue_lock);
 }
 
 void GPU_Worker_Sync(void)
@@ -1825,11 +1818,13 @@ void GPU_Worker_Sync(void)
    if (!gpu_worker_running || !gpu_queue_lock)
       return;
 
-   if (gpu_queue_head == gpu_queue_tail && gpu_worker_idle)
+   if (__atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE) == __atomic_load_n(&gpu_queue_tail, __ATOMIC_ACQUIRE) &&
+       __atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
       return;
 
    slock_lock(gpu_queue_lock);
-   while (gpu_queue_head != gpu_queue_tail || !gpu_worker_idle)
+   while (__atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE) != __atomic_load_n(&gpu_queue_tail, __ATOMIC_ACQUIRE) ||
+          !__atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
    {
       scond_wait(gpu_queue_drained, gpu_queue_lock);
    }
@@ -1929,7 +1924,7 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
    while (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
    {
       slock_lock(gpu_queue_lock);
-      if (gpu_worker_idle)
+      if (__atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
          scond_signal(gpu_queue_not_empty);
       if (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
          scond_wait(gpu_queue_not_full, gpu_queue_lock);
@@ -1944,9 +1939,9 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
    gpu_queue[head].data = data;
    gpu_queue[head].addr = addr;
 
-   gpu_queue_head = (head + 1) & GPU_QUEUE_MASK;
+   __atomic_store_n(&gpu_queue_head, (head + 1) & GPU_QUEUE_MASK, __ATOMIC_RELEASE);
 
-   if (gpu_worker_idle)
+   if (__atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
    {
       slock_lock(gpu_queue_lock);
       scond_signal(gpu_queue_not_empty);
@@ -1982,16 +1977,48 @@ void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
                GPU_Worker_Push(GPU_CMD_GP1, V, 0);
                break;
 
+            case 0x03:  /* Display enable */
+               GPU.DisplayOff = (V & 0x00FFFFFF) & 1;
+               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
+               break;
+
             case 0x04:  /* DMA Setup — GPUSTAT exposes DMAControl, update for CPU reads */
                GPU.DMAControl = (V & 0x00FFFFFF) & 0x3;
                /* Queue so worker-side GP1 handler stays in sync */
                GPU_Worker_Push(GPU_CMD_GP1, V, 0);
                break;
 
+            case 0x05:  /* Start of display area in framebuffer */
+               GPU.DisplayFB_XStart = (V & 0x00FFFFFF) & 0x3FE;
+               GPU.DisplayFB_YStart = ((V & 0x00FFFFFF) >> 10) & 0x1FF;
+               GPU.display_change_count++;
+               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
+               break;
+
+            case 0x06:  /* Horizontal display range */
+               GPU.HorizStart = (V & 0x00FFFFFF) & 0xFFF;
+               GPU.HorizEnd = ((V & 0x00FFFFFF) >> 12) & 0xFFF;
+               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
+               break;
+
+            case 0x07:  /* Vertical display range */
+               GPU.VertStart = (V & 0x00FFFFFF) & 0x3FF;
+               GPU.VertEnd = ((V & 0x00FFFFFF) >> 10) & 0x3FF;
+               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
+               break;
+
+            case 0x08:  /* Display Mode */
+               GPU.DisplayMode = (V & 0x00FFFFFF) & 0xFF;
+               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
+               break;
+
+            case 0x09:  /* TexDisableAllowChange */
+               GPU.TexDisableAllowChange = (V & 0x00FFFFFF) & 1;
+               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
+               break;
+
             default:
-               /* Display commands (0x03, 0x05-0x08) and others:
-                * queue to worker so rhi_intf_* calls execute on the
-                * same thread as GP0 draw commands — no Vulkan race. */
+               /* Queue remaining commands to worker */
                GPU_Worker_Push(GPU_CMD_GP1, V, 0);
                break;
          }
@@ -3268,8 +3295,6 @@ bool GPU_DMACanWrite(void)
 {
    if (gpu_worker_enabled && gpu_worker_running)
    {
-      if (GPU.InCmd & (INCMD_FBREAD | INCMD_FBWRITE | INCMD_PLINE | INCMD_QUAD))
-         return false;
       return (GPU_Queue_Count() < (GPU_QUEUE_SIZE - 1024));
    }
    return CalcFIFOReadyBit();

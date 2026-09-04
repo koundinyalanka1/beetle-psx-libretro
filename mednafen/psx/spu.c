@@ -1685,53 +1685,43 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
 static void spu_worker_thread_loop(void *arg)
 {
    (void)arg;
-   while (1)
+
+   slock_lock(spu_queue_lock);
+
+   while (!spu_worker_stopping)
    {
-      if (spu_queue_head == spu_queue_tail)
+      while (__atomic_load_n(&spu_queue_head, __ATOMIC_ACQUIRE) == spu_queue_tail && !spu_worker_stopping)
       {
-         slock_lock(spu_queue_lock);
-         while (spu_queue_head == spu_queue_tail && !spu_worker_stopping)
-         {
-            spu_worker_idle = true;
-            scond_signal(spu_queue_drained);
-            scond_wait(spu_queue_not_empty, spu_queue_lock);
-         }
-         if (spu_worker_stopping && spu_queue_head == spu_queue_tail)
-         {
-            spu_worker_idle = true;
-            scond_signal(spu_queue_drained);
-            slock_unlock(spu_queue_lock);
-            break;
-         }
-         spu_worker_idle = false;
-         slock_unlock(spu_queue_lock);
+         __atomic_store_n(&spu_worker_idle, true, __ATOMIC_RELEASE);
+         scond_signal(spu_queue_drained);
+         scond_wait(spu_queue_not_empty, spu_queue_lock);
       }
 
-      spu_worker_idle = false;
+      if (spu_worker_stopping && __atomic_load_n(&spu_queue_head, __ATOMIC_ACQUIRE) == spu_queue_tail)
+         break;
+
+      __atomic_store_n(&spu_worker_idle, false, __ATOMIC_RELEASE);
+      slock_unlock(spu_queue_lock);
 
       uint32_t tail = spu_queue_tail;
       int32_t sample_clocks = spu_queue[tail].sample_clocks;
       spu_queue_tail = (tail + 1) & SPU_QUEUE_MASK;
+      __atomic_store_n(&spu_queue_tail, spu_queue_tail, __ATOMIC_RELEASE);
 
       SPU_SynthesizeSamples_Internal(sample_clocks);
 
-      if (spu_queue_head == spu_queue_tail)
-      {
-         slock_lock(spu_queue_lock);
-         if (spu_queue_head == spu_queue_tail)
-         {
-            spu_worker_idle = true;
-            scond_signal(spu_queue_drained);
-         }
-         slock_unlock(spu_queue_lock);
-      }
+      slock_lock(spu_queue_lock);
    }
+
+   __atomic_store_n(&spu_worker_idle, true, __ATOMIC_RELEASE);
+   scond_signal(spu_queue_drained);
+   slock_unlock(spu_queue_lock);
 }
 
 static void SPU_Worker_QueueSynth(int32_t sample_clocks)
 {
    uint32_t head = spu_queue_head;
-   uint32_t tail = spu_queue_tail;
+   uint32_t tail = __atomic_load_n(&spu_queue_tail, __ATOMIC_ACQUIRE);
    uint32_t count = (head - tail) & SPU_QUEUE_MASK;
 
    if (count >= SPU_QUEUE_SIZE - 1)
@@ -1741,9 +1731,9 @@ static void SPU_Worker_QueueSynth(int32_t sample_clocks)
    }
 
    spu_queue[head].sample_clocks = sample_clocks;
-   spu_queue_head = (head + 1) & SPU_QUEUE_MASK;
+   __atomic_store_n(&spu_queue_head, (head + 1) & SPU_QUEUE_MASK, __ATOMIC_RELEASE);
 
-   if (spu_worker_idle)
+   if (__atomic_load_n(&spu_worker_idle, __ATOMIC_ACQUIRE))
    {
       slock_lock(spu_queue_lock);
       scond_signal(spu_queue_not_empty);
@@ -1756,11 +1746,13 @@ void SPU_Worker_Sync(void)
    if (!spu_worker_running || !spu_queue_lock)
       return;
 
-   if (spu_queue_head == spu_queue_tail && spu_worker_idle)
+   if (__atomic_load_n(&spu_queue_head, __ATOMIC_ACQUIRE) == __atomic_load_n(&spu_queue_tail, __ATOMIC_ACQUIRE) &&
+       __atomic_load_n(&spu_worker_idle, __ATOMIC_ACQUIRE))
       return;
 
    slock_lock(spu_queue_lock);
-   while (spu_queue_head != spu_queue_tail || !spu_worker_idle)
+   while (__atomic_load_n(&spu_queue_head, __ATOMIC_ACQUIRE) != __atomic_load_n(&spu_queue_tail, __ATOMIC_ACQUIRE) ||
+          !__atomic_load_n(&spu_worker_idle, __ATOMIC_ACQUIRE))
    {
       scond_wait(spu_queue_drained, spu_queue_lock);
    }
