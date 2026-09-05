@@ -134,7 +134,11 @@ MDFN_ALIGN(64) PS_GPU GPU;
 typedef enum
 {
    GPU_CMD_GP0,
-   GPU_CMD_GP1
+   GPU_CMD_GP1,
+   /* Interlace field parity, produced by GPU_Update() on the emulation thread
+    * and consumed by LineSkipTest() in the rasteriser.  Queued rather than
+    * assigned so it lands between the right two drawing commands. */
+   GPU_CMD_FIELD
 } gpu_cmd_type_t;
 
 typedef struct
@@ -148,21 +152,42 @@ typedef struct
 #define GPU_QUEUE_MASK (GPU_QUEUE_SIZE - 1)
 
 static gpu_cmd_t gpu_queue[GPU_QUEUE_SIZE];
-static volatile uint32_t gpu_queue_head = 0;
-static volatile uint32_t gpu_queue_tail = 0;
+static uint32_t gpu_queue_head = 0;
+static uint32_t gpu_queue_tail = 0;
 
-static volatile bool gpu_worker_idle = true;
-static volatile bool gpu_worker_running = false;
-static volatile bool gpu_worker_stopping = false;
-static volatile bool gpu_worker_enabled = true;
-static volatile bool gpu_worker_irq_pending = false;
-static volatile bool last_gpu_irq_state = false;
+static bool gpu_worker_idle = true;
+static bool gpu_worker_running = false;
+static bool gpu_worker_stopping = false;
+static bool gpu_worker_enabled = false;
+
+/* IRQ_Assert() ends up in CPU_AssertIRQ(); only the emulation thread may call
+ * it, so the worker records the level it wants and GPU_Update() applies the
+ * edge. */
+static bool gpu_worker_irq_pending = false;
+static bool last_gpu_irq_state = false;
+
+/* GPUSTAT is polled by the CPU without draining the queue, so every draw-side
+ * field it reports is republished here after each batch instead of letting the
+ * reader race on the live struct.  Covers InCmd, the blitter FIFO depth and
+ * the whole draw-mode word (texpage, blend, dither, dfe, mask bits). */
+static uint32_t gpu_pub_incmd = 0;      /* INCMD_NONE */
+static uint32_t gpu_pub_fifo_count = 0;
+static uint32_t gpu_pub_drawmode = 0;
 
 static slock_t *gpu_queue_lock = NULL;
 static scond_t *gpu_queue_not_empty = NULL;
 static scond_t *gpu_queue_not_full = NULL;
 static scond_t *gpu_queue_drained = NULL;
 static sthread_t *gpu_thread = NULL;
+
+/* Bounded waits: the handshake below cannot lose a wakeup, but a timeout keeps
+ * any residual signalling bug a hiccup rather than a wedged emulation thread
+ * (which the frontend reports as an ANR, not a crash). */
+#define GPU_WORKER_WAIT_US 20000
+
+
+/* How much queue headroom the CPU-visible "FIFO has room" bit reserves. */
+#define GPU_QUEUE_FIFO_MARGIN 1024
 
 static void GPU_WriteGP0_Internal(uint32_t InData, uint32_t addr);
 static void GPU_WriteGP1_Internal(uint32_t V);
@@ -173,6 +198,70 @@ static INLINE uint32_t GPU_Queue_Count(void)
    uint32_t h = __atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE);
    uint32_t t = __atomic_load_n(&gpu_queue_tail, __ATOMIC_ACQUIRE);
    return (h - t) & GPU_QUEUE_MASK;
+}
+
+static INLINE bool GPU_Queue_Empty(void)
+{
+   return __atomic_load_n(&gpu_queue_head, __ATOMIC_SEQ_CST)
+       == __atomic_load_n(&gpu_queue_tail, __ATOMIC_SEQ_CST);
+}
+
+/* Set from drawing commands, i.e. from the worker thread when threading is on,
+ * and read by libretro.c's frame-duping check on the emulation thread. */
+static INLINE void GPU_MarkDisplayDirty(void)
+{
+   __atomic_store_n(&GPU.display_possibly_dirty, true, __ATOMIC_RELEASE);
+}
+
+/* GPUSTAT bits 0-15 that come from the draw-mode register (GP0 0xE1/0xE6),
+ * i.e. from state the worker owns. */
+static INLINE uint32_t GPU_DrawModeStatusBits(void)
+{
+   uint32_t r = 0;
+
+   r |= GPU.TexPageX >> 6;
+   r |= GPU.TexPageY >> 4;
+   r |= GPU.abr << 5;
+   r |= GPU.TexMode << 7;
+   r |= GPU.dtd << 9;
+   r |= GPU.dfe << 10;
+
+   if(GPU.MaskSetOR)
+      r |= 1 << 11;
+   if(GPU.MaskEvalAND)
+      r |= 1 << 12;
+
+   r |= GPU.TexDisable << 15;
+
+   return r;
+}
+
+/* Refresh the CPU-visible snapshot.  Called by the worker after every batch,
+ * and by the emulation thread whenever it has drained the worker and then
+ * touched the same state itself (GP1, GPUREAD, state load). */
+static INLINE void GPU_PublishStatus(void)
+{
+   __atomic_store_n(&gpu_pub_incmd, (uint32_t)GPU.InCmd, __ATOMIC_RELEASE);
+   __atomic_store_n(&gpu_pub_fifo_count, GPU_BlitterFIFO.in_count,
+         __ATOMIC_RELEASE);
+   __atomic_store_n(&gpu_pub_drawmode, GPU_DrawModeStatusBits(),
+         __ATOMIC_RELEASE);
+}
+
+/* Emulation-thread copy of GPU.field_ram_readout.  With the worker running the
+ * struct field belongs to the rasteriser and is updated in command-stream
+ * order via GPU_CMD_FIELD; this shadow is what GPU_Update()'s own scanout
+ * maths reads, so the two threads never touch the same object. */
+static bool gpu_field_ram_readout_emu = false;
+
+static INLINE void GPU_SetFieldRamReadout(bool v)
+{
+   gpu_field_ram_readout_emu = v;
+
+   if (gpu_worker_running)
+      GPU_Worker_Push(GPU_CMD_FIELD, (uint32_t)v, 0);
+   else
+      GPU.field_ram_readout = v;
 }
 
 /* Scratch handles for PS1-state save/load and resolution rescale.
@@ -491,11 +580,17 @@ static void Command_ClearCache(PS_GPU* g, const uint32_t *cb)
 
 static void Command_IRQ(PS_GPU* g, const uint32_t *cb)
 {
-   g->IRQPending = true;
+   /* Runs on the worker when threading is on.  IRQ_Assert() reaches into CPU
+    * state and GPU.IRQPending is CPU-visible through GPUSTAT, so record the
+    * request and let GPU_Update() set both on the emulation thread. */
    if (gpu_worker_running)
-      gpu_worker_irq_pending = true;
-   else
-      IRQ_Assert(IRQ_GPU, g->IRQPending);
+   {
+      __atomic_store_n(&gpu_worker_irq_pending, true, __ATOMIC_RELEASE);
+      return;
+   }
+
+   g->IRQPending = true;
+   IRQ_Assert(IRQ_GPU, g->IRQPending);
 }
 
 /* Special RAM write mode(16 pixels at a time), */
@@ -617,10 +712,7 @@ static void Command_FBFill(PS_GPU* gpu, const uint32_t *cb)
    rhi_intf_fill_rect(cb[0], destX, destY, width, height);
 
    if (RectOverlapsDisplay(destX, destY, width, height))
-      GPU.display_possibly_dirty = true;
-
-   if (gpu_worker_running && gpu->DrawTimeAvail < 0)
-      gpu->DrawTimeAvail = 0;
+      GPU_MarkDisplayDirty();
 }
 
 static void Command_FBCopy(PS_GPU* g, const uint32_t *cb)
@@ -690,10 +782,7 @@ static void Command_FBCopy(PS_GPU* g, const uint32_t *cb)
    rhi_intf_copy_rect(sourceX, sourceY, destX, destY, width, height, g->MaskEvalAND != 0, g->MaskSetOR != 0);
 
    if (RectOverlapsDisplay(destX, destY, width, height))
-      GPU.display_possibly_dirty = true;
-
-   if (gpu_worker_running && g->DrawTimeAvail < 0)
-      g->DrawTimeAvail = 0;
+      GPU_MarkDisplayDirty();
 }
 
 static void Command_FBWrite(PS_GPU* g, const uint32_t *cb)
@@ -729,7 +818,7 @@ static void Command_FBWrite(PS_GPU* g, const uint32_t *cb)
 
    if (RectOverlapsDisplay((int32_t)g->FBRW_X, (int32_t)g->FBRW_Y,
             (int32_t)g->FBRW_W, (int32_t)g->FBRW_H))
-      GPU.display_possibly_dirty = true;
+      GPU_MarkDisplayDirty();
 }
 
 /* FBRead: PS1 GPU in SCPH-5501 gives odd, inconsistent results when
@@ -789,7 +878,7 @@ static void Command_DrawMode(PS_GPU* g, const uint32_t *cb)
    g->dfe =        (cmdw >> 10) & 1;
 
    if (g->dfe)
-      GPU.display_possibly_dirty = true;
+      GPU_MarkDisplayDirty();
 }
 
 static void Command_TexWindow(PS_GPU* g, const uint32_t *cb)
@@ -1239,6 +1328,10 @@ void GPU_RecalcClockRatio(void) {
 
 void GPU_Destroy(void)
 {
+   /* The worker rasterises straight into GPU.vram - it has to be gone before
+    * the buffer is. */
+   GPU_Worker_Kill();
+
    free(GPU.vram);
    GPU.vram = NULL;
 }
@@ -1260,9 +1353,15 @@ void GPU_Destroy(void)
  */
 bool GPU_Rescale(uint8_t ushift)
 {
-   uint16_t *old_vram = GPU.vram;
-   uint8_t     old_shift = GPU.upscale_shift;
+   uint16_t *old_vram;
+   uint8_t     old_shift;
    uint16_t *new_vram;
+
+   /* Reallocates GPU.vram underneath the rasteriser. */
+   GPU_Worker_Sync();
+
+   old_vram  = GPU.vram;
+   old_shift = GPU.upscale_shift;
 
    /* Step 1+2: allocate scratch buffer at 1x. If we're already at 1x
     * we can alias the old vram directly; otherwise allocate scratch
@@ -1319,6 +1418,9 @@ bool GPU_Rescale(uint8_t ushift)
 static void GPU_SoftReset(void) /* Control command 0x00 */
 {
    GPU.IRQPending = false;
+   /* Drop any request the worker had outstanding along with the line. */
+   __atomic_store_n(&gpu_worker_irq_pending, false, __ATOMIC_RELEASE);
+   last_gpu_irq_state = false;
    IRQ_Assert(IRQ_GPU, GPU.IRQPending);
 
    InvalidateCache(&GPU);
@@ -1386,6 +1488,8 @@ static void GPU_SoftReset(void) /* Control command 0x00 */
 
 void GPU_Power(void)
 {
+   GPU_Worker_Sync();
+
    memset(GPU.vram, 0, 512 * 1024 * UPSCALE(&GPU) * UPSCALE(&GPU) * sizeof(*GPU.vram));
 
    memset(GPU.CLUT_Cache, 0, sizeof(GPU.CLUT_Cache));
@@ -1476,6 +1580,7 @@ void GPU_Power(void)
    GPU.scanline = 0;
    GPU.field = 0;
    GPU.field_ram_readout = 0;
+   gpu_field_ram_readout_emu = false;
    GPU.PhaseChange = 0;
 
    /* */
@@ -1622,9 +1727,6 @@ static void ProcessFIFO(uint32_t in_count)
       if (command->func[GPU.abr][GPU.TexMode])
          command->func[GPU.abr][GPU.TexMode | (GPU.MaskEvalAND ? 0x4 : 0x0)](&GPU, CB);
    }
-
-   if (gpu_worker_running && GPU.DrawTimeAvail < 0)
-      GPU.DrawTimeAvail = 0;
 }
 
 static INLINE void GPU_WriteCB(uint32_t InData, uint32_t addr)
@@ -1679,11 +1781,12 @@ static void GPU_WriteGP1_Internal(uint32_t V)
          GPU.IRQPending = false;
          if (gpu_worker_running)
          {
-            gpu_worker_irq_pending = false;
+            /* Clear both the worker's request and the level we last handed
+             * the CPU, so GPU_Update() doesn't re-raise it. */
+            __atomic_store_n(&gpu_worker_irq_pending, false, __ATOMIC_RELEASE);
             last_gpu_irq_state = false;
          }
-         else
-            IRQ_Assert(IRQ_GPU, GPU.IRQPending);
+         IRQ_Assert(IRQ_GPU, false);
          break;
 
       case 0x03:  /* Display enable */
@@ -1765,68 +1868,107 @@ static void GPU_WriteGP1_Internal(uint32_t V)
    }
 }
 
+/*
+ * GPU_Worker_Push() publishes the new head and then loads gpu_worker_idle;
+ * this thread publishes gpu_worker_idle and then loads head.  Both pairs are
+ * sequentially consistent, so by Dekker's argument at least one side observes
+ * the other's store: either the producer sees us idle and signals (we still
+ * hold the mutex, so it blocks until scond_wait() releases it), or we see the
+ * work and never sleep.  Testing the queue *before* publishing idle - which is
+ * what this loop used to do - leaves a window where neither side sees the
+ * other, the worker parks on a non-empty queue, and the next
+ * GPU_Worker_Sync() on the emulation thread never returns.
+ */
 static void gpu_worker_thread_loop(void *arg)
 {
    (void)arg;
 
    slock_lock(gpu_queue_lock);
 
-   while (!gpu_worker_stopping)
+   for (;;)
    {
-      while (__atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE) == gpu_queue_tail && !gpu_worker_stopping)
+      for (;;)
       {
-         __atomic_store_n(&gpu_worker_idle, true, __ATOMIC_RELEASE);
-         scond_signal(gpu_queue_drained);
-         scond_wait(gpu_queue_not_empty, gpu_queue_lock);
+         if (gpu_worker_stopping)
+            goto done;
+
+         __atomic_store_n(&gpu_worker_idle, true, __ATOMIC_SEQ_CST);
+
+         if (!GPU_Queue_Empty())
+            break;
+
+         scond_broadcast(gpu_queue_drained);
+         scond_wait_timeout(gpu_queue_not_empty, gpu_queue_lock,
+               GPU_WORKER_WAIT_US);
       }
 
-      if (gpu_worker_stopping && __atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE) == gpu_queue_tail)
-         break;
-
-      __atomic_store_n(&gpu_worker_idle, false, __ATOMIC_RELEASE);
+      __atomic_store_n(&gpu_worker_idle, false, __ATOMIC_SEQ_CST);
       slock_unlock(gpu_queue_lock);
 
-      uint32_t tail = gpu_queue_tail;
-      uint32_t head = __atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE);
-      uint32_t count = (head - tail) & GPU_QUEUE_MASK;
-      if (count > 256)
-         count = 256;
-
-      for (uint32_t i = 0; i < count; i++)
       {
-         uint32_t idx = (tail + i) & GPU_QUEUE_MASK;
-         if (gpu_queue[idx].type == GPU_CMD_GP0)
-            GPU_WriteGP0_Internal(gpu_queue[idx].data, gpu_queue[idx].addr);
-         else
-            GPU_WriteGP1_Internal(gpu_queue[idx].data);
+         uint32_t tail  = __atomic_load_n(&gpu_queue_tail, __ATOMIC_RELAXED);
+         uint32_t head  = __atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE);
+         uint32_t count = (head - tail) & GPU_QUEUE_MASK;
+         uint32_t i;
+
+         if (count > 256)
+            count = 256;
+
+         for (i = 0; i < count; i++)
+         {
+            uint32_t idx = (tail + i) & GPU_QUEUE_MASK;
+            switch (gpu_queue[idx].type)
+            {
+               case GPU_CMD_GP0:
+                  GPU_WriteGP0_Internal(gpu_queue[idx].data,
+                        gpu_queue[idx].addr);
+                  break;
+               case GPU_CMD_FIELD:
+                  GPU.field_ram_readout = (bool)gpu_queue[idx].data;
+                  break;
+               default:
+                  GPU_WriteGP1_Internal(gpu_queue[idx].data);
+                  break;
+            }
+         }
+
+         GPU_PublishStatus();
+
+         /* Retire only after the batch has run: GPU_Worker_Sync() reads an
+          * empty queue plus an idle worker as "everything is applied". */
+         __atomic_store_n(&gpu_queue_tail, (tail + count) & GPU_QUEUE_MASK,
+               __ATOMIC_RELEASE);
       }
 
-      gpu_queue_tail = (tail + count) & GPU_QUEUE_MASK;
-      __atomic_store_n(&gpu_queue_tail, (tail + count) & GPU_QUEUE_MASK, __ATOMIC_RELEASE);
-
       slock_lock(gpu_queue_lock);
-      scond_signal(gpu_queue_not_full);
+      scond_broadcast(gpu_queue_not_full);
    }
 
-   __atomic_store_n(&gpu_worker_idle, true, __ATOMIC_RELEASE);
-   scond_signal(gpu_queue_drained);
+done:
+   GPU_PublishStatus();
+   __atomic_store_n(&gpu_worker_idle, true, __ATOMIC_SEQ_CST);
+   scond_broadcast(gpu_queue_drained);
    slock_unlock(gpu_queue_lock);
 }
 
 void GPU_Worker_Sync(void)
 {
-   if (!gpu_worker_running || !gpu_queue_lock)
+   if (!__atomic_load_n(&gpu_worker_running, __ATOMIC_ACQUIRE) || !gpu_queue_lock)
       return;
 
-   if (__atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE) == __atomic_load_n(&gpu_queue_tail, __ATOMIC_ACQUIRE) &&
-       __atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
+   /* Lock-free fast path: nothing queued and the worker parked. */
+   if (GPU_Queue_Empty() && __atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
       return;
 
    slock_lock(gpu_queue_lock);
-   while (__atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE) != __atomic_load_n(&gpu_queue_tail, __ATOMIC_ACQUIRE) ||
-          !__atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
+   while (!gpu_worker_stopping
+         && (!GPU_Queue_Empty()
+            || !__atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE)))
    {
-      scond_wait(gpu_queue_drained, gpu_queue_lock);
+      /* Timed: the predicate is re-tested every pass, so a lost signal costs
+       * a few microseconds instead of wedging the emulation thread. */
+      scond_wait_timeout(gpu_queue_drained, gpu_queue_lock,
+            GPU_WORKER_WAIT_US);
    }
    slock_unlock(gpu_queue_lock);
 }
@@ -1836,12 +1978,21 @@ void GPU_Worker_Init(void)
    if (gpu_worker_running)
       return;
 
+   /* The software renderer's scanout runs on the emulation thread and reads
+    * GPU.vram line by line from GPU_Update(), which would race the worker's
+    * rasterisation.  Only the hardware backends keep their own VRAM, so
+    * threading is a hardware-renderer feature. */
+   if (rhi_intf_is_type() == RHI_SOFTWARE)
+      return;
+
    gpu_queue_head = 0;
    gpu_queue_tail = 0;
    gpu_worker_idle = true;
    gpu_worker_stopping = false;
-   gpu_worker_irq_pending = false;
-   last_gpu_irq_state = false;
+   gpu_worker_irq_pending = GPU.IRQPending;
+   last_gpu_irq_state = GPU.IRQPending;
+   gpu_field_ram_readout_emu = GPU.field_ram_readout;
+   GPU_PublishStatus();
 
    gpu_queue_lock = slock_new();
    gpu_queue_not_empty = scond_new();
@@ -1854,29 +2005,41 @@ void GPU_Worker_Init(void)
       return;
    }
 
+   /* OpenGL records instead of issuing GL while the worker is live.  Armed
+    * before the thread exists so the very first queued command is recorded. */
+   rhi_intf_set_threaded_recording(true);
+
+   /* Published before the thread exists: gpu_worker_running gates the
+    * timing-model bypass the worker itself relies on inside ProcessFIFO. */
+   __atomic_store_n(&gpu_worker_running, true, __ATOMIC_RELEASE);
+
    gpu_thread = sthread_create(gpu_worker_thread_loop, NULL);
    if (!gpu_thread)
    {
+      /* Kill() clears gpu_worker_running and releases what we allocated. */
       GPU_Worker_Kill();
       return;
    }
-
-   gpu_worker_running = true;
 }
 
 void GPU_Worker_Kill(void)
 {
-   if (!gpu_worker_running && !gpu_thread)
+   /* Also the cleanup path for a partially-built worker, so test the
+    * primitives too and not just the running flag. */
+   if (!gpu_worker_running && !gpu_thread && !gpu_queue_lock)
       return;
 
-   last_gpu_irq_state = false;
+   /* Retire queued drawing before the thread goes away, otherwise teardown
+    * throws away a frame's worth of VRAM writes. */
+   GPU_Worker_Sync();
 
    if (gpu_queue_lock)
    {
       slock_lock(gpu_queue_lock);
       gpu_worker_stopping = true;
-      scond_signal(gpu_queue_not_empty);
-      scond_signal(gpu_queue_not_full);
+      scond_broadcast(gpu_queue_not_empty);
+      scond_broadcast(gpu_queue_not_full);
+      scond_broadcast(gpu_queue_drained);
       slock_unlock(gpu_queue_lock);
    }
 
@@ -1893,25 +2056,103 @@ void GPU_Worker_Kill(void)
 
    gpu_worker_running = false;
    gpu_worker_stopping = false;
+
+   /* Back to issuing GL directly; this also replays anything still recorded.
+    * The worker is joined by now, so nothing can append behind us. */
+   rhi_intf_set_threaded_recording(false);
+
+   /* Back to direct assertion.  Flush a pending edge the drained worker raised
+    * but GPU_Update() hadn't published yet - and only that, because Kill() is
+    * also the teardown path and IRQ_Assert() reaches into CPU/lightrec state
+    * we shouldn't poke for nothing. */
+   if (gpu_worker_irq_pending != last_gpu_irq_state)
+   {
+      GPU.IRQPending = gpu_worker_irq_pending;
+      IRQ_Assert(IRQ_GPU, gpu_worker_irq_pending);
+   }
+   last_gpu_irq_state = false;
 }
 
+/* Everything that has to hold for the worker to be allowed to run.  Checked
+ * afresh on every frame because the renderer is only chosen in
+ * rhi_intf_open() - after the first check_variables() pass - and PGXP can be
+ * toggled at runtime. */
+static bool GPU_Worker_Permitted(void)
+{
+   if (!gpu_worker_enabled)
+      return false;
+
+   /*
+    * A whitelist, per backend, because what the worker is allowed to touch
+    * differs sharply between them.
+    *
+    * Software: GPU_Update() scans VRAM out line by line on this thread, which
+    * would race the rasteriser.  Never threaded.
+    *
+    * Vulkan: no thread-affine context.  Submission is serialised through the
+    * frontend's queue lock (rhi_vk_lock_queue) and everything else the worker
+    * touches is core-owned, so the worker calls the renderer directly.
+    *
+    * OpenGL: GL calls are only valid on the thread holding the context, and
+    * the draw entry points reach gl_renderer_draw() whenever the vertex or
+    * index buffer fills mid-primitive.  The backend therefore records calls
+    * instead of issuing them (rhi_intf_set_threaded_recording) and the
+    * emulation thread replays them at end of frame.  That works only while
+    * nothing on the worker needs a synchronous answer from GL - which means
+    * the software framebuffer must be on, since without it Command_FBRead()
+    * asks for a hard read-back mid-command. */
+   switch (rhi_intf_is_type())
+   {
+      case RHI_VULKAN:
+         break;
+      case RHI_OPENGL:
+         if (!rhi_intf_has_software_renderer())
+            return false;
+         break;
+      default:
+         return false;
+   }
+
+   /* PGXP feeds the rasteriser from state the CPU thread owns: the memory
+    * shadow GPU_WriteCB() samples through ReadMem(), and the vertex cache
+    * PGXP_CacheVertex() fills from the GTE.  On the worker both would be read
+    * at a later CPU time than the GP0 word they belong to - a data race, and
+    * wrong geometry even if it were atomic.  Correcting it means snapshotting
+    * the PGXP vertex into each queue entry; until then the two are exclusive.
+    *
+    * PGXP_enabled() is the same predicate GPU_WriteCB()/ProcessFIFO() use to
+    * decide whether to touch PGXP at all, so this tracks it exactly. */
+   if (PGXP_enabled())
+      return false;
+
+   return true;
+}
+
+/* Records the preference only.  Starting and stopping is GPU_Worker_Refresh()'s
+ * job, on the emulation thread: retro_load_game() can run on a separate loader
+ * thread, and a worker created there inherits that thread's CPU affinity - if
+ * it lands on a little core the emulation thread just blocks waiting on it. */
 void GPU_SetThreaded(bool enabled)
 {
-   if (gpu_worker_enabled == enabled)
+   gpu_worker_enabled = enabled;
+}
+
+/* Call once per frame from the emulation thread, after option handling and
+ * before CPU_Run().  Starting here (rather than at load) means the thread
+ * inherits this thread's affinity and priority; re-checking here means a
+ * mid-session renderer or PGXP change takes effect before the next frame's
+ * drawing rather than one frame late. */
+void GPU_Worker_Refresh(void)
+{
+   bool permitted = GPU_Worker_Permitted();
+
+   if (permitted == gpu_worker_running)
       return;
 
-   if (gpu_worker_running)
-   {
-      GPU_Worker_Sync();
-      if (!enabled)
-         GPU_Worker_Kill();
-   }
-   else if (enabled)
-   {
+   if (permitted)
       GPU_Worker_Init();
-   }
-
-   gpu_worker_enabled = enabled;
+   else
+      GPU_Worker_Kill();
 }
 
 bool GPU_GetThreaded(void)
@@ -1919,32 +2160,46 @@ bool GPU_GetThreaded(void)
    return gpu_worker_enabled;
 }
 
+/* Requested (GPU_GetThreaded) vs actually threaded: the worker declines under
+ * the software renderer and if the thread can't be created. */
+bool GPU_Worker_Active(void)
+{
+   return gpu_worker_running;
+}
+
 static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
 {
+   uint32_t head;
+
    while (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
    {
       slock_lock(gpu_queue_lock);
-      if (__atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
-         scond_signal(gpu_queue_not_empty);
+      /* Kick the worker in case it is parked, then re-test under the lock so
+       * a not_full signal raised in between can't be missed. */
+      scond_broadcast(gpu_queue_not_empty);
       if (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
-         scond_wait(gpu_queue_not_full, gpu_queue_lock);
+         scond_wait_timeout(gpu_queue_not_full, gpu_queue_lock,
+               GPU_WORKER_WAIT_US);
       slock_unlock(gpu_queue_lock);
    }
 
    if (gpu_worker_stopping)
       return;
 
-   uint32_t head = gpu_queue_head;
+   head = __atomic_load_n(&gpu_queue_head, __ATOMIC_RELAXED);
    gpu_queue[head].type = type;
    gpu_queue[head].data = data;
    gpu_queue[head].addr = addr;
 
-   __atomic_store_n(&gpu_queue_head, (head + 1) & GPU_QUEUE_MASK, __ATOMIC_RELEASE);
+   /* Publish the entry, then look at the worker: see the comment on
+    * gpu_worker_thread_loop() for why both must be sequentially consistent. */
+   __atomic_store_n(&gpu_queue_head, (head + 1) & GPU_QUEUE_MASK,
+         __ATOMIC_SEQ_CST);
 
-   if (__atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
+   if (__atomic_load_n(&gpu_worker_idle, __ATOMIC_SEQ_CST))
    {
       slock_lock(gpu_queue_lock);
-      scond_signal(gpu_queue_not_empty);
+      scond_broadcast(gpu_queue_not_empty);
       slock_unlock(gpu_queue_lock);
    }
 }
@@ -1956,81 +2211,30 @@ void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
 
    if(A & 4)   /* GP1 ("Control") */
    {
-      if (gpu_worker_enabled && gpu_worker_running)
-      {
-         uint32_t command = V >> 24;
-         switch(command)
-         {
-            case 0x00:  /* Reset GPU — CPU must see cleared InCmd/FIFO/status */
-            case 0x01:  /* Reset command buffer — CPU must see cleared InCmd */
-            case 0x10:  /* GPU info — CPU reads DataReadBuffer immediately */
-               GPU_Worker_Sync();
-               GPU_WriteGP1_Internal(V);
-               break;
+      /*
+       * GP1 is always applied here, on the emulation thread, never queued.
+       *
+       * Every one of these commands either feeds GPUSTAT (which the CPU reads
+       * without draining the queue) or pokes the renderer through rhi_intf_*.
+       * Splitting them - applying the display registers here *and* queueing a
+       * copy for the worker, which is what this used to do - lets the worker
+       * replay a stale value over a newer one and drives the renderer from two
+       * threads at once.  Draining first and applying once keeps a single
+       * writer for every field, and GP1 traffic is a handful of writes per
+       * frame, so the sync costs nothing measurable.
+       */
+      GPU_Worker_Sync();
+      GPU_WriteGP1_Internal(V);
 
-            case 0x02:  /* Acknowledge IRQ — clear flags on CPU thread for instant visibility */
-               gpu_worker_irq_pending = false;
-               GPU.IRQPending = false;
-               IRQ_Assert(IRQ_GPU, false);
-               last_gpu_irq_state = false;
-               /* Also queue to worker so its copy stays consistent */
-               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
-               break;
-
-            case 0x03:  /* Display enable */
-               GPU.DisplayOff = (V & 0x00FFFFFF) & 1;
-               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
-               break;
-
-            case 0x04:  /* DMA Setup — GPUSTAT exposes DMAControl, update for CPU reads */
-               GPU.DMAControl = (V & 0x00FFFFFF) & 0x3;
-               /* Queue so worker-side GP1 handler stays in sync */
-               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
-               break;
-
-            case 0x05:  /* Start of display area in framebuffer */
-               GPU.DisplayFB_XStart = (V & 0x00FFFFFF) & 0x3FE;
-               GPU.DisplayFB_YStart = ((V & 0x00FFFFFF) >> 10) & 0x1FF;
-               GPU.display_change_count++;
-               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
-               break;
-
-            case 0x06:  /* Horizontal display range */
-               GPU.HorizStart = (V & 0x00FFFFFF) & 0xFFF;
-               GPU.HorizEnd = ((V & 0x00FFFFFF) >> 12) & 0xFFF;
-               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
-               break;
-
-            case 0x07:  /* Vertical display range */
-               GPU.VertStart = (V & 0x00FFFFFF) & 0x3FF;
-               GPU.VertEnd = ((V & 0x00FFFFFF) >> 10) & 0x3FF;
-               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
-               break;
-
-            case 0x08:  /* Display Mode */
-               GPU.DisplayMode = (V & 0x00FFFFFF) & 0xFF;
-               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
-               break;
-
-            case 0x09:  /* TexDisableAllowChange */
-               GPU.TexDisableAllowChange = (V & 0x00FFFFFF) & 1;
-               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
-               break;
-
-            default:
-               /* Queue remaining commands to worker */
-               GPU_Worker_Push(GPU_CMD_GP1, V, 0);
-               break;
-         }
-      }
-      else
-      {
-         GPU_WriteGP1_Internal(V);
-      }
+      /* GP1 0x00/0x01 clear InCmd and the blitter FIFO; refresh the snapshot
+       * GPU_Read() reports, since the worker isn't going to. */
+      if (gpu_worker_running)
+         GPU_PublishStatus();
    }
    else        /* GP0 ("Data") */
    {
-      if (gpu_worker_enabled && gpu_worker_running)
+      /* The hot path: raw drawing data, owned end to end by the worker. */
+      if (gpu_worker_running)
       {
          GPU_Worker_Push(GPU_CMD_GP0, V, A);
          return;
@@ -2041,7 +2245,7 @@ void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
 
 void GPU_WriteDMA(uint32_t V, uint32_t addr)
 {
-   if (gpu_worker_enabled && gpu_worker_running)
+   if (gpu_worker_running)
    {
       GPU_Worker_Push(GPU_CMD_GP0, V, addr);
       return;
@@ -2080,12 +2284,19 @@ static INLINE uint32_t GPU_ReadData(void)
 
 uint32_t GPU_ReadDMA(void)
 {
-   if (gpu_worker_enabled && gpu_worker_running)
-      GPU_Worker_Sync();
+   uint32_t ret;
+
+   GPU_Worker_Sync();
 
    if(GPU.InCmd != INCMD_FBREAD)
       return GPU.DataReadBuffer;
-   return GPU_ReadData();
+
+   /* GPU_ReadData() advances FBRW_* and can end the transfer, i.e. it writes
+    * state the worker normally owns - republish for the next GPUSTAT poll. */
+   ret = GPU_ReadData();
+   if (gpu_worker_running)
+      GPU_PublishStatus();
+   return ret;
 }
 
 uint32_t GPU_Read(const int32_t timestamp, uint32_t A)
@@ -2115,14 +2326,21 @@ uint32_t GPU_Read(const int32_t timestamp, uint32_t A)
       /* GPU idle bit */
       if (gpu_worker_running)
       {
-         if (GPU_Queue_Count() == 0 && gpu_worker_idle
-               && GPU.InCmd == INCMD_NONE && GPU_BlitterFIFO.in_count == 0)
+         /* Read the snapshot the worker republishes after each batch rather
+          * than the live fields it is mutating. */
+         uint32_t incmd = __atomic_load_n(&gpu_pub_incmd, __ATOMIC_ACQUIRE);
+         uint32_t fifo  = __atomic_load_n(&gpu_pub_fifo_count, __ATOMIC_ACQUIRE);
+
+         if (GPU_Queue_Count() == 0
+               && __atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE)
+               && incmd == INCMD_NONE && fifo == 0)
             ret |= 1 << 26;
 
-         if (GPU.InCmd == INCMD_FBREAD)
+         if (incmd == INCMD_FBREAD)
             ret |= (1 << 27);
 
-         ret |= (GPU_Queue_Count() < (GPU_QUEUE_SIZE - 1024)) << 28;
+         ret |= (GPU_Queue_Count()
+               < (GPU_QUEUE_SIZE - GPU_QUEUE_FIFO_MARGIN)) << 28;
       }
       else
       {
@@ -2136,34 +2354,24 @@ uint32_t GPU_Read(const int32_t timestamp, uint32_t A)
          ret |= CalcFIFOReadyBit() << 28;    /* FIFO has room bit? (kinda). */
       }
 
-      /* */
-      /* */
-      ret |= GPU.TexPageX >> 6;
-      ret |= GPU.TexPageY >> 4;
-      ret |= GPU.abr << 5;
-      ret |= GPU.TexMode << 7;
-
-      ret |= GPU.dtd << 9;
-      ret |= GPU.dfe << 10;
-
-      if(GPU.MaskSetOR)
-         ret |= 1 << 11;
-
-      if(GPU.MaskEvalAND)
-         ret |= 1 << 12;
-
-      ret |= GPU.TexDisable << 15;
+      /* Draw-mode bits: the worker owns these fields while it is running, so
+       * take them from the snapshot rather than reading them live. */
+      if (gpu_worker_running)
+         ret |= __atomic_load_n(&gpu_pub_drawmode, __ATOMIC_ACQUIRE);
+      else
+         ret |= GPU_DrawModeStatusBits();
    }
    else     /* "Data" */
    {
-      if (gpu_worker_enabled && gpu_worker_running)
-      {
-         if (GPU.InCmd == INCMD_FBREAD || GPU_Queue_Count() > 0 || !gpu_worker_idle)
-            GPU_Worker_Sync();
-      }
+      /* Reading GP0 data hands back VRAM the worker may still be filling. */
+      GPU_Worker_Sync();
 
       if(GPU.InCmd == INCMD_FBREAD)
+      {
          ret = GPU_ReadData();
+         if (gpu_worker_running)
+            GPU_PublishStatus();
+      }
       else
          ret = GPU.DataReadBuffer;
    }
@@ -2354,18 +2562,22 @@ int32_t GPU_Update(const int32_t sys_timestamp)
    if(GPU.DrawTimeAvail > (2*EventCycles << psx_gpu_overclock_shift))
       GPU.DrawTimeAvail = (2*EventCycles << psx_gpu_overclock_shift);
 
-   if(GPU_BlitterFIFO.in_count && GPU.InCmd != INCMD_FBREAD)
-   {
-      if(!gpu_worker_running)
-         ProcessFIFO(GPU_BlitterFIFO.in_count);
-   }
+   /* The blitter FIFO and InCmd belong to the worker while threading is on;
+    * don't even read them from here. */
+   if(!gpu_worker_running
+         && GPU_BlitterFIFO.in_count && GPU.InCmd != INCMD_FBREAD)
+      ProcessFIFO(GPU_BlitterFIFO.in_count);
 
    if(gpu_worker_running)
    {
-      if (gpu_worker_irq_pending != last_gpu_irq_state)
+      /* Emulation thread - the only place allowed to move the GPU IRQ line. */
+      bool want = __atomic_load_n(&gpu_worker_irq_pending, __ATOMIC_ACQUIRE);
+
+      if (want != last_gpu_irq_state)
       {
-         last_gpu_irq_state = gpu_worker_irq_pending;
-         IRQ_Assert(IRQ_GPU, last_gpu_irq_state);
+         last_gpu_irq_state = want;
+         GPU.IRQPending     = want;
+         IRQ_Assert(IRQ_GPU, want);
       }
    }
 
@@ -2562,9 +2774,9 @@ int32_t GPU_Update(const int32_t sys_timestamp)
                GPU.DisplayFB_CurYOffset = 0;
 
                if((GPU.DisplayMode & 0x24) == 0x24)
-                  GPU.field_ram_readout = !GPU.field;
+                  GPU_SetFieldRamReadout(!GPU.field);
                else
-                  GPU.field_ram_readout = 0;
+                  GPU_SetFieldRamReadout(false);
             }
 
             if(GPU.scanline == GPU.VertStart && GPU.InVBlank)
@@ -2590,7 +2802,7 @@ int32_t GPU_Update(const int32_t sys_timestamp)
             /* test that showed an oddity was pathological in */
             /* that VertEnd < VertStart in it. */
             if((GPU.DisplayMode & 0x24) == 0x24)
-               displayfb_yoffset = (GPU.DisplayFB_CurYOffset << 1) + (GPU.InVBlank ? 0 : GPU.field_ram_readout);
+               displayfb_yoffset = (GPU.DisplayFB_CurYOffset << 1) + (GPU.InVBlank ? 0 : gpu_field_ram_readout_emu);
 
             GPU.DisplayFB_CurLineYReadout = (GPU.DisplayFB_YStart + displayfb_yoffset) & 0x1FF;
 
@@ -2708,7 +2920,7 @@ int32_t GPU_Update(const int32_t sys_timestamp)
                            &deferred_scanouts[deferred_scanout_count++];
                         const uint32_t opp_y = (GPU.DisplayFB_YStart
                               + (GPU.DisplayFB_CurYOffset << 1)
-                              + (GPU.InVBlank ? 0 : !GPU.field_ram_readout))
+                              + (GPU.InVBlank ? 0 : !gpu_field_ram_readout_emu))
                            & 0x1FF;
                         r->dest_line       = dest_line;
                         r->dest_line_other = dest_line ^ 1;
@@ -2850,8 +3062,7 @@ TheEnd:
 
 void GPU_StartFrame(EmulateSpecStruct *espec_arg)
 {
-   if (gpu_worker_enabled && gpu_worker_running)
-      GPU_Worker_Sync();
+   GPU_Worker_Sync();
 
    GPU.sl_zero_reached = false;
    GPU.espec           = espec_arg;
@@ -3046,6 +3257,15 @@ void GPU_RestoreStateP2(bool load)
 
 void GPU_RestoreStateP3(void)
 {
+   GPU_Worker_Sync();
+
+   /* A loaded state brings its own IRQPending; re-seat the worker mirrors so
+    * GPU_Update() doesn't replay a stale edge. */
+   __atomic_store_n(&gpu_worker_irq_pending, GPU.IRQPending, __ATOMIC_RELEASE);
+   last_gpu_irq_state = GPU.IRQPending;
+   gpu_field_ram_readout_emu = GPU.field_ram_readout;
+   GPU_PublishStatus();
+
    for(unsigned i = 0; i < 256; i++)
    {
       GPU.TexCache[i].Tag = TexCache_Tag[i];
@@ -3100,8 +3320,7 @@ void GPU_RestoreStateP3(void)
 
 int GPU_StateAction(StateMem *sm, int load, int data_only)
 {
-   if (gpu_worker_enabled && gpu_worker_running)
-      GPU_Worker_Sync();
+   GPU_Worker_Sync();
 
    GPU_RestoreStateP1(load);
 
@@ -3263,12 +3482,12 @@ int GPU_StateAction(StateMem *sm, int load, int data_only)
 
 bool GPU_get_display_possibly_dirty(void)
 {
-   return GPU.display_possibly_dirty;
+   return __atomic_load_n(&GPU.display_possibly_dirty, __ATOMIC_ACQUIRE);
 }
 
 void GPU_set_display_possibly_dirty(bool dirty)
 {
-   GPU.display_possibly_dirty = dirty;
+   __atomic_store_n(&GPU.display_possibly_dirty, dirty, __ATOMIC_RELEASE);
 }
 
 void GPU_set_display_change_count(unsigned a)
@@ -3283,6 +3502,8 @@ unsigned GPU_get_display_change_count(void)
 
 void GPU_set_dither_upscale_shift(uint8_t factor)
 {
+   /* Read by the rasteriser. */
+   GPU_Worker_Sync();
    GPU.dither_upscale_shift = factor;
 }
 
@@ -3293,15 +3514,14 @@ uint8_t GPU_get_upscale_shift(void)
 
 bool GPU_DMACanWrite(void)
 {
-   if (gpu_worker_enabled && gpu_worker_running)
-   {
-      return (GPU_Queue_Count() < (GPU_QUEUE_SIZE - 1024));
-   }
+   if (gpu_worker_running)
+      return (GPU_Queue_Count() < (GPU_QUEUE_SIZE - GPU_QUEUE_FIFO_MARGIN));
    return CalcFIFOReadyBit();
 }
 
 uint16_t *GPU_get_vram(void)
 {
+   GPU_Worker_Sync();
    return GPU.vram;
 }
 

@@ -60,8 +60,27 @@ typedef enum
    RHI_DEFER_SET_VERTICAL_DISPLAY_RANGE,
    RHI_DEFER_SET_DISPLAY_MODE,
    RHI_DEFER_LOAD_IMAGE,
-   RHI_DEFER_TOGGLE_DISPLAY
+   RHI_DEFER_TOGGLE_DISPLAY,
+
+   /* Drawing.  Originally excluded on purpose (see the note above): with no
+    * renderer there is nowhere to draw to, so pre-context geometry was
+    * dropped.  They exist now for a second user of this queue - the threaded
+    * GPU under a backend whose API is thread-affine, where the worker records
+    * drawing it may not issue itself and the emulation thread replays it at
+    * end of frame.  The context-down case still drops them, by clearing the
+    * queue rather than by refusing to record. */
+   RHI_DEFER_PUSH_TRIANGLE,
+   RHI_DEFER_PUSH_QUAD,
+   RHI_DEFER_PUSH_LINE,
+   RHI_DEFER_FILL_RECT,
+   RHI_DEFER_COPY_RECT
 } rhi_defer_kind_t;
+
+/* Vertex attributes carried by a recorded triangle/quad.  precise_rgb is
+ * 3 floats per vertex and fog 4 per vertex, matching how the backends index
+ * the caller's arrays (precise_rgb[v*3+c], fog[v*4+c]); both are optional at
+ * the call site, so presence is recorded explicitly rather than inferred. */
+#define RHI_DEFER_MAX_VERTS 4
 
 /*
  * A single deferred operation. The struct stores the raw arguments the
@@ -139,7 +158,16 @@ typedef struct
          uint16_t  y;
          uint16_t  w;
          uint16_t  h;
+         /* Live pointer into the caller's VRAM mirror.  Only meaningful when
+          * has_pixels is false. */
          uint16_t *vram;
+         /* Offset into the queue's pixel arena of a w*h tightly-packed copy
+          * taken at record time.  Required whenever the queue may be replayed
+          * after the source has moved on - i.e. always, for a per-frame
+          * journal, where a later write to the same VRAM rect would otherwise
+          * make this upload carry the wrong pixels. */
+         size_t    pixel_offset;
+         bool      has_pixels;
          bool      mask_test;
          bool      set_mask;
       } load_image;
@@ -148,6 +176,56 @@ typedef struct
       {
          bool status;
       } toggle_display;
+
+      /* Shared by PUSH_TRIANGLE (nverts 3) and PUSH_QUAD (nverts 4). */
+      struct
+      {
+         float    px[RHI_DEFER_MAX_VERTS];
+         float    py[RHI_DEFER_MAX_VERTS];
+         float    pw[RHI_DEFER_MAX_VERTS];
+         uint32_t c[RHI_DEFER_MAX_VERTS];
+         float    precise_rgb[RHI_DEFER_MAX_VERTS * 3];
+         float    fog[RHI_DEFER_MAX_VERTS * 4];
+         uint16_t tx[RHI_DEFER_MAX_VERTS];
+         uint16_t ty[RHI_DEFER_MAX_VERTS];
+         uint16_t min_u, min_v, max_u, max_v;
+         uint16_t texpage_x, texpage_y;
+         uint16_t clut_x, clut_y;
+         int      blend_mode;
+         uint8_t  nverts;
+         uint8_t  texture_blend_mode;
+         uint8_t  depth_shift;
+         bool     has_precise_rgb;
+         bool     has_fog;
+         bool     dither;
+         bool     mask_test;
+         bool     set_mask;
+         bool     is_sprite;   /* quad only */
+         bool     may_be_2d;   /* quad only */
+      } push_poly;
+
+      struct
+      {
+         int16_t  p0x, p0y, p1x, p1y;
+         uint32_t c0, c1;
+         int      blend_mode;
+         bool     dither;
+         bool     mask_test;
+         bool     set_mask;
+      } push_line;
+
+      struct
+      {
+         uint32_t color;
+         uint16_t x, y, w, h;
+      } fill_rect;
+
+      struct
+      {
+         uint16_t src_x, src_y, dst_x, dst_y, w, h;
+         bool     mask_test;
+         bool     set_mask;
+      } copy_rect;
    } u;
 } rhi_defer_op_t;
 
@@ -161,6 +239,19 @@ typedef struct
    rhi_defer_op_t *ops;       /* heap-allocated, grown on demand           */
    size_t          count;     /* number of valid entries                   */
    size_t          capacity;  /* allocated slots                           */
+   /* Packed pixel payloads for recorded VRAM uploads.  Ops reference this by
+    * offset rather than by pointer so growth can realloc it freely, and it is
+    * reset (not freed) alongside the op array. */
+   uint16_t       *pixels;
+   size_t          pixel_count;
+   size_t          pixel_capacity;
+   /* Normally a drain that grew the queue well past its initial size gives
+    * the memory back, since the context-down burst it was sized for happens
+    * once.  A queue used as a per-frame journal refills to the same high-water
+    * mark every frame, and handing it back would mean a free plus a run of
+    * doubling reallocs every single frame - far more work than the recording
+    * saves.  Set this while that is the usage. */
+   bool            keep_storage;
 } rhi_defer_queue_t;
 
 /*
@@ -180,6 +271,10 @@ void rhi_defer_clear(rhi_defer_queue_t *q);
 
 /* Number of currently queued ops. Cheap. */
 size_t rhi_defer_count(const rhi_defer_queue_t *q);
+
+/* Keep the backing allocation across drains (see keep_storage above).
+ * Clearing it does not free anything by itself; the next drain will. */
+void rhi_defer_set_keep_storage(rhi_defer_queue_t *q, bool keep);
 
 /*
  * Drain the queue in FIFO order, invoking `dispatch(user, op)` once per
@@ -231,7 +326,83 @@ void rhi_defer_push_load_image(rhi_defer_queue_t *q,
                                uint16_t *vram,
                                bool mask_test, bool set_mask);
 
+/* As above, but copies the w*h rect out of `src` (read at `src_stride`) into
+ * the queue's pixel arena, so the upload replays the pixels as they were when
+ * it was recorded rather than whatever is in VRAM at drain time.  Returns
+ * false if the copy could not be made, in which case nothing was queued. */
+bool rhi_defer_push_load_image_snapshot(rhi_defer_queue_t *q,
+                                        uint16_t x, uint16_t y,
+                                        uint16_t w, uint16_t h,
+                                        const uint16_t *src,
+                                        size_t src_stride,
+                                        size_t src_height,
+                                        bool mask_test, bool set_mask);
+
+/* Reproduce a recorded snapshot into `dst` (a full `stride` x `height` VRAM
+ * image) at the rect's own coordinates, wrapping in x and y exactly as the
+ * backends' upload paths do, so a subsequent read of that rect sees what was
+ * recorded.  Only the rect is written. */
+void rhi_defer_stage_load_image(const rhi_defer_op_t *op,
+                                const uint16_t *packed,
+                                uint16_t *dst,
+                                size_t stride, size_t height);
+
+/* Base of the pixel arena, for a dispatcher unpacking a snapshot. */
+const uint16_t *rhi_defer_pixels(const rhi_defer_queue_t *q, size_t offset);
+
 void rhi_defer_push_toggle_display(rhi_defer_queue_t *q, bool status);
+
+/* Drawing.  `precise_rgb` and `fog` may be NULL; when present they are copied
+ * (nverts*3 and nverts*4 floats respectively), never aliased - they point at
+ * caller stack arrays that are gone by the time the queue drains. */
+void rhi_defer_push_triangle(rhi_defer_queue_t *q,
+      float p0x, float p0y, float p0w,
+      float p1x, float p1y, float p1w,
+      float p2x, float p2y, float p2w,
+      uint32_t c0, uint32_t c1, uint32_t c2,
+      const float *precise_rgb, const float *fog,
+      uint16_t t0x, uint16_t t0y,
+      uint16_t t1x, uint16_t t1y,
+      uint16_t t2x, uint16_t t2y,
+      uint16_t min_u, uint16_t min_v,
+      uint16_t max_u, uint16_t max_v,
+      uint16_t texpage_x, uint16_t texpage_y,
+      uint16_t clut_x, uint16_t clut_y,
+      uint8_t texture_blend_mode, uint8_t depth_shift,
+      bool dither, int blend_mode, bool mask_test, bool set_mask);
+
+void rhi_defer_push_quad(rhi_defer_queue_t *q,
+      float p0x, float p0y, float p0w,
+      float p1x, float p1y, float p1w,
+      float p2x, float p2y, float p2w,
+      float p3x, float p3y, float p3w,
+      uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3,
+      const float *precise_rgb, const float *fog,
+      uint16_t t0x, uint16_t t0y,
+      uint16_t t1x, uint16_t t1y,
+      uint16_t t2x, uint16_t t2y,
+      uint16_t t3x, uint16_t t3y,
+      uint16_t min_u, uint16_t min_v,
+      uint16_t max_u, uint16_t max_v,
+      uint16_t texpage_x, uint16_t texpage_y,
+      uint16_t clut_x, uint16_t clut_y,
+      uint8_t texture_blend_mode, uint8_t depth_shift,
+      bool dither, int blend_mode, bool mask_test, bool set_mask,
+      bool is_sprite, bool may_be_2d);
+
+void rhi_defer_push_line(rhi_defer_queue_t *q,
+      int16_t p0x, int16_t p0y, int16_t p1x, int16_t p1y,
+      uint32_t c0, uint32_t c1,
+      bool dither, int blend_mode, bool mask_test, bool set_mask);
+
+void rhi_defer_push_fill_rect(rhi_defer_queue_t *q,
+      uint32_t color, uint16_t x, uint16_t y, uint16_t w, uint16_t h);
+
+void rhi_defer_push_copy_rect(rhi_defer_queue_t *q,
+      uint16_t src_x, uint16_t src_y,
+      uint16_t dst_x, uint16_t dst_y,
+      uint16_t w, uint16_t h,
+      bool mask_test, bool set_mask);
 
 #ifdef __cplusplus
 }

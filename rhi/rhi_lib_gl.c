@@ -20,6 +20,7 @@
 #include "rhi_intf.h" /* enums */
 #include "rhi_tt.h"  /* shared HD texture replacement/tracking engine */
 #include "rhi_defer.h"
+#include <rthreads/rthreads.h>
 #include "tt_trace.h"
 #include "beetle_psx_globals.h"
 
@@ -97,6 +98,10 @@ static bool gl_fp16_renderable(void)
  * corruption - reproduces on end-user machines but not on Mesa, where
  * every map is serviced synchronously; when that happens the user's
  * log, not our rig, is the instrument. */
+/* Defined with the threaded-GPU recording state further down. */
+static void gl_journal_drain(void);
+static bool gl_journal_check_owner_thread(const char *what);
+
 bool rhi_gl_read_vram(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                       uint16_t *vram);
 
@@ -1085,11 +1090,136 @@ static retro_gl static_renderer;
  */
 static rhi_defer_queue_t gl_defer_queue;
 
+static void gl_defer_dispatch(void *user, const rhi_defer_op_t *op);
+
+/*
+ * Threaded-GPU recording.
+ *
+ * OpenGL is thread-affine: every GL call must run on the thread holding the
+ * current context, which is the frontend's.  The GPU worker executes GP0
+ * commands on its own thread, so while it is running the rhi_gl_* entry points
+ * do not touch GL at all - they append to gl_defer_queue instead, and the
+ * emulation thread replays the whole queue in order at end of frame (and
+ * before any read-back), by which point the worker has been drained.
+ *
+ * This reuses the queue that already buffers state across the context-down
+ * window rather than adding a second one, so there is exactly one ordering for
+ * both cases.  It also means the state setters must be recorded too, even the
+ * ones that never touch GL: executing them immediately while draws are still
+ * queued would apply them to the wrong side of the recorded stream.
+ */
+static bool gl_journal_active   = false;
+static bool gl_journal_draining = false;
+/* The thread that armed recording, i.e. the one that owns the GL context.
+ * Used only to catch a renderer call arriving from the worker on a path that
+ * cannot be recorded. */
+static uintptr_t gl_journal_owner_thread = 0;
+
+/* Full-VRAM scratch used to stage a recorded upload back to full stride.
+ * Allocated on first use and kept: it is only reached while recording, and a
+ * recording session spans the whole time the GPU worker is up. */
+static uint16_t *gl_journal_stage = NULL;
+
+static uint16_t *gl_journal_stage_buffer(void)
+{
+   if (!gl_journal_stage)
+      gl_journal_stage = (uint16_t *)malloc(
+            (size_t)VRAM_WIDTH_PIXELS * (size_t)VRAM_HEIGHT * sizeof(uint16_t));
+   return gl_journal_stage;
+}
+
+/* Ceiling on ops buffered while there is no renderer to replay them on.
+ * Generous next to a normal frame's primitive count; it exists only to bound
+ * growth across a long context-down window. */
+#define GL_JOURNAL_MAX_OPS 262144
+
+/* Record rather than execute?  Also true with no renderer at all, which is the
+ * original context-down case. */
+static INLINE bool gl_should_defer(const gl_renderer *renderer)
+{
+   return !renderer || (gl_journal_active && !gl_journal_draining);
+}
+
+/* Replay everything recorded so far.  Emulation thread only, and only with a
+ * live renderer - while the context is down the existing gl_context_reset()
+ * drain owns the queue. */
+static void gl_journal_drain(void)
+{
+   if (gl_journal_draining)
+      return;
+   if (rhi_defer_count(&gl_defer_queue) == 0)
+      return;
+
+   if (static_renderer.state == GL_STATE_INVALID || !static_renderer.state_data)
+   {
+      /* Context is down.  Recording keeps running (the worker doesn't stop
+       * for it), so without a ceiling the journal would grow for as long as
+       * the app stays backgrounded.  Past the cap, drop what we have: that is
+       * already this queue's policy for geometry that arrives with nowhere to
+       * draw, and gl_context_reset() replays a full VRAM upload anyway. */
+      if (rhi_defer_count(&gl_defer_queue) > GL_JOURNAL_MAX_OPS)
+      {
+         if (log_cb)
+            log_cb(RETRO_LOG_WARN,
+                  "[GL] dropping %u recorded ops: no renderer to replay them "
+                  "on (context down).\n",
+                  (unsigned)rhi_defer_count(&gl_defer_queue));
+         rhi_defer_clear(&gl_defer_queue);
+      }
+      return;
+   }
+
+   gl_journal_draining = true;
+   rhi_defer_drain(&gl_defer_queue, gl_defer_dispatch, NULL);
+   gl_journal_draining = false;
+}
+
+/* False (having logged once) when called from a thread other than the one that
+ * owns the GL context, while recording is armed. */
+static bool gl_journal_check_owner_thread(const char *what)
+{
+   static bool warned = false;
+
+   if (!gl_journal_active)
+      return true;
+   if (sthread_get_current_thread_id() == gl_journal_owner_thread)
+      return true;
+
+   if (!warned)
+   {
+      warned = true;
+      if (log_cb)
+         log_cb(RETRO_LOG_ERROR,
+               "[GL] rhi_gl_%s from the GPU worker thread; this path cannot be "
+               "recorded and GL is not valid off the context thread. Skipping. "
+               "Threaded GPU should have been refused for this configuration.\n",
+               what);
+   }
+   return false;
+}
+
+void rhi_gl_set_threaded_recording(bool enabled)
+{
+   if (gl_journal_active == enabled)
+      return;
+
+   /* Turning it off: whatever the worker recorded still has to be replayed,
+    * and the caller (GPU_Worker_Kill, on the emulation thread) has already
+    * drained the worker. */
+   if (!enabled)
+      gl_journal_drain();
+
+   /* While recording, the queue refills to a frame's worth of primitives every
+    * frame; don't hand the allocation back between them. */
+   rhi_defer_set_keep_storage(&gl_defer_queue, enabled);
+
+   gl_journal_owner_thread = enabled ? sthread_get_current_thread_id() : 0;
+   gl_journal_active       = enabled;
+}
+
 /* Forward declarations for the rhi_gl_* entry points the dispatcher
  * replays into. They are defined further down in this file; the
  * dispatcher itself is static so no header touch is needed. */
-static void gl_defer_dispatch(void *user, const rhi_defer_op_t *op);
-
 static bool has_software_fb = false;
 
 static void gl_renderer_draw(gl_renderer *renderer);
@@ -5569,16 +5699,100 @@ static void gl_defer_dispatch(void *user, const rhi_defer_op_t *op)
                                  op->u.set_display_mode.width_mode);
          break;
       case RHI_DEFER_LOAD_IMAGE:
-         rhi_gl_load_image(op->u.load_image.x,
-                           op->u.load_image.y,
-                           op->u.load_image.w,
-                           op->u.load_image.h,
-                           op->u.load_image.vram,
-                           op->u.load_image.mask_test,
-                           op->u.load_image.set_mask);
+      {
+         uint16_t *src = op->u.load_image.vram;
+
+         if (op->u.load_image.has_pixels)
+         {
+            /* The recorded copy is tightly packed; rhi_gl_load_image and the
+             * texture tracker both read at full VRAM stride, so stage it back
+             * into a scratch buffer at the rect's own coordinates.  Only the
+             * rect is ever read, so the rest of the buffer is don't-care. */
+            const uint16_t *packed = rhi_defer_pixels(&gl_defer_queue,
+                                                      op->u.load_image.pixel_offset);
+            uint16_t *stage = gl_journal_stage_buffer();
+
+            if (packed && stage)
+            {
+               rhi_defer_stage_load_image(op, packed, stage,
+                     (size_t)VRAM_WIDTH_PIXELS, (size_t)VRAM_HEIGHT);
+               src = stage;
+            }
+            else
+               src = NULL;
+         }
+
+         if (src)
+            rhi_gl_load_image(op->u.load_image.x,
+                              op->u.load_image.y,
+                              op->u.load_image.w,
+                              op->u.load_image.h,
+                              src,
+                              op->u.load_image.mask_test,
+                              op->u.load_image.set_mask);
          break;
+      }
       case RHI_DEFER_TOGGLE_DISPLAY:
          rhi_gl_toggle_display(op->u.toggle_display.status);
+         break;
+      case RHI_DEFER_PUSH_TRIANGLE:
+         rhi_gl_push_triangle(
+               op->u.push_poly.px[0], op->u.push_poly.py[0], op->u.push_poly.pw[0],
+               op->u.push_poly.px[1], op->u.push_poly.py[1], op->u.push_poly.pw[1],
+               op->u.push_poly.px[2], op->u.push_poly.py[2], op->u.push_poly.pw[2],
+               op->u.push_poly.c[0], op->u.push_poly.c[1], op->u.push_poly.c[2],
+               op->u.push_poly.has_precise_rgb ? op->u.push_poly.precise_rgb : NULL,
+               op->u.push_poly.has_fog ? op->u.push_poly.fog : NULL,
+               op->u.push_poly.tx[0], op->u.push_poly.ty[0],
+               op->u.push_poly.tx[1], op->u.push_poly.ty[1],
+               op->u.push_poly.tx[2], op->u.push_poly.ty[2],
+               op->u.push_poly.min_u, op->u.push_poly.min_v,
+               op->u.push_poly.max_u, op->u.push_poly.max_v,
+               op->u.push_poly.texpage_x, op->u.push_poly.texpage_y,
+               op->u.push_poly.clut_x, op->u.push_poly.clut_y,
+               op->u.push_poly.texture_blend_mode, op->u.push_poly.depth_shift,
+               op->u.push_poly.dither, op->u.push_poly.blend_mode,
+               op->u.push_poly.mask_test, op->u.push_poly.set_mask);
+         break;
+      case RHI_DEFER_PUSH_QUAD:
+         rhi_gl_push_quad(
+               op->u.push_poly.px[0], op->u.push_poly.py[0], op->u.push_poly.pw[0],
+               op->u.push_poly.px[1], op->u.push_poly.py[1], op->u.push_poly.pw[1],
+               op->u.push_poly.px[2], op->u.push_poly.py[2], op->u.push_poly.pw[2],
+               op->u.push_poly.px[3], op->u.push_poly.py[3], op->u.push_poly.pw[3],
+               op->u.push_poly.c[0], op->u.push_poly.c[1],
+               op->u.push_poly.c[2], op->u.push_poly.c[3],
+               op->u.push_poly.has_precise_rgb ? op->u.push_poly.precise_rgb : NULL,
+               op->u.push_poly.has_fog ? op->u.push_poly.fog : NULL,
+               op->u.push_poly.tx[0], op->u.push_poly.ty[0],
+               op->u.push_poly.tx[1], op->u.push_poly.ty[1],
+               op->u.push_poly.tx[2], op->u.push_poly.ty[2],
+               op->u.push_poly.tx[3], op->u.push_poly.ty[3],
+               op->u.push_poly.min_u, op->u.push_poly.min_v,
+               op->u.push_poly.max_u, op->u.push_poly.max_v,
+               op->u.push_poly.texpage_x, op->u.push_poly.texpage_y,
+               op->u.push_poly.clut_x, op->u.push_poly.clut_y,
+               op->u.push_poly.texture_blend_mode, op->u.push_poly.depth_shift,
+               op->u.push_poly.dither, op->u.push_poly.blend_mode,
+               op->u.push_poly.mask_test, op->u.push_poly.set_mask);
+         break;
+      case RHI_DEFER_PUSH_LINE:
+         rhi_gl_push_line(op->u.push_line.p0x, op->u.push_line.p0y,
+                          op->u.push_line.p1x, op->u.push_line.p1y,
+                          op->u.push_line.c0, op->u.push_line.c1,
+                          op->u.push_line.dither, op->u.push_line.blend_mode,
+                          op->u.push_line.mask_test, op->u.push_line.set_mask);
+         break;
+      case RHI_DEFER_FILL_RECT:
+         rhi_gl_fill_rect(op->u.fill_rect.color, op->u.fill_rect.x,
+                          op->u.fill_rect.y, op->u.fill_rect.w,
+                          op->u.fill_rect.h);
+         break;
+      case RHI_DEFER_COPY_RECT:
+         rhi_gl_copy_rect(op->u.copy_rect.src_x, op->u.copy_rect.src_y,
+                          op->u.copy_rect.dst_x, op->u.copy_rect.dst_y,
+                          op->u.copy_rect.w, op->u.copy_rect.h,
+                          op->u.copy_rect.mask_test, op->u.copy_rect.set_mask);
          break;
    }
 }
@@ -5965,6 +6179,9 @@ hw_render_accepted:
 
 void rhi_gl_close(void)
 {
+   free(gl_journal_stage);
+   gl_journal_stage = NULL;
+
    static_renderer.state       = GL_STATE_INVALID;
    static_renderer.video_clock = VIDEO_CLOCK_NTSC;
 }
@@ -6102,6 +6319,10 @@ static void compute_vram_framebuffer_dimensions(gl_renderer *renderer)
 void rhi_gl_finalize_frame(const void *fb, unsigned width,
                            unsigned height, unsigned pitch)
 {
+   /* Emulation thread.  Anything the GPU worker recorded this frame is issued
+    * here, in order, before the frame is presented. */
+   gl_journal_drain();
+
    gl_renderer      *renderer;
    struct gl_analog *analog          = NULL;
    unsigned          analog_native_w = 0;
@@ -6364,11 +6585,8 @@ void rhi_gl_set_tex_window(uint8_t tww, uint8_t twh, uint8_t twx, uint8_t twy)
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
    {
-      /* Renderer not yet constructed - buffer the call so it lands
-       * once gl_context_reset brings the renderer up. Matches the
-       * Vulkan backend's defer policy for the same entry point. */
       rhi_defer_push_set_tex_window(&gl_defer_queue, tww, twh, twx, twy);
       return;
    }
@@ -6408,7 +6626,7 @@ void rhi_gl_set_draw_offset(int16_t x, int16_t y)
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
    {
       rhi_defer_push_set_draw_offset(&gl_defer_queue, x, y);
       return;
@@ -6430,7 +6648,7 @@ void rhi_gl_set_draw_area(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
    {
       rhi_defer_push_set_draw_area(&gl_defer_queue, x0, y0, x1, y1);
       return;
@@ -6457,10 +6675,9 @@ void rhi_gl_set_vram_framebuffer_coords(uint32_t xstart, uint32_t ystart)
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
    {
-      rhi_defer_push_set_vram_framebuffer_coords(&gl_defer_queue,
-            xstart, ystart);
+      rhi_defer_push_set_vram_framebuffer_coords(&gl_defer_queue, xstart, ystart);
       return;
    }
 
@@ -6476,7 +6693,7 @@ void rhi_gl_set_horizontal_display_range(uint16_t x1, uint16_t x2)
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
    {
       rhi_defer_push_set_horizontal_display_range(&gl_defer_queue, x1, x2);
       return;
@@ -6494,7 +6711,7 @@ void rhi_gl_set_vertical_display_range(uint16_t y1, uint16_t y2)
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
    {
       rhi_defer_push_set_vertical_display_range(&gl_defer_queue, y1, y2);
       return;
@@ -6515,10 +6732,9 @@ void rhi_gl_set_display_mode(bool depth_24bpp,
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
    {
-      rhi_defer_push_set_display_mode(&gl_defer_queue,
-            depth_24bpp, is_pal, is_480i, width_mode);
+      rhi_defer_push_set_display_mode(&gl_defer_queue, depth_24bpp, is_pal, is_480i, width_mode);
       return;
    }
 
@@ -6575,8 +6791,18 @@ void rhi_gl_push_triangle(
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
+   {
+      rhi_defer_push_triangle(&gl_defer_queue,
+            p0x, p0y, p0w, p1x, p1y, p1w, p2x, p2y, p2w,
+            c0, c1, c2, precise_rgb, fog,
+            t0x, t0y, t1x, t1y, t2x, t2y,
+            min_u, min_v, max_u, max_v,
+            texpage_x, texpage_y, clut_x, clut_y,
+            texture_blend_mode, depth_shift,
+            dither, blend_mode, mask_test, set_mask);
       return;
+   }
 
    switch (blend_mode)
    {
@@ -6706,8 +6932,18 @@ void rhi_gl_push_quad(
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
+   {
+      rhi_defer_push_quad(&gl_defer_queue,
+            p0x, p0y, p0w, p1x, p1y, p1w, p2x, p2y, p2w, p3x, p3y, p3w,
+            c0, c1, c2, c3, precise_rgb, fog,
+            t0x, t0y, t1x, t1y, t2x, t2y, t3x, t3y,
+            min_u, min_v, max_u, max_v,
+            texpage_x, texpage_y, clut_x, clut_y,
+            texture_blend_mode, depth_shift,
+            dither, blend_mode, mask_test, set_mask, false, false);
       return;
+   }
 
    switch (blend_mode)
    {
@@ -6942,8 +7178,12 @@ void rhi_gl_push_line(
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
+   {
+      rhi_defer_push_line(&gl_defer_queue, p0x, p0y, p1x, p1y,
+            c0, c1, dither, blend_mode, mask_test, set_mask);
       return;
+   }
 
    switch (blend_mode)
    {
@@ -7053,19 +7293,20 @@ void rhi_gl_load_image(
    x &= VRAM_WIDTH_PIXELS - 1;
    y &= VRAM_HEIGHT - 1;
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
    {
-      /* This is the case King's Field on GL was hitting: the game's
-       * boot uploads HUD glyph tiles via this entry point before the
-       * frontend has called gl_context_reset, so without buffering
-       * the glyph VRAM pixels were dropped on the floor and only
-       * appeared after a savestate-load (which replays the entire
-       * 1MiB VRAM blob via GPU_RestoreStateP3()). Defer the upload;
-       * gl_context_reset's drain will replay it on the live
-       * renderer. The captured `vram` pointer aliases GPU.vram,
-       * which lives for the whole core lifetime - safe to hold. */
-      rhi_defer_push_load_image(&gl_defer_queue,
-            x, y, w, h, vram, mask_test, set_mask);
+      /* Snapshot the pixels rather than the pointer.  The replay happens at
+       * end of frame, by which time the worker may have written this same
+       * VRAM rect again - the ordinary upload-texture / draw / upload-again /
+       * draw pattern - and an aliased read would hand the first upload the
+       * second one's pixels.  (It also removes the pointer's dependence on
+       * GPU.vram surviving a GPU_Rescale.)  If the copy can't be made, fall
+       * back to aliasing: stale pixels beat a dropped upload. */
+      if (!rhi_defer_push_load_image_snapshot(&gl_defer_queue, x, y, w, h,
+               vram, (size_t)VRAM_WIDTH_PIXELS, (size_t)VRAM_HEIGHT,
+               mask_test, set_mask))
+         rhi_defer_push_load_image(&gl_defer_queue,
+               x, y, w, h, vram, mask_test, set_mask);
       return;
    }
 
@@ -7287,6 +7528,16 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
    uint32_t *scratch_rgba8  = NULL;
    float    *scratch_f      = NULL;
    size_t   row;
+
+   /* A read-back has to see the recorded drawing, so replay it first.  Only
+    * reachable from the emulation thread: threaded GL requires the software
+    * framebuffer, and with it Command_FBRead() never asks for a hard
+    * read-back at all.  A read-back cannot be recorded - it has to answer now
+    * - so if that gate ever slips, say so rather than issuing GL from the
+    * wrong thread and crashing somewhere unrelated. */
+   if (!gl_journal_check_owner_thread("read_vram"))
+      return false;
+   gl_journal_drain();
 
    if (static_renderer.state == GL_STATE_INVALID)
       return false;
@@ -7858,8 +8109,11 @@ void rhi_gl_fill_rect(
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
+   {
+      rhi_defer_push_fill_rect(&gl_defer_queue, color, x, y, w, h);
       return;
+   }
 
    top_left[0]   = x;
    top_left[1]   = y;
@@ -7988,8 +8242,12 @@ void rhi_gl_copy_rect(
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
+   {
+      rhi_defer_push_copy_rect(&gl_defer_queue, src_x, src_y,
+            dst_x, dst_y, w, h, mask_test, set_mask);
       return;
+   }
 
    if (src_x == dst_x && src_y == dst_y)
      return;
@@ -8120,7 +8378,7 @@ void rhi_gl_toggle_display(bool status)
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   if (gl_should_defer(renderer))
    {
       rhi_defer_push_toggle_display(&gl_defer_queue, status);
       return;

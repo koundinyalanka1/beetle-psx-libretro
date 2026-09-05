@@ -334,6 +334,8 @@ void GPU_Worker_Init(void);
 void GPU_Worker_Kill(void);
 void GPU_SetThreaded(bool enabled);
 bool GPU_GetThreaded(void);
+bool GPU_Worker_Active(void);
+void GPU_Worker_Refresh(void);
 
 #ifdef __cplusplus
 }

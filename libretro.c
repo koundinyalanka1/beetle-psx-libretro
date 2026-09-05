@@ -6071,6 +6071,14 @@ bool retro_load_game(const struct retro_game_info *info)
 
    alloc_surface();
 
+   /* Note: the worker threads are NOT started here.  A frontend may run
+    * retro_load_game() on a dedicated loader thread with a different CPU
+    * affinity than the one that drives retro_run() - Linux threads inherit
+    * the creator's affinity mask and nice value, so a worker created here can
+    * end up on a little core while the emulation thread is pinned to the big
+    * cluster, and the emulation thread then blocks waiting on it.
+    * retro_run() starts them instead; see GPU/SPU_Worker_Refresh(). */
+
    /* Hide irrelevant core options */
    switch (rhi_intf_is_type())
    {
@@ -6080,6 +6088,9 @@ bool retro_load_game(const struct retro_game_info *info)
          option_display.visible = false;
 
          option_display.key = BEETLE_OPT(renderer_software_fb);
+         environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
+         /* No threaded GPU on the software renderer. */
+         option_display.key = BEETLE_OPT(threaded_gpu);
          environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
          option_display.key = BEETLE_OPT(scaled_uv_offset);
          environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
@@ -6332,6 +6343,14 @@ void retro_run(void)
    if (!PSX_CPU || !PSX_FIO || !PSX_CDC)
       return;
 
+   /* Everything below - option handling, geometry, rhi_intf_prepare_frame,
+    * rescale - runs on this thread and reaches into state the GPU worker
+    * owns or into the renderer it draws with.  The previous frame already
+    * ended with a sync, so this is normally free; it is here so no path
+    * added above CPU_Run() can start racing the worker by accident. */
+   GPU_Worker_Sync();
+
+
    /* Keep the HDR encode in sync with the frontend's live HDR controls.
     * RetroArch's paper-white and Colour Boost sliders change at runtime and
     * do NOT fire the core's variable-update path, so re-query them each frame
@@ -6568,6 +6587,24 @@ void retro_run(void)
    spec.surface      = surf;
    spec.LineWidths   = rects;
    spec.SoundBufSize = 0;
+
+   /* Start/stop the workers from this thread, so they inherit the affinity and
+    * priority the frontend gave its emulation thread, and so a renderer or
+    * PGXP change from the option block above takes effect before this frame
+    * draws anything.  A cheap no-op when nothing changed. */
+   {
+      bool gpu_was = GPU_Worker_Active();
+      bool spu_was = SPU_Worker_Active();
+
+      GPU_Worker_Refresh();
+      SPU_Worker_Refresh();
+
+      if (gpu_was != GPU_Worker_Active() || spu_was != SPU_Worker_Active())
+         log_cb(RETRO_LOG_INFO,
+               "Threading: GPU worker %s, SPU worker %s\n",
+               GPU_Worker_Active() ? "on" : "off",
+               SPU_Worker_Active() ? "on" : "off");
+   }
 
    espec = (EmulateSpecStruct*)&spec;
    /* start of Emulate */

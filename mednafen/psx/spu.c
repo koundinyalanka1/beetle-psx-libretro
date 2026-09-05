@@ -107,20 +107,45 @@ typedef struct
 #define SPU_QUEUE_MASK (SPU_QUEUE_SIZE - 1)
 
 static spu_synth_cmd_t spu_queue[SPU_QUEUE_SIZE];
-static volatile uint32_t spu_queue_head = 0;
-static volatile uint32_t spu_queue_tail = 0;
-static volatile bool spu_worker_idle = true;
-static volatile bool spu_worker_running = false;
-static volatile bool spu_worker_stopping = false;
-static volatile bool spu_worker_enabled = false;
+static uint32_t spu_queue_head = 0;
+static uint32_t spu_queue_tail = 0;
+static bool spu_worker_idle = true;
+static bool spu_worker_running = false;
+static bool spu_worker_stopping = false;
+static bool spu_worker_enabled = false;
+
+/* IRQ_Assert() reaches into CPU_AssertIRQ() and mutates CPU state, so the
+ * synthesis thread may never call it.  It records the level it wants here and
+ * the emulation thread applies the edge from SPU_UpdateFromCDC(), which runs
+ * every CDC tick - far finer than one frame. */
+static bool spu_irq_pending = false;
+static bool spu_irq_published = false;
 
 static slock_t *spu_queue_lock = NULL;
 static scond_t *spu_queue_not_empty = NULL;
 static scond_t *spu_queue_drained = NULL;
 static sthread_t *spu_thread = NULL;
 
+/* Bounded waits: with the handshake below a wakeup cannot be lost, but a
+ * timeout turns any residual signalling bug into a hiccup instead of a hung
+ * emulation thread (which the frontend reports as an ANR, not a crash). */
+#define SPU_WORKER_WAIT_US 20000
+
 static void SPU_SynthesizeSamples_Internal(int32_t sample_clocks);
 static void SPU_Worker_QueueSynth(int32_t sample_clocks);
+
+static INLINE bool SPU_Queue_Empty(void)
+{
+   return __atomic_load_n(&spu_queue_head, __ATOMIC_SEQ_CST)
+       == __atomic_load_n(&spu_queue_tail, __ATOMIC_SEQ_CST);
+}
+
+static INLINE uint32_t SPU_Queue_Count(void)
+{
+   uint32_t h = __atomic_load_n(&spu_queue_head, __ATOMIC_ACQUIRE);
+   uint32_t t = __atomic_load_n(&spu_queue_tail, __ATOMIC_ACQUIRE);
+   return (h - t) & SPU_QUEUE_MASK;
+}
 
 static const int16_t FIR_Table[256][4] =
 {
@@ -487,6 +512,30 @@ static uint32_t ReverbCur;
 
 static bool IRQAsserted;
 
+/* Single funnel for every SPU IRQ line change, so the worker thread never
+ * touches the CPU's interrupt state directly. */
+static INLINE void SPU_SetIRQ(bool status)
+{
+   IRQAsserted = status;
+
+   if (__atomic_load_n(&spu_worker_running, __ATOMIC_ACQUIRE))
+      __atomic_store_n(&spu_irq_pending, status, __ATOMIC_RELEASE);
+   else
+      IRQ_Assert(IRQ_SPU, status);
+}
+
+/* Emulation thread: apply whatever level the worker last asked for. */
+static INLINE void SPU_PublishIRQ(void)
+{
+   bool want = __atomic_load_n(&spu_irq_pending, __ATOMIC_ACQUIRE);
+
+   if (want != spu_irq_published)
+   {
+      spu_irq_published = want;
+      IRQ_Assert(IRQ_SPU, want);
+   }
+}
+
 static int32_t clock_divider;
 
 static uint16_t SPURAM[524288 / sizeof(uint16_t)];
@@ -505,6 +554,9 @@ static INLINE void SPU_WR_RVB(uint16_t raw_offs, int16_t sample);
   void SPU_Power(void)
 {
    int i;
+
+   SPU_Worker_Sync();
+
    clock_divider = 768;
 
    memset(SPURAM, 0, sizeof(SPURAM));
@@ -584,7 +636,9 @@ static INLINE void SPU_WR_RVB(uint16_t raw_offs, int16_t sample);
 
    ReverbCur = ReverbWA;
 
-   IRQAsserted = false;
+   IRQAsserted       = false;
+   spu_irq_pending   = false;
+   spu_irq_published = false;
 }
 
 static INLINE void CalcVCDelta(const uint8_t zs, uint8_t speed, bool log_mode, bool dec_mode, bool inv_increment, int16_t Current, int *increment, int *divinco)
@@ -710,8 +764,7 @@ static void SPU_RunDecoder(SPU_Voice *voice)
          unsigned test_addr = (voice->CurAddr - 1) & 0x3FFFF;
          if(IRQAddr == test_addr || IRQAddr == (test_addr & 0x3FFF8))
          {
-            IRQAsserted = true;
-            IRQ_Assert(IRQ_SPU, IRQAsserted);
+            SPU_SetIRQ(true);
          }
       }
       return;
@@ -749,8 +802,7 @@ static void SPU_RunDecoder(SPU_Voice *voice)
       unsigned test_addr = voice->CurAddr & 0x3FFFF;
       if(IRQAddr == test_addr || IRQAddr == (test_addr & 0x3FFF8))
       {
-         IRQAsserted = true;
-         IRQ_Assert(IRQ_SPU, IRQAsserted);
+         SPU_SetIRQ(true);
       }
    }
 
@@ -938,8 +990,7 @@ static INLINE void SPU_CheckIRQAddr(uint32_t addr)
       if(IRQAddr != addr)
          return;
 
-      IRQAsserted = true;
-      IRQ_Assert(IRQ_SPU, IRQAsserted);
+      SPU_SetIRQ(true);
    }
 }
 
@@ -1631,6 +1682,10 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
 {
    int32_t sample_clocks = 0;
 
+   /* Emulation thread - the only place allowed to move the SPU IRQ line. */
+   if (spu_worker_running)
+      SPU_PublishIRQ();
+
    clock_divider -= clocks;
 
    while(clock_divider <= 0)
@@ -1641,7 +1696,7 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
 
    if (sample_clocks > 0)
    {
-      if (spu_worker_enabled && spu_worker_running)
+      if (spu_worker_running)
          SPU_Worker_QueueSynth(sample_clocks);
       else
          SPU_SynthesizeSamples_Internal(sample_clocks);
@@ -1652,8 +1707,7 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
 
   void SPU_WriteDMA(uint32_t V)
 {
-   if (spu_worker_enabled && spu_worker_running)
-      SPU_Worker_Sync();
+   SPU_Worker_Sync();
 
    SPU_WriteSPURAM(RWAddr, V);
    RWAddr = (RWAddr + 1) & 0x3FFFF;
@@ -1667,8 +1721,7 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
 
   uint32_t SPU_ReadDMA(void)
 {
-   if (spu_worker_enabled && spu_worker_running)
-      SPU_Worker_Sync();
+   SPU_Worker_Sync();
 
    uint32_t ret = (uint16_t)SPU_ReadSPURAM(RWAddr);
    RWAddr = (RWAddr + 1) & 0x3FFFF;
@@ -1682,79 +1735,115 @@ int32_t SPU_UpdateFromCDC(int32_t clocks)
    return(ret);
 }
 
+/*
+ * The producer publishes a job by storing the new head and then loading
+ * spu_worker_idle; this thread publishes spu_worker_idle and then loads head.
+ * Both pairs are sequentially consistent, so by Dekker's argument at least one
+ * side observes the other's store: either the producer sees us idle and signals
+ * (we still hold the mutex, so it blocks until scond_wait() releases it), or we
+ * see the job and never sleep.  Checking the queue *before* publishing idle -
+ * which is what this loop used to do - leaves a window where neither side sees
+ * the other, the worker sleeps on a non-empty queue and the next
+ * SPU_Worker_Sync() from the emulation thread never returns.
+ */
 static void spu_worker_thread_loop(void *arg)
 {
    (void)arg;
 
    slock_lock(spu_queue_lock);
 
-   while (!spu_worker_stopping)
+   for (;;)
    {
-      while (__atomic_load_n(&spu_queue_head, __ATOMIC_ACQUIRE) == spu_queue_tail && !spu_worker_stopping)
+      for (;;)
       {
-         __atomic_store_n(&spu_worker_idle, true, __ATOMIC_RELEASE);
-         scond_signal(spu_queue_drained);
-         scond_wait(spu_queue_not_empty, spu_queue_lock);
+         if (spu_worker_stopping)
+            goto done;
+
+         __atomic_store_n(&spu_worker_idle, true, __ATOMIC_SEQ_CST);
+
+         if (!SPU_Queue_Empty())
+            break;
+
+         scond_broadcast(spu_queue_drained);
+         scond_wait_timeout(spu_queue_not_empty, spu_queue_lock,
+               SPU_WORKER_WAIT_US);
       }
 
-      if (spu_worker_stopping && __atomic_load_n(&spu_queue_head, __ATOMIC_ACQUIRE) == spu_queue_tail)
-         break;
-
-      __atomic_store_n(&spu_worker_idle, false, __ATOMIC_RELEASE);
+      __atomic_store_n(&spu_worker_idle, false, __ATOMIC_SEQ_CST);
       slock_unlock(spu_queue_lock);
 
-      uint32_t tail = spu_queue_tail;
-      int32_t sample_clocks = spu_queue[tail].sample_clocks;
-      spu_queue_tail = (tail + 1) & SPU_QUEUE_MASK;
-      __atomic_store_n(&spu_queue_tail, spu_queue_tail, __ATOMIC_RELEASE);
+      {
+         uint32_t tail = __atomic_load_n(&spu_queue_tail, __ATOMIC_RELAXED);
+         int32_t sample_clocks = spu_queue[tail].sample_clocks;
 
-      SPU_SynthesizeSamples_Internal(sample_clocks);
+         SPU_SynthesizeSamples_Internal(sample_clocks);
+
+         /* Retire only after the work is done: SPU_Worker_Sync() treats an
+          * empty queue plus an idle worker as "everything is applied". */
+         __atomic_store_n(&spu_queue_tail, (tail + 1) & SPU_QUEUE_MASK,
+               __ATOMIC_RELEASE);
+      }
 
       slock_lock(spu_queue_lock);
    }
 
-   __atomic_store_n(&spu_worker_idle, true, __ATOMIC_RELEASE);
-   scond_signal(spu_queue_drained);
+done:
+   __atomic_store_n(&spu_worker_idle, true, __ATOMIC_SEQ_CST);
+   scond_broadcast(spu_queue_drained);
    slock_unlock(spu_queue_lock);
 }
 
 static void SPU_Worker_QueueSynth(int32_t sample_clocks)
 {
-   uint32_t head = spu_queue_head;
-   uint32_t tail = __atomic_load_n(&spu_queue_tail, __ATOMIC_ACQUIRE);
-   uint32_t count = (head - tail) & SPU_QUEUE_MASK;
+   uint32_t head;
 
-   if (count >= SPU_QUEUE_SIZE - 1)
+   /* Queue full: drain it rather than synthesising here, which would run the
+    * SPU state machine on two threads at once. */
+   if (SPU_Queue_Count() >= SPU_QUEUE_SIZE - 1)
    {
-      SPU_SynthesizeSamples_Internal(sample_clocks);
-      return;
+      SPU_Worker_Sync();
+
+      if (!__atomic_load_n(&spu_worker_running, __ATOMIC_ACQUIRE))
+      {
+         SPU_SynthesizeSamples_Internal(sample_clocks);
+         return;
+      }
    }
 
+   head = __atomic_load_n(&spu_queue_head, __ATOMIC_RELAXED);
    spu_queue[head].sample_clocks = sample_clocks;
-   __atomic_store_n(&spu_queue_head, (head + 1) & SPU_QUEUE_MASK, __ATOMIC_RELEASE);
 
-   if (__atomic_load_n(&spu_worker_idle, __ATOMIC_ACQUIRE))
+   /* Publish the job, then look at the worker: see the comment on
+    * spu_worker_thread_loop() for why both must be sequentially consistent. */
+   __atomic_store_n(&spu_queue_head, (head + 1) & SPU_QUEUE_MASK,
+         __ATOMIC_SEQ_CST);
+
+   if (__atomic_load_n(&spu_worker_idle, __ATOMIC_SEQ_CST))
    {
       slock_lock(spu_queue_lock);
-      scond_signal(spu_queue_not_empty);
+      scond_broadcast(spu_queue_not_empty);
       slock_unlock(spu_queue_lock);
    }
 }
 
 void SPU_Worker_Sync(void)
 {
-   if (!spu_worker_running || !spu_queue_lock)
+   if (!__atomic_load_n(&spu_worker_running, __ATOMIC_ACQUIRE) || !spu_queue_lock)
       return;
 
-   if (__atomic_load_n(&spu_queue_head, __ATOMIC_ACQUIRE) == __atomic_load_n(&spu_queue_tail, __ATOMIC_ACQUIRE) &&
-       __atomic_load_n(&spu_worker_idle, __ATOMIC_ACQUIRE))
+   /* Lock-free fast path: nothing queued and the worker parked. */
+   if (SPU_Queue_Empty() && __atomic_load_n(&spu_worker_idle, __ATOMIC_ACQUIRE))
       return;
 
    slock_lock(spu_queue_lock);
-   while (__atomic_load_n(&spu_queue_head, __ATOMIC_ACQUIRE) != __atomic_load_n(&spu_queue_tail, __ATOMIC_ACQUIRE) ||
-          !__atomic_load_n(&spu_worker_idle, __ATOMIC_ACQUIRE))
+   while (!spu_worker_stopping
+         && (!SPU_Queue_Empty()
+            || !__atomic_load_n(&spu_worker_idle, __ATOMIC_ACQUIRE)))
    {
-      scond_wait(spu_queue_drained, spu_queue_lock);
+      /* Timed: the predicate is re-tested every pass, so a lost signal costs
+       * a few microseconds instead of wedging the emulation thread. */
+      scond_wait_timeout(spu_queue_drained, spu_queue_lock,
+            SPU_WORKER_WAIT_US);
    }
    slock_unlock(spu_queue_lock);
 }
@@ -1768,6 +1857,8 @@ void SPU_Worker_Init(void)
    spu_queue_tail = 0;
    spu_worker_idle = true;
    spu_worker_stopping = false;
+   spu_irq_pending = IRQAsserted;
+   spu_irq_published = IRQAsserted;
 
    spu_queue_lock = slock_new();
    spu_queue_not_empty = scond_new();
@@ -1779,26 +1870,36 @@ void SPU_Worker_Init(void)
       return;
    }
 
+   /* Published before the thread exists: spu_worker_running is what routes
+    * IRQ assertion away from the worker. */
+   __atomic_store_n(&spu_worker_running, true, __ATOMIC_RELEASE);
+
    spu_thread = sthread_create(spu_worker_thread_loop, NULL);
    if (!spu_thread)
    {
+      /* Kill() clears spu_worker_running and releases what we allocated. */
       SPU_Worker_Kill();
       return;
    }
-
-   spu_worker_running = true;
 }
 
 void SPU_Worker_Kill(void)
 {
-   if (!spu_worker_running && !spu_thread)
+   /* Also the cleanup path for a partially-built worker, so test the
+    * primitives too and not just the running flag. */
+   if (!spu_worker_running && !spu_thread && !spu_queue_lock)
       return;
+
+   /* Let queued synthesis retire before the thread goes away, so teardown
+    * doesn't silently drop a frame's worth of audio state. */
+   SPU_Worker_Sync();
 
    if (spu_queue_lock)
    {
       slock_lock(spu_queue_lock);
       spu_worker_stopping = true;
-      scond_signal(spu_queue_not_empty);
+      scond_broadcast(spu_queue_not_empty);
+      scond_broadcast(spu_queue_drained);
       slock_unlock(spu_queue_lock);
    }
 
@@ -1814,30 +1915,47 @@ void SPU_Worker_Kill(void)
 
    spu_worker_running = false;
    spu_worker_stopping = false;
+
+   /* Back to direct assertion.  Flush a pending edge the drained worker raised
+    * but SPU_UpdateFromCDC() hadn't published yet - and only that, because
+    * Kill() is also the teardown path and IRQ_Assert() reaches into
+    * CPU/lightrec state we shouldn't poke for nothing. */
+   if (spu_irq_pending != spu_irq_published)
+   {
+      spu_irq_published = spu_irq_pending;
+      IRQ_Assert(IRQ_SPU, spu_irq_pending);
+   }
 }
 
+/* Records the preference only; SPU_Worker_Refresh() acts on it from the
+ * emulation thread.  See GPU_SetThreaded() for why. */
 void SPU_SetThreaded(bool enabled)
 {
-   if (spu_worker_enabled == enabled)
+   spu_worker_enabled = enabled;
+}
+
+/* Call once per frame from the emulation thread, after option handling and
+ * before CPU_Run() - see GPU_Worker_Refresh() for why the thread must be
+ * created here rather than at load time. */
+void SPU_Worker_Refresh(void)
+{
+   if (spu_worker_enabled == spu_worker_running)
       return;
 
-   if (spu_worker_running)
-   {
-      SPU_Worker_Sync();
-      if (!enabled)
-         SPU_Worker_Kill();
-   }
-   else if (enabled)
-   {
+   if (spu_worker_enabled)
       SPU_Worker_Init();
-   }
-
-   spu_worker_enabled = enabled;
+   else
+      SPU_Worker_Kill();
 }
 
 bool SPU_GetThreaded(void)
 {
    return spu_worker_enabled;
+}
+
+bool SPU_Worker_Active(void)
+{
+   return spu_worker_running;
 }
 
 /*
@@ -1883,13 +2001,16 @@ void SPU_Init(void)
    RvbResPos = 0;
    ReverbCur = 0;
    IRQAsserted = false;
+   spu_irq_pending = false;
+   spu_irq_published = false;
    clock_divider = 0;
 
    IntermediateBufferPos = 0;
    memset(IntermediateBuffer, 0, sizeof(IntermediateBuffer));
 
-   if (spu_worker_enabled)
-      SPU_Worker_Init();
+   /* Deliberately does NOT start the worker: SPU_Init() runs on whatever
+    * thread loaded the content, and the thread must be created by the
+    * emulation thread to inherit its affinity.  retro_run() starts it. */
 }
 
 void SPU_Kill(void)
@@ -1899,6 +2020,11 @@ void SPU_Kill(void)
 
   void SPU_Write(int32_t timestamp, uint32_t A, uint16_t V)
 {
+   /* Register writes are ordered against synthesis: the worker reads voice,
+    * reverb and control registers as it runs, so it has to be caught up before
+    * any of them changes underneath it. */
+   SPU_Worker_Sync();
+
    A &= 0x3FF;
 
    if(A >= 0x200)
@@ -2037,8 +2163,7 @@ void SPU_Kill(void)
                     SPUControl = V;
                     if(!(V & 0x40))
                     {
-                       IRQAsserted = false;
-                       IRQ_Assert(IRQ_SPU, IRQAsserted);
+                       SPU_SetIRQ(false);
                     }
                     SPU_CheckIRQAddr(RWAddr);
                     break;
@@ -2069,8 +2194,8 @@ void SPU_Kill(void)
 
   uint16_t SPU_Read(int32_t timestamp, uint32_t A)
 {
-   if (spu_worker_enabled && spu_worker_running)
-      SPU_Worker_Sync();
+   /* Reads expose live envelope/status state the worker is producing. */
+   SPU_Worker_Sync();
 
    A &= 0x3FF;
 
@@ -2137,8 +2262,7 @@ void SPU_Kill(void)
 
   int SPU_StateAction(StateMem *sm, int load, int data_only)
 {
-   if (spu_worker_enabled && spu_worker_running)
-      SPU_Worker_Sync();
+   SPU_Worker_Sync();
 
    static SFORMAT StateRegs[] =
    {
@@ -2287,6 +2411,8 @@ void SPU_Kill(void)
 
       RvbResPos &= 0x3F;
 
+      spu_irq_pending   = IRQAsserted;
+      spu_irq_published = IRQAsserted;
       IRQ_Assert(IRQ_SPU, IRQAsserted);
    }
 

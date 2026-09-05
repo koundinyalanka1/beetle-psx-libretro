@@ -108,5 +108,7 @@ void     SPU_Worker_Init(void);
 void     SPU_Worker_Kill(void);
 void     SPU_SetThreaded(bool enabled);
 bool     SPU_GetThreaded(void);
+bool     SPU_Worker_Active(void);
+void     SPU_Worker_Refresh(void);
 
 #endif

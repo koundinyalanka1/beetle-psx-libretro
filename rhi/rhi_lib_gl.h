@@ -113,6 +113,11 @@ void rhi_gl_copy_rect(uint16_t src_x, uint16_t src_y,
 void rhi_gl_toggle_display(bool status);
 
 bool rhi_gl_has_software_renderer(void);
+
+/* Record rhi_gl_* calls instead of issuing GL, so the GPU worker can drive the
+ * renderer from its own thread; the emulation thread replays them at end of
+ * frame.  See the comment on gl_journal_active. */
+void rhi_gl_set_threaded_recording(bool enabled);
 bool rhi_gl_context_ready(void);
 
 #ifdef __cplusplus

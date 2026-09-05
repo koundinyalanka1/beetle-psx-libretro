@@ -168,6 +168,11 @@ void rhi_intf_copy_rect(uint16_t src_x, uint16_t src_y,
 
 enum rhi_renderer_type rhi_intf_is_type(void);
 
+/* Tell the active backend that GP0 execution is moving to (or off) a worker
+ * thread.  Only OpenGL cares: its API is thread-affine, so it records calls
+ * and replays them on the emulation thread.  A no-op elsewhere. */
+void rhi_intf_set_threaded_recording(bool enabled);
+
 void rhi_intf_toggle_display(bool status);
 
 bool rhi_intf_has_software_renderer(void);

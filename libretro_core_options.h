@@ -224,7 +224,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       BEETLE_OPT(threaded_gpu),
       "Threaded GPU (Graphics)",
       NULL,
-      "Offload GPU drawing commands and DMA processing to an asynchronous worker thread. Eliminates rendering-related CPU bottlenecks on multicore systems.",
+      "Offload GPU drawing commands and DMA processing to an asynchronous worker thread, so rasterisation overlaps CPU emulation on multicore systems. Not available on the software renderer, which scans VRAM out from the emulation thread. On OpenGL it additionally requires 'Software Framebuffer' to be enabled, because GL calls are recorded and replayed on the emulation thread and a mid-command VRAM read-back cannot be deferred.",
       NULL,
       "system",
       {

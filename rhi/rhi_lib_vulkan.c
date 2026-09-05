@@ -387,6 +387,23 @@ PFN_vkDestroySemaphore vkDestroySemaphore;
 PFN_vkDestroyShaderModule vkDestroyShaderModule;
 PFN_vkDeviceWaitIdle vkDeviceWaitIdle;
 PFN_vkEndCommandBuffer vkEndCommandBuffer;
+
+/*
+ * libretro_vulkan.h: "If the core submits command buffers itself to any of the
+ * queues provided in this interface, the core must lock and unlock the
+ * frontend from racing on the VkQueue.  Queue submission can happen on any
+ * thread.  Even if queue submission happens on the same thread as retro_run(),
+ * the lock/unlock functions must still be called."
+ *
+ * We were not calling them at all.  It happened to work because every core
+ * submission was on retro_run()'s thread and the frontend only submits between
+ * frames - but with the GPU worker rasterising on its own thread that is
+ * coincidence, not a guarantee.  Defined further down, next to the interface
+ * pointer they need.
+ */
+static void rhi_vk_lock_queue(void);
+static void rhi_vk_unlock_queue(void);
+
 PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties;
 PFN_vkEnumerateDeviceLayerProperties vkEnumerateDeviceLayerProperties;
 PFN_vkEnumerateInstanceExtensionProperties vkEnumerateInstanceExtensionProperties;
@@ -16248,7 +16265,10 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
       }
 
       cleared_fence = fence ? fencemanager_request_cleared_fence(&self->managers.fence) : VK_NULL_HANDLE;
+
+      rhi_vk_lock_queue();
       result = vkQueueSubmit(queue, 1, &submit, cleared_fence);
+      rhi_vk_unlock_queue();
 
       if (result != VK_SUCCESS)
          LOGE("vkQueueSubmit failed (code: %d).\n", (int)(result));
@@ -16523,7 +16543,9 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
             break;
       }
 
+      rhi_vk_lock_queue();
       result = vkQueueSubmit(queue, VkSubmitInfoVec_size(&submits), VkSubmitInfoVec_data(&submits), cleared_fence);
+      rhi_vk_unlock_queue();
       if (result != VK_SUCCESS)
          LOGE("vkQueueSubmit failed (code: %d).\n", (int)(result));
       cbhvec_clear(submissions);
@@ -16833,8 +16855,15 @@ static void device_wait_idle_nolock(Device *self)
    if (self->per_frame.count != 0)
       device_end_frame_nolock(self);
 
+   /* vkDeviceWaitIdle is externally synchronised with respect to every queue
+    * on the device, so it needs the frontend's queue lock for the same reason
+    * a submit does. */
    if (self->device != VK_NULL_HANDLE)
+   {
+      rhi_vk_lock_queue();
       vkDeviceWaitIdle(self->device);
+      rhi_vk_unlock_queue();
+   }
 
    device_clear_wait_semaphores(self);
 
@@ -18713,7 +18742,33 @@ extern enum rhi_renderer_type rhi_type;
 extern retro_log_printf_t log_cb;
 
 static struct retro_hw_render_callback hw_render;
+/* Full-VRAM scratch for staging a recorded upload back to full stride.  Only
+ * touched while replaying the pre-context_reset queue, which happens once. */
+static uint16_t *vk_defer_stage = NULL;
+
+static uint16_t *vk_defer_stage_buffer(void)
+{
+   if (!vk_defer_stage)
+      vk_defer_stage = (uint16_t *)malloc(
+            (size_t)FB_WIDTH * (size_t)FB_HEIGHT * sizeof(uint16_t));
+   return vk_defer_stage;
+}
+
 static const struct retro_hw_render_interface_vulkan *vulkan;
+
+/* No-ops until the HW-render interface is up, and when a frontend leaves the
+ * hooks NULL (they are optional in the struct, mandatory to call when set). */
+static void rhi_vk_lock_queue(void)
+{
+   if (vulkan && vulkan->lock_queue)
+      vulkan->lock_queue(vulkan->handle);
+}
+
+static void rhi_vk_unlock_queue(void)
+{
+   if (vulkan && vulkan->unlock_queue)
+      vulkan->unlock_queue(vulkan->handle);
+}
 
 /* Owning vector of retro_vulkan_image (POD), replacing A dynamic array of
  * retro_vulkan_image. resize() grows/shrinks the backing array; grown slots are
@@ -18917,14 +18972,38 @@ static void vk_defer_dispatch(void *user, const rhi_defer_op_t *op)
                                      op->u.set_display_mode.width_mode);
          break;
       case RHI_DEFER_LOAD_IMAGE:
-         rhi_vulkan_load_image(op->u.load_image.x,
-                               op->u.load_image.y,
-                               op->u.load_image.w,
-                               op->u.load_image.h,
-                               op->u.load_image.vram,
-                               op->u.load_image.mask_test,
-                               op->u.load_image.set_mask);
+      {
+         /* A recorded snapshot is tightly packed, while load_image reads at
+          * full VRAM stride, so stage it back into a scratch buffer at the
+          * rect's own coordinates.  Only the rect is ever read. */
+         uint16_t *src = op->u.load_image.vram;
+
+         if (op->u.load_image.has_pixels)
+         {
+            const uint16_t *packed = rhi_defer_pixels(&defer,
+                                          op->u.load_image.pixel_offset);
+            uint16_t *stage = vk_defer_stage_buffer();
+
+            if (packed && stage)
+            {
+               rhi_defer_stage_load_image(op, packed, stage,
+                     (size_t)FB_WIDTH, (size_t)FB_HEIGHT);
+               src = stage;
+            }
+            else
+               src = NULL;
+         }
+
+         if (src)
+            rhi_vulkan_load_image(op->u.load_image.x,
+                                  op->u.load_image.y,
+                                  op->u.load_image.w,
+                                  op->u.load_image.h,
+                                  src,
+                                  op->u.load_image.mask_test,
+                                  op->u.load_image.set_mask);
          break;
+      }
       case RHI_DEFER_TOGGLE_DISPLAY:
          rhi_vulkan_toggle_display(op->u.toggle_display.status);
          break;
@@ -20088,12 +20167,16 @@ void rhi_vulkan_load_image(
 {
    if (!renderer)
    {
-      /* Pre-context_reset uploads (e.g. savestate-load arriving before
-       * the Vulkan context is up, or game boot pushing VRAM ahead of
-       * the frontend's context_reset). The captured `vram` pointer
-       * aliases GPU.vram, which lives for the whole core lifetime, so
-       * holding it across the deferred-replay window is safe. */
-      rhi_defer_push_load_image(&defer, x, y, w, h, vram, mask_test, set_mask);
+      /* Pre-context_reset uploads (e.g. savestate-load arriving before the
+       * Vulkan context is up, or game boot pushing VRAM ahead of the
+       * frontend's context_reset).  Snapshot the pixels rather than aliasing
+       * GPU.vram: that buffer is freed and reallocated by GPU_Rescale(), so a
+       * pointer held across the replay window is not as safe as it looks.
+       * Falling back to the alias on allocation failure keeps the old
+       * behaviour rather than dropping the upload. */
+      if (!rhi_defer_push_load_image_snapshot(&defer, x, y, w, h, vram,
+               (size_t)FB_WIDTH, (size_t)FB_HEIGHT, mask_test, set_mask))
+         rhi_defer_push_load_image(&defer, x, y, w, h, vram, mask_test, set_mask);
       return;
    }
 

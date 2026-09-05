@@ -264,6 +264,16 @@ enum rhi_renderer_type rhi_intf_is_type(void)
    return rhi_type;
 }
 
+void rhi_intf_set_threaded_recording(bool enabled)
+{
+#if defined(HAVE_OPENGL)
+   if (rhi_type == RHI_OPENGL)
+      rhi_gl_set_threaded_recording(enabled);
+   else
+#endif
+      (void)enabled;
+}
+
 /* `static inline` (rather than the original plain `inline`) so that
  * unoptimised builds link. With -O3 (release) every call site got
  * inlined and no out-of-line definition was needed; under DEBUG=1

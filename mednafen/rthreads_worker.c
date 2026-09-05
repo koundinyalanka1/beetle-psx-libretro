@@ -2,6 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Bounded waits, so a missed signal degrades into a short stall rather than a
+ * permanently blocked caller. */
+#define RTHREADS_WORKER_WAIT_US 20000
+
 typedef struct
 {
    rthreads_job_fn_t fn;
@@ -37,8 +41,9 @@ static void worker_thread_entry(void *userdata)
       while (worker->count == 0 && !worker->stopping)
       {
          worker->idle = true;
-         scond_signal(worker->drained);
-         scond_wait(worker->not_empty, worker->lock);
+         scond_broadcast(worker->drained);
+         scond_wait_timeout(worker->not_empty, worker->lock,
+               RTHREADS_WORKER_WAIT_US);
       }
 
       if (worker->stopping && worker->count == 0)
@@ -49,7 +54,7 @@ static void worker_thread_entry(void *userdata)
       worker->read_pos = (worker->read_pos + 1) % worker->capacity;
       worker->count--;
 
-      scond_signal(worker->not_full);
+      scond_broadcast(worker->not_full);
 
       slock_unlock(worker->lock);
 
@@ -59,11 +64,14 @@ static void worker_thread_entry(void *userdata)
       slock_lock(worker->lock);
 
       if (worker->count == 0)
-         scond_signal(worker->drained);
+      {
+         worker->idle = true;
+         scond_broadcast(worker->drained);
+      }
    }
 
    worker->idle = true;
-   scond_signal(worker->drained);
+   scond_broadcast(worker->drained);
    slock_unlock(worker->lock);
 }
 
@@ -118,7 +126,8 @@ bool rthreads_worker_post(rthreads_worker_t *worker, rthreads_job_fn_t fn, void 
 
    while (worker->count >= worker->capacity && !worker->stopping)
    {
-      scond_wait(worker->not_full, worker->lock);
+      scond_wait_timeout(worker->not_full, worker->lock,
+            RTHREADS_WORKER_WAIT_US);
    }
 
    if (worker->stopping)
@@ -132,7 +141,7 @@ bool rthreads_worker_post(rthreads_worker_t *worker, rthreads_job_fn_t fn, void 
    worker->write_pos = (worker->write_pos + 1) % worker->capacity;
    worker->count++;
 
-   scond_signal(worker->not_empty);
+   scond_broadcast(worker->not_empty);
    slock_unlock(worker->lock);
 
    return true;
@@ -146,7 +155,8 @@ void rthreads_worker_wait(rthreads_worker_t *worker)
    slock_lock(worker->lock);
    while ((worker->count > 0 || !worker->idle) && !worker->stopping)
    {
-      scond_wait(worker->drained, worker->lock);
+      scond_wait_timeout(worker->drained, worker->lock,
+            RTHREADS_WORKER_WAIT_US);
    }
    slock_unlock(worker->lock);
 }
@@ -164,6 +174,9 @@ void rthreads_worker_free(rthreads_worker_t *worker)
          scond_broadcast(worker->not_empty);
       if (worker->not_full)
          scond_broadcast(worker->not_full);
+      /* Also release anyone parked in rthreads_worker_wait(). */
+      if (worker->drained)
+         scond_broadcast(worker->drained);
       slock_unlock(worker->lock);
    }
 

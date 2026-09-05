@@ -1,5 +1,9 @@
 #include "rthreads_pool.h"
 #include <features/features_cpu.h>
+
+/* Bounded waits, so a missed signal degrades into a short stall rather than a
+ * permanently blocked caller. */
+#define RTHREADS_POOL_WAIT_US 20000
 #include <stdlib.h>
 #include <string.h>
 
@@ -48,14 +52,14 @@ static void pool_worker_loop(void *userdata)
 
          pool->tasks_remaining--;
          if (pool->tasks_remaining == 0)
-            scond_signal(pool->done_cond);
+            scond_broadcast(pool->done_cond);
       }
 
       if (pool->stopping)
          break;
 
       /* Wait for next dispatch */
-      scond_wait(pool->work_cond, pool->lock);
+      scond_wait_timeout(pool->work_cond, pool->lock, RTHREADS_POOL_WAIT_US);
    }
 
    slock_unlock(pool->lock);
@@ -146,7 +150,7 @@ void rthreads_pool_dispatch_and_wait(rthreads_pool_t *pool,
    /* Wait for all tasks to finish */
    while (pool->tasks_remaining > 0 && !pool->stopping)
    {
-      scond_wait(pool->done_cond, pool->lock);
+      scond_wait_timeout(pool->done_cond, pool->lock, RTHREADS_POOL_WAIT_US);
    }
 
    pool->current_fn = NULL;
@@ -168,6 +172,9 @@ void rthreads_pool_free(rthreads_pool_t *pool)
       pool->stopping = true;
       if (pool->work_cond)
          scond_broadcast(pool->work_cond);
+      /* Also release a dispatcher parked in rthreads_pool_dispatch_and_wait(). */
+      if (pool->done_cond)
+         scond_broadcast(pool->done_cond);
       slock_unlock(pool->lock);
    }
 
