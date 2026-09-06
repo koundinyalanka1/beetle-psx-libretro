@@ -92,6 +92,7 @@
 #include "cdc.h"
 #include "spu.h"
 #include <rthreads/rthreads.h>
+#include <features/features_cpu.h>
 
 uint32_t IntermediateBufferPos;
 int16_t IntermediateBuffer[4096][2];
@@ -130,6 +131,12 @@ static sthread_t *spu_thread = NULL;
  * timeout turns any residual signalling bug into a hiccup instead of a hung
  * emulation thread (which the frontend reports as an ANR, not a crash). */
 #define SPU_WORKER_WAIT_US 20000
+
+/* Same instrumentation as the GPU side: if the emulation thread spends most of
+ * a frame here, the worker is costing more in handoffs than it saves. */
+static uint64_t spu_sync_block_us = 0;
+static uint32_t spu_sync_block_n  = 0;
+static uint32_t spu_job_n         = 0;
 
 static void SPU_SynthesizeSamples_Internal(int32_t sample_clocks);
 static void SPU_Worker_QueueSynth(int32_t sample_clocks);
@@ -1810,6 +1817,8 @@ static void SPU_Worker_QueueSynth(int32_t sample_clocks)
       }
    }
 
+   spu_job_n++;
+
    head = __atomic_load_n(&spu_queue_head, __ATOMIC_RELAXED);
    spu_queue[head].sample_clocks = sample_clocks;
 
@@ -1835,17 +1844,35 @@ void SPU_Worker_Sync(void)
    if (SPU_Queue_Empty() && __atomic_load_n(&spu_worker_idle, __ATOMIC_ACQUIRE))
       return;
 
-   slock_lock(spu_queue_lock);
-   while (!spu_worker_stopping
-         && (!SPU_Queue_Empty()
-            || !__atomic_load_n(&spu_worker_idle, __ATOMIC_ACQUIRE)))
    {
-      /* Timed: the predicate is re-tested every pass, so a lost signal costs
-       * a few microseconds instead of wedging the emulation thread. */
-      scond_wait_timeout(spu_queue_drained, spu_queue_lock,
-            SPU_WORKER_WAIT_US);
+      retro_time_t t0 = cpu_features_get_time_usec();
+
+      slock_lock(spu_queue_lock);
+      while (!spu_worker_stopping
+            && (!SPU_Queue_Empty()
+               || !__atomic_load_n(&spu_worker_idle, __ATOMIC_ACQUIRE)))
+      {
+         /* Timed: the predicate is re-tested every pass, so a lost signal
+          * costs a few microseconds instead of wedging the emulation thread. */
+         scond_wait_timeout(spu_queue_drained, spu_queue_lock,
+               SPU_WORKER_WAIT_US);
+      }
+      slock_unlock(spu_queue_lock);
+
+      spu_sync_block_us += (uint64_t)(cpu_features_get_time_usec() - t0);
+      spu_sync_block_n++;
    }
-   slock_unlock(spu_queue_lock);
+}
+
+void SPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
+                          uint32_t *jobs)
+{
+   if (blocked_us) *blocked_us = spu_sync_block_us;
+   if (blocks)     *blocks     = spu_sync_block_n;
+   if (jobs)       *jobs       = spu_job_n;
+   spu_sync_block_us = 0;
+   spu_sync_block_n  = 0;
+   spu_job_n         = 0;
 }
 
 void SPU_Worker_Init(void)

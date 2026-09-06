@@ -697,6 +697,9 @@ static void extract_directory(char *buf, const char *path, size_t size)
 #include "mednafen/mempatcher.h"
 
 #include <stdarg.h>
+#ifdef ANDROID
+#include <android/log.h>
+#endif
 #include <ctype.h>
 
 /* Based off(but not the same as) public-domain "JKISS" PRNG. */
@@ -4371,7 +4374,25 @@ static void fallback_log(enum retro_log_level level, const char *fmt, ...)
    va_list va;
    (void)level;
    va_start(va, fmt);
+#ifdef ANDROID
+   /* stderr is discarded on Android, so a frontend that declines
+    * GET_LOG_INTERFACE silently loses every diagnostic the core emits - which
+    * is indistinguishable from the core having nothing to say. Route to
+    * logcat instead: `adb logcat -s beetle-psx` picks it up with no frontend
+    * support at all. */
+   {
+      static const int prio[] = {
+         ANDROID_LOG_DEBUG, ANDROID_LOG_INFO,
+         ANDROID_LOG_WARN,  ANDROID_LOG_ERROR
+      };
+      __android_log_vprint(
+            (level < (enum retro_log_level)(sizeof(prio) / sizeof(prio[0])))
+               ? prio[level] : ANDROID_LOG_INFO,
+            "beetle-psx", fmt, va);
+   }
+#else
    vfprintf(stderr, fmt, va);
+#endif
    va_end(va);
 }
 
@@ -6599,11 +6620,44 @@ void retro_run(void)
       GPU_Worker_Refresh();
       SPU_Worker_Refresh();
 
+      /* WARN, not INFO: a frontend that filters core INFO (several do) would
+       * otherwise never show whether threading actually engaged, which is the
+       * first thing anyone needs when the core is slow. */
       if (gpu_was != GPU_Worker_Active() || spu_was != SPU_Worker_Active())
-         log_cb(RETRO_LOG_INFO,
+         log_cb(RETRO_LOG_WARN,
                "Threading: GPU worker %s, SPU worker %s\n",
                GPU_Worker_Active() ? "on" : "off",
                SPU_Worker_Active() ? "on" : "off");
+   }
+
+   /* Periodic worker cost report.  The question threading always raises is
+    * whether the emulation thread is spending more time waiting on a worker
+    * than the worker saves; these are the numbers that answer it, and they
+    * are useless if a log filter eats them, hence WARN. */
+   if (GPU_Worker_Active() || SPU_Worker_Active())
+   {
+      static uint32_t stat_frames;
+
+      if (++stat_frames >= 300)
+      {
+         uint64_t gpu_us = 0, spu_us = 0;
+         uint32_t gpu_n = 0, spu_n = 0, gpu_push = 0, gpu_depth = 0, spu_jobs = 0;
+
+         GPU_Worker_TakeStats(&gpu_us, &gpu_n, &gpu_push, &gpu_depth);
+         SPU_Worker_TakeStats(&spu_us, &spu_n, &spu_jobs);
+
+         log_cb(RETRO_LOG_WARN,
+               "Worker cost over %u frames: GPU blocked %.2f ms/frame (%u waits, "
+               "%u words, depth %u) | SPU blocked %.2f ms/frame (%u waits, "
+               "%u jobs/frame)\n",
+               stat_frames,
+               (double)gpu_us / 1000.0 / (double)stat_frames, gpu_n,
+               gpu_push / stat_frames, gpu_depth,
+               (double)spu_us / 1000.0 / (double)stat_frames, spu_n,
+               spu_jobs / stat_frames);
+
+         stat_frames = 0;
+      }
    }
 
    espec = (EmulateSpecStruct*)&spec;

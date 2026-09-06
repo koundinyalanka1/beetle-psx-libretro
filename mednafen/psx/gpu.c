@@ -23,6 +23,7 @@
 
 #include <retro_miscellaneous.h>
 #include <rthreads/rthreads.h>
+#include <features/features_cpu.h>
 
 #if defined(__SSE2__)
 #include <emmintrin.h>
@@ -179,6 +180,13 @@ static scond_t *gpu_queue_not_empty = NULL;
 static scond_t *gpu_queue_not_full = NULL;
 static scond_t *gpu_queue_drained = NULL;
 static sthread_t *gpu_thread = NULL;
+
+/* How long the emulation thread has spent blocked in GPU_Worker_Sync, and how
+ * often.  Threading is only a win if this stays small; it is the one number
+ * that says whether the worker is helping or just adding handoffs. */
+static uint64_t gpu_sync_block_us = 0;
+static uint32_t gpu_sync_block_n  = 0;
+static uint32_t gpu_push_n        = 0;
 
 /* Bounded waits: the handshake below cannot lose a wakeup, but a timeout keeps
  * any residual signalling bug a hiccup rather than a wedged emulation thread
@@ -1960,17 +1968,36 @@ void GPU_Worker_Sync(void)
    if (GPU_Queue_Empty() && __atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
       return;
 
-   slock_lock(gpu_queue_lock);
-   while (!gpu_worker_stopping
-         && (!GPU_Queue_Empty()
-            || !__atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE)))
    {
-      /* Timed: the predicate is re-tested every pass, so a lost signal costs
-       * a few microseconds instead of wedging the emulation thread. */
-      scond_wait_timeout(gpu_queue_drained, gpu_queue_lock,
-            GPU_WORKER_WAIT_US);
+      retro_time_t t0 = cpu_features_get_time_usec();
+
+      slock_lock(gpu_queue_lock);
+      while (!gpu_worker_stopping
+            && (!GPU_Queue_Empty()
+               || !__atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE)))
+      {
+         /* Timed: the predicate is re-tested every pass, so a lost signal
+          * costs a few microseconds instead of wedging the emulation thread. */
+         scond_wait_timeout(gpu_queue_drained, gpu_queue_lock,
+               GPU_WORKER_WAIT_US);
+      }
+      slock_unlock(gpu_queue_lock);
+
+      gpu_sync_block_us += (uint64_t)(cpu_features_get_time_usec() - t0);
+      gpu_sync_block_n++;
    }
-   slock_unlock(gpu_queue_lock);
+}
+
+void GPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
+                          uint32_t *pushes, uint32_t *queue_depth)
+{
+   if (blocked_us)  *blocked_us  = gpu_sync_block_us;
+   if (blocks)      *blocks      = gpu_sync_block_n;
+   if (pushes)      *pushes      = gpu_push_n;
+   if (queue_depth) *queue_depth = gpu_worker_running ? GPU_Queue_Count() : 0;
+   gpu_sync_block_us = 0;
+   gpu_sync_block_n  = 0;
+   gpu_push_n        = 0;
 }
 
 void GPU_Worker_Init(void)
@@ -2185,6 +2212,8 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
 
    if (gpu_worker_stopping)
       return;
+
+   gpu_push_n++;
 
    head = __atomic_load_n(&gpu_queue_head, __ATOMIC_RELAXED);
    gpu_queue[head].type = type;

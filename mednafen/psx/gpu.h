@@ -336,6 +336,10 @@ void GPU_SetThreaded(bool enabled);
 bool GPU_GetThreaded(void);
 bool GPU_Worker_Active(void);
 void GPU_Worker_Refresh(void);
+/* Read-and-reset: microseconds the emulation thread spent blocked waiting on
+ * the worker, how many times it blocked, GP0 words queued, current depth. */
+void GPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
+                          uint32_t *pushes, uint32_t *queue_depth);
 
 #ifdef __cplusplus
 }
