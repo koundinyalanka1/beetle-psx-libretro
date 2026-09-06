@@ -11,6 +11,7 @@
 #endif
 #include <libretro.h>
 #include <rthreads/rthreads.h>
+#include <features/features_cpu.h>
 #include <streams/file_stream.h>
 #include <vfs/vfs_hybrid.h>
 #include <string/stdstring.h>
@@ -6370,6 +6371,41 @@ static void av_enable_poll(void);
 static bool av_video_enabled(void);
 static bool av_audio_enabled(void);
 
+/* ---- retro_run phase accounting -------------------------------------------
+ *
+ * retro_run is where the frame budget goes, and the only number anyone had for
+ * it was the total.  On a budget part that total sits at 9-12 ms against a
+ * 16.7 ms budget, and the frontend's own instrumentation puts ~97% of it
+ * before set_image - which says "the whole emulated frame" rather than "the
+ * renderer", but says nothing about which part of it.
+ *
+ * Four buckets, chosen because they split the candidate answers apart:
+ *
+ *   cpu      CPU_Run(): the emulated machine - MIPS, CDC, timers, DMA, and
+ *            every GPU/SPU event they drive.  GP0 command processing lands
+ *            here too, so this bucket minus the worker log's inline figure is
+ *            everything that is not the command stream.
+ *   finalize rhi_intf_finalize_frame(): scanout, renderer submit, set_image.
+ *   audio    audio_batch_cb(): the frontend's audio sink.  Timed separately
+ *            because a sink that blocks is indistinguishable from emulation
+ *            cost once it is inside our frame time, and that is exactly the
+ *            confusion to avoid when chasing audio problems.
+ *   other    the residual: option handling, geometry, input, deferred
+ *            scanout, and the two worker syncs at the top.
+ */
+static uint64_t phase_cpu_us   = 0;
+static uint64_t phase_final_us = 0;
+static uint64_t phase_audio_us = 0;
+static uint64_t phase_total_us = 0;
+static uint32_t phase_frames   = 0;
+/* Why a frame produced no image.  present_hz below run_hz has exactly two
+ * causes and they call for opposite fixes: the frontend disabling video for
+ * this run (it is behind and catching up), or the core deciding nothing
+ * visible changed.  Counting them apart is the difference between "make the
+ * core cheaper" and "fix the dupe heuristic". */
+static uint32_t phase_skip_av  = 0;
+static uint32_t phase_dupe     = 0;
+
 void retro_run(void)
 {
    bool updated = false;
@@ -6389,6 +6425,8 @@ void retro_run(void)
     * unconditional PSX_CPU->Run / PSX_FIO->UpdateInput calls below. */
    if (!PSX_CPU || !PSX_FIO || !PSX_CDC)
       return;
+
+   retro_time_t phase_t0 = cpu_features_get_time_usec();
 
    /* Ask once per frame and cache it, so every decision below agrees. */
    av_enable_poll();
@@ -6730,7 +6768,11 @@ void retro_run(void)
    GPU_StartFrame(espec);
 
    Running = -1;
-   timestamp = CPU_Run(PSX_CPU, timestamp);
+   {
+      retro_time_t t0 = cpu_features_get_time_usec();
+      timestamp = CPU_Run(PSX_CPU, timestamp);
+      phase_cpu_us += (uint64_t)(cpu_features_get_time_usec() - t0);
+   }
 
    assert(timestamp);
 
@@ -7008,14 +7050,33 @@ void retro_run(void)
     * renderer's frame. The flag only drops the scanout. */
    rhi_intf_set_frame_skip(!av_video_enabled());
 
+   /* Sampled here because the backend's dupe test reads the same flags and
+    * libretro.c clears them further down.  The dupe arm mirrors the backend's
+    * condition minus its interlace term, which lives in renderer state, so an
+    * interlaced title over-reports dupes slightly. */
+   if (!av_video_enabled())
+      phase_skip_av++;
+   else if (allow_frame_duping
+         && !GPU_get_display_possibly_dirty()
+         && !GPU_get_display_change_count())
+      phase_dupe++;
+
    GPU_Worker_Sync();
-   rhi_intf_finalize_frame(fb, width, height,
-         MEDNAFEN_CORE_GEOMETRY_MAX_W << (2 + upscale_shift));
+   {
+      retro_time_t t0 = cpu_features_get_time_usec();
+      rhi_intf_finalize_frame(fb, width, height,
+            MEDNAFEN_CORE_GEOMETRY_MAX_W << (2 + upscale_shift));
+      phase_final_us += (uint64_t)(cpu_features_get_time_usec() - t0);
+   }
 
    rhi_intf_set_frame_skip(false);
 
    if (audio_batch_cb && av_audio_enabled())
+   {
+      retro_time_t t0 = cpu_features_get_time_usec();
       audio_batch_cb(&IntermediateBuffer[0][0], spec.SoundBufSize);
+      phase_audio_us += (uint64_t)(cpu_features_get_time_usec() - t0);
+   }
    }
 
    if (GPU_get_display_possibly_dirty() || (GPU_get_display_change_count() != 0))
@@ -7029,6 +7090,31 @@ void retro_run(void)
    if (led_state_cb)
       retro_led_interface();
 
+   phase_total_us += (uint64_t)(cpu_features_get_time_usec() - phase_t0);
+   if (++phase_frames >= 300)
+   {
+      double f     = (double)phase_frames;
+      double total = (double)phase_total_us / 1000.0 / f;
+      double cpu   = (double)phase_cpu_us   / 1000.0 / f;
+      double final = (double)phase_final_us / 1000.0 / f;
+      double audio = (double)phase_audio_us / 1000.0 / f;
+
+      log_cb(RETRO_LOG_WARN,
+            "retro_run over %u frames: %.2f ms/frame = CPU %.2f + finalize "
+            "%.2f + audio %.2f + other %.2f | no image: %u frontend-skip + "
+            "%u duped\n",
+            phase_frames, total, cpu, final, audio,
+            total - cpu - final - audio,
+            phase_skip_av, phase_dupe);
+
+      phase_skip_av  = 0;
+      phase_dupe     = 0;
+      phase_cpu_us   = 0;
+      phase_final_us = 0;
+      phase_audio_us = 0;
+      phase_total_us = 0;
+      phase_frames   = 0;
+   }
 }
 
 void retro_get_system_info(struct retro_system_info *info)

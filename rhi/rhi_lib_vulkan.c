@@ -20095,9 +20095,30 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
 
    /* A frontend-requested skip takes the same exit as a duped frame: the
     * drawing still has to be flushed and the frame still has to be closed out,
-    * only the scanout is dropped. */
+    * only the scanout is dropped.
+    *
+    * The dupe test used to consider only display_change_count - GP1(05h), the
+    * display-area register.  That is narrower than what the software path in
+    * libretro.c uses and narrower than the truth: a game that fills, copies or
+    * CPU-uploads into the region it is already displaying, or that is running
+    * interlaced, produces a new frame without ever moving the display area,
+    * and every one of those was dropped here while the software renderer
+    * presented it.  The OpenGL backend never dupes at all, so the three paths
+    * disagreed three ways and Vulkan was the one losing frames.
+    *
+    * Match libretro.c.  Widening can only present more frames than before,
+    * never fewer - being too eager costs a redundant present, being too narrow
+    * costs the player a frame they should have seen.
+    *
+    * Still not tracked, on any path: polygon, sprite and line drawing never
+    * mark the display dirty (GPU_MarkDisplayDirty has four call sites and none
+    * of them is the rasteriser).  So this remains a heuristic; it now errs
+    * toward presenting. */
    if (rhi_intf_frame_skipped()
-         || (frame_duping_enabled && !GPU_get_display_change_count()))
+         || (frame_duping_enabled
+            && !GPU_get_display_change_count()
+            && !GPU_get_display_possibly_dirty()
+            && !renderer->render_state.is_480i))
    {
       /* Any visual core option changes will be deferred to next non-duped frame */
 

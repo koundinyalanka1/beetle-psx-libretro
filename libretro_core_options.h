@@ -224,7 +224,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       BEETLE_OPT(threaded_gpu),
       "Threaded GPU (Graphics)",
       NULL,
-      "Offload GPU drawing commands and DMA processing to an asynchronous worker thread, so rasterisation overlaps CPU emulation on multicore systems. Not available on the software renderer, which scans VRAM out from the emulation thread. On OpenGL it additionally requires 'Software Framebuffer' to be enabled, because GL calls are recorded and replayed on the emulation thread and a mid-command VRAM read-back cannot be deferred.",
+      "Offload GPU drawing commands to a worker thread so they overlap CPU emulation. Off by default because on this system it does not work: the guest polls GPUSTAT and the DMA-ready handshake roughly every four GP0 words, and every poll has to make the worker's progress observable, so the queue collapses before it can hold anything. Measured across two devices, zero of ~150,000 GP0 words per session ever reached the worker while it still cost a thread and a staged copy of every word. Enable it only if you are measuring the worker log yourself. Not available on the software renderer, which scans VRAM out from the emulation thread.",
       NULL,
       "system",
       {
@@ -232,7 +232,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
          { "enabled",  NULL },
          { NULL, NULL },
       },
-      "enabled"
+      "disabled"
    },
 #ifndef EMSCRIPTEN
    {
