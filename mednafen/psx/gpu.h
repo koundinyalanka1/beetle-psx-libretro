@@ -340,7 +340,8 @@ void GPU_Worker_Refresh(void);
  * the worker, how many times it blocked, GP0 words queued, current depth. */
 void GPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
                           uint32_t *pushes, uint32_t *queue_depth,
-                          uint64_t *full_us, uint32_t *fulls);
+                          uint64_t *full_us, uint32_t *fulls,
+                          uint32_t *spins);
 
 #ifdef __cplusplus
 }

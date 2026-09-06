@@ -199,6 +199,39 @@ static sthread_t *gpu_thread = NULL;
  * that says whether the worker is helping or just adding handoffs. */
 static uint64_t gpu_sync_block_us = 0;
 static uint32_t gpu_sync_block_n  = 0;
+/* Syncs satisfied by spinning instead of blocking - see GPU_Worker_Sync. */
+static uint32_t gpu_sync_spin_n   = 0;
+
+/*
+ * Adaptive wait.
+ *
+ * GPUSTAT reads and the DMA handshake both drain the queue, deliberately: the
+ * guest must never observe host queue depth or worker scheduling.  That is
+ * correct, but it means this is called on the order of a thousand times per
+ * frame, and at almost every one of those calls the worker is a few
+ * microseconds from finishing.  Blocking there costs a futex round-trip and
+ * two context switches - far more than the wait itself.
+ *
+ * So spin briefly first, and only block when the worker has a real backlog.
+ * This changes no semantics: the function still returns only once the queue is
+ * drained and the worker idle.  It only changes how that is waited for.
+ *
+ * Note the mirror of this on the worker side - spinning before it parks - is
+ * NOT a win and was measured to be a regression (3.5 ms/frame vs 2.3 for this
+ * spin alone).  This function waits for gpu_worker_idle, so a worker spinning
+ * with idle still false forces the emulation thread to wait out that entire
+ * spin.  The worker should park promptly and let the producer do the waiting.
+ */
+#define GPU_SYNC_SPIN_ITERS     4096
+#define GPU_SYNC_SPIN_MAX_DEPTH 512
+
+#if defined(__aarch64__) || defined(__arm__)
+#define GPU_CPU_RELAX() __asm__ __volatile__("yield" ::: "memory")
+#elif defined(__i386__) || defined(__x86_64__)
+#define GPU_CPU_RELAX() __asm__ __volatile__("pause" ::: "memory")
+#else
+#define GPU_CPU_RELAX() do {} while (0)
+#endif
 static uint32_t gpu_push_n        = 0;
 
 /* Bounded waits: the handshake below cannot lose a wakeup, but a timeout keeps
@@ -2020,6 +2053,30 @@ void GPU_Worker_Sync(void)
       return;
    }
 
+   /* Spin phase: cheap when the worker is nearly done, which is the common
+    * case for a GPUSTAT poll landing just behind a short burst of GP0. */
+   {
+      unsigned spins;
+
+      for (spins = 0; spins < GPU_SYNC_SPIN_ITERS; spins++)
+      {
+         if (GPU_Queue_Empty()
+               && __atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
+         {
+            gpu_sync_spin_n++;
+            GPU_ApplyIRQ();
+            return;
+         }
+
+         /* A real backlog won't clear inside a spin; blocking is cheaper and
+          * lets the core sleep. */
+         if (GPU_Queue_Count() > GPU_SYNC_SPIN_MAX_DEPTH)
+            break;
+
+         GPU_CPU_RELAX();
+      }
+   }
+
    {
       retro_time_t t0 = cpu_features_get_time_usec();
 
@@ -2044,16 +2101,19 @@ void GPU_Worker_Sync(void)
 
 void GPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
                           uint32_t *pushes, uint32_t *queue_depth,
-                          uint64_t *full_us, uint32_t *fulls)
+                          uint64_t *full_us, uint32_t *fulls,
+                          uint32_t *spins)
 {
    if (blocked_us)  *blocked_us  = gpu_sync_block_us;
    if (blocks)      *blocks      = gpu_sync_block_n;
+   if (spins)       *spins       = gpu_sync_spin_n;
    if (pushes)      *pushes      = gpu_push_n;
    if (queue_depth) *queue_depth = gpu_worker_running ? GPU_Queue_Count() : 0;
    if (full_us)     *full_us     = gpu_push_block_us;
    if (fulls)       *fulls       = gpu_push_block_n;
    gpu_sync_block_us = 0;
    gpu_sync_block_n  = 0;
+   gpu_sync_spin_n   = 0;
    gpu_push_n        = 0;
    gpu_push_block_us = 0;
    gpu_push_block_n  = 0;
