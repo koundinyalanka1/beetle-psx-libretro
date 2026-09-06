@@ -6366,6 +6366,10 @@ static bool retro_set_system_av_info(void)
    return environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &new_av_info);
 }
 
+static void av_enable_poll(void);
+static bool av_video_enabled(void);
+static bool av_audio_enabled(void);
+
 void retro_run(void)
 {
    bool updated = false;
@@ -6385,6 +6389,9 @@ void retro_run(void)
     * unconditional PSX_CPU->Run / PSX_FIO->UpdateInput calls below. */
    if (!PSX_CPU || !PSX_FIO || !PSX_CDC)
       return;
+
+   /* Ask once per frame and cache it, so every decision below agrees. */
+   av_enable_poll();
 
    /* Everything below - option handling, geometry, rhi_intf_prepare_frame,
     * rescale - runs on this thread and reaches into state the GPU worker
@@ -6662,23 +6669,25 @@ void retro_run(void)
 
       if (++stat_frames >= 300)
       {
-         uint64_t gpu_us = 0, spu_us = 0, gpu_full_us = 0;
+         uint64_t gpu_us = 0, spu_us = 0, gpu_full_us = 0, gpu_busy_us = 0;
          uint32_t gpu_n = 0, spu_n = 0, gpu_push = 0, gpu_depth = 0;
          uint32_t spu_jobs = 0, gpu_fulls = 0, gpu_spins = 0;
 
          GPU_Worker_TakeStats(&gpu_us, &gpu_n, &gpu_push, &gpu_depth,
-                              &gpu_full_us, &gpu_fulls, &gpu_spins);
+                              &gpu_full_us, &gpu_fulls, &gpu_spins,
+                              &gpu_busy_us);
          SPU_Worker_TakeStats(&spu_us, &spu_n, &spu_jobs);
 
          /* queue-full time is called out separately: it means the two threads
           * are running in lockstep rather than overlapping, which is a
           * different failure than the worker merely being behind at a sync. */
          log_cb(RETRO_LOG_WARN,
-               "Worker cost over %u frames: GPU sync %.2f ms/frame "
-               "(%u blocked + %u spun) queue-full %.2f ms/frame (%u stalls) "
-               "%u words/frame depth %u | SPU sync %.2f ms/frame (%u waits, "
-               "%u jobs/frame)\n",
+               "Worker cost over %u frames: GPU busy %.2f ms/frame, sync "
+               "%.2f ms/frame (%u blocked + %u spun), queue-full %.2f ms/frame "
+               "(%u stalls), %u words/frame, depth %u | SPU sync %.2f ms/frame "
+               "(%u waits, %u jobs/frame)\n",
                stat_frames,
+               (double)gpu_busy_us / 1000.0 / (double)stat_frames,
                (double)gpu_us / 1000.0 / (double)stat_frames,
                gpu_n, gpu_spins,
                (double)gpu_full_us / 1000.0 / (double)stat_frames, gpu_fulls,
@@ -6947,6 +6956,11 @@ void retro_run(void)
       VCD_RunFrame();
       vcd_fb = VCD_GetVideo(&vcd_w, &vcd_h, &vcd_pitch);
 
+      /* finalize_frame is always called - it is what pairs with
+       * prepare_frame and closes the renderer's frame out. The skip flag only
+       * tells it to drop the scanout. */
+      rhi_intf_set_frame_skip(!av_video_enabled());
+
       if (vcd_fb)
       {
          GPU_Worker_Sync();
@@ -6959,7 +6973,9 @@ void retro_run(void)
                MEDNAFEN_CORE_GEOMETRY_MAX_W << (2 + upscale_shift));
       }
 
-      if (audio_batch_cb)
+      rhi_intf_set_frame_skip(false);
+
+      if (audio_batch_cb && av_audio_enabled())
       {
          static int16_t vcd_abuf[4096 * 2];
          size_t frames = VCD_GetAudio(vcd_abuf,
@@ -6970,11 +6986,17 @@ void retro_run(void)
    }
    else
    {
+   /* Always call finalize_frame - it pairs with prepare_frame and closes the
+    * renderer's frame. The flag only drops the scanout. */
+   rhi_intf_set_frame_skip(!av_video_enabled());
+
    GPU_Worker_Sync();
    rhi_intf_finalize_frame(fb, width, height,
-		   MEDNAFEN_CORE_GEOMETRY_MAX_W << (2 + upscale_shift));
+         MEDNAFEN_CORE_GEOMETRY_MAX_W << (2 + upscale_shift));
 
-   if (audio_batch_cb)
+   rhi_intf_set_frame_skip(false);
+
+   if (audio_batch_cb && av_audio_enabled())
       audio_batch_cb(&IntermediateBuffer[0][0], spec.SoundBufSize);
    }
 
@@ -7194,13 +7216,60 @@ size_t retro_serialize_size(void)
    return DEFAULT_STATE_SIZE; // 16MB
 }
 
+/* Cached per frame by retro_run so the rest of the frame agrees with itself;
+ * see av_enable_poll(). */
+static int av_enable_flags = RETRO_AV_ENABLE_VIDEO | RETRO_AV_ENABLE_AUDIO;
+
 bool UsingFastSavestates(void)
 {
    int flags;
    if (environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &flags))
-      return flags & 4;
+      return flags & RETRO_AV_ENABLE_FAST_SAVESTATES;
    return false;
 }
+
+/*
+ * Frame-skip support.
+ *
+ * The frontend decides, per frame, whether it actually wants video and audio
+ * from us.  Dropping the presentation of a frame it is going to discard lets
+ * it keep audio cadence and input latency when the core cannot hold full
+ * speed - without it, a frontend that falls behind has no way to shed work and
+ * everything slows down together, video and audio alike.
+ *
+ * Emulation itself is never skipped: the GPU still executes every command
+ * (VRAM has to stay correct for the frames we do present) and the SPU still
+ * produces samples.  What a skipped frame drops is the scanout - the render
+ * pass, the image creation, and the blit - which is the part the frontend
+ * would have thrown away.
+ *
+ * Querying this every frame is also how a frontend detects that the core
+ * supports skipping at all, so the call itself matters, not just the answer.
+ */
+static void av_enable_poll(void)
+{
+   int flags;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_AUDIO_VIDEO_ENABLE, &flags))
+      av_enable_flags = flags;
+   else
+      av_enable_flags = RETRO_AV_ENABLE_VIDEO | RETRO_AV_ENABLE_AUDIO;
+}
+
+static INLINE bool av_video_enabled(void)
+{
+   return (av_enable_flags & RETRO_AV_ENABLE_VIDEO) != 0;
+}
+
+static INLINE bool av_audio_enabled(void)
+{
+   /* HARD_DISABLE means the frontend will not consume audio at all, so we
+    * skip the callback entirely rather than handing it samples to drop. */
+   if (av_enable_flags & RETRO_AV_ENABLE_HARD_DISABLE_AUDIO)
+      return false;
+   return (av_enable_flags & RETRO_AV_ENABLE_AUDIO) != 0;
+}
+
 
 /* Serialize emulator state into the frontend's `data` buffer of `size`
  * bytes.

@@ -6356,6 +6356,18 @@ void rhi_gl_finalize_frame(const void *fb, unsigned width,
 
    tt_frame_advance();
 
+   /* Frontend-requested skip: still issue the frame's drawing (VRAM has to be
+    * correct for the frames we do present) and still report a frame so the
+    * frontend can pace, but drop the scanout and present. */
+   if (rhi_intf_frame_skipped())
+   {
+      if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+         gl_renderer_draw(renderer);
+      if (video_cb)
+         video_cb(NULL, width, height, pitch);
+      return;
+   }
+
    /* Draw pending commands */
    if (!gl_draw_buffer_is_empty(renderer->command_buffer))
       gl_renderer_draw(renderer);

@@ -20093,7 +20093,11 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
 
    tt_frame_advance();
 
-   if (frame_duping_enabled && !GPU_get_display_change_count())
+   /* A frontend-requested skip takes the same exit as a duped frame: the
+    * drawing still has to be flushed and the frame still has to be closed out,
+    * only the scanout is dropped. */
+   if (rhi_intf_frame_skipped()
+         || (frame_duping_enabled && !GPU_get_display_change_count()))
    {
       /* Any visual core option changes will be deferred to next non-duped frame */
 

@@ -201,6 +201,12 @@ static uint64_t gpu_sync_block_us = 0;
 static uint32_t gpu_sync_block_n  = 0;
 /* Syncs satisfied by spinning instead of blocking - see GPU_Worker_Sync. */
 static uint32_t gpu_sync_spin_n   = 0;
+/* Microseconds the worker spent actually executing commands.  Together with
+ * the emulation thread's frame time this says whether the two threads are
+ * overlapping: if worker-busy plus sync-blocked is close to the whole frame,
+ * they are running in lockstep and there is nothing to gain from waiting less
+ * - the win would have to come from letting the queue run deeper. */
+static uint64_t gpu_worker_busy_us = 0;
 
 /*
  * Adaptive wait.
@@ -1998,6 +2004,7 @@ static void gpu_worker_thread_loop(void *arg)
       slock_unlock(gpu_queue_lock);
 
       {
+         retro_time_t work_t0 = cpu_features_get_time_usec();
          uint32_t tail  = __atomic_load_n(&gpu_queue_tail, __ATOMIC_RELAXED);
          uint32_t head  = __atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE);
          uint32_t count = (head - tail) & GPU_QUEUE_MASK;
@@ -2029,6 +2036,10 @@ static void gpu_worker_thread_loop(void *arg)
           * empty queue plus an idle worker as "everything is applied". */
          __atomic_store_n(&gpu_queue_tail, (tail + count) & GPU_QUEUE_MASK,
                __ATOMIC_RELEASE);
+
+         /* Relaxed: read once per 300 frames by the emulation thread, and an
+          * occasional torn/stale sample would only skew a diagnostic. */
+         gpu_worker_busy_us += (uint64_t)(cpu_features_get_time_usec() - work_t0);
       }
 
       slock_lock(gpu_queue_lock);
@@ -2102,11 +2113,12 @@ void GPU_Worker_Sync(void)
 void GPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
                           uint32_t *pushes, uint32_t *queue_depth,
                           uint64_t *full_us, uint32_t *fulls,
-                          uint32_t *spins)
+                          uint32_t *spins, uint64_t *busy_us)
 {
    if (blocked_us)  *blocked_us  = gpu_sync_block_us;
    if (blocks)      *blocks      = gpu_sync_block_n;
    if (spins)       *spins       = gpu_sync_spin_n;
+   if (busy_us)     *busy_us     = gpu_worker_busy_us;
    if (pushes)      *pushes      = gpu_push_n;
    if (queue_depth) *queue_depth = gpu_worker_running ? GPU_Queue_Count() : 0;
    if (full_us)     *full_us     = gpu_push_block_us;
@@ -2114,6 +2126,7 @@ void GPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
    gpu_sync_block_us = 0;
    gpu_sync_block_n  = 0;
    gpu_sync_spin_n   = 0;
+   gpu_worker_busy_us = 0;
    gpu_push_n        = 0;
    gpu_push_block_us = 0;
    gpu_push_block_n  = 0;

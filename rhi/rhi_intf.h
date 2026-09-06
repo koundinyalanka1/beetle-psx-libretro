@@ -173,6 +173,14 @@ enum rhi_renderer_type rhi_intf_is_type(void);
  * and replays them on the emulation thread.  A no-op elsewhere. */
 void rhi_intf_set_threaded_recording(bool enabled);
 
+/* Ask the backend to finish the frame without presenting it: drawing is still
+ * flushed and the frame is still reported (as a NULL/duped frame), but the
+ * scanout - render pass, image creation, blit - is skipped.  Set per frame,
+ * before rhi_intf_finalize_frame; it must still be called so prepare_frame and
+ * finalize_frame stay paired, or the renderer is left mid-frame. */
+void rhi_intf_set_frame_skip(bool skip);
+bool rhi_intf_frame_skipped(void);
+
 void rhi_intf_toggle_display(bool status);
 
 bool rhi_intf_has_software_renderer(void);

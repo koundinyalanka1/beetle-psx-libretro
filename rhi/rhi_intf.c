@@ -264,6 +264,18 @@ enum rhi_renderer_type rhi_intf_is_type(void)
    return rhi_type;
 }
 
+static bool rhi_frame_skip = false;
+
+void rhi_intf_set_frame_skip(bool skip)
+{
+   rhi_frame_skip = skip;
+}
+
+bool rhi_intf_frame_skipped(void)
+{
+   return rhi_frame_skip;
+}
+
 void rhi_intf_set_threaded_recording(bool enabled)
 {
 #if defined(HAVE_OPENGL)
@@ -521,7 +533,11 @@ void rhi_intf_finalize_frame(const void *fb, unsigned width,
    switch (rhi_type)
    {
       case RHI_SOFTWARE:
-         video_cb(fb, width, height, pitch);
+         /* Nothing to unwind on the software path; just report no new frame. */
+         if (rhi_frame_skip)
+            video_cb(NULL, width, height, pitch);
+         else
+            video_cb(fb, width, height, pitch);
          break;
       case RHI_OPENGL:
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
