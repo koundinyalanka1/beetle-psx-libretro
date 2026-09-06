@@ -5799,6 +5799,10 @@ static void gl_defer_dispatch(void *user, const rhi_defer_op_t *op)
 
 static void gl_context_reset(void)
 {
+   /* The GPU worker records against this renderer and its journal. Finish
+    * those writes before replacing either during a frontend context reset. */
+   GPU_Worker_Sync();
+
    /* Resolve the GL function-pointer table for this context.
     * rglgen_resolve_symbols walks the rglgen-generated symbol
     * declarations and populates each __rglgen_glFoo via the
@@ -5860,9 +5864,15 @@ static void gl_context_reset(void)
       static_renderer.inited = true;
       static_renderer.state  = GL_STATE_VALID;
 
+      /* Restore the baseline directly even when the GPU worker is enabled.
+       * Recording these calls and replaying with recording still armed would
+       * append to the same queue being drained, dropping the restored state
+       * and potentially reallocating an operation under the dispatcher. */
+      gl_journal_draining = true;
       GPU_RestoreStateP1(true);
       GPU_RestoreStateP2(true);
       GPU_RestoreStateP3();
+      gl_journal_draining = false;
 
       /* Replay any rhi_gl_* state-sets / VRAM uploads / display
        * toggles that arrived between rhi_gl_open's SET_HW_RENDER
@@ -5879,7 +5889,7 @@ static void gl_context_reset(void)
          log_cb(RETRO_LOG_INFO,
                "[gl_context_reset] replaying %u deferred RHI op(s)\n",
                (unsigned)rhi_defer_count(&gl_defer_queue));
-         rhi_defer_drain(&gl_defer_queue, gl_defer_dispatch, NULL);
+         gl_journal_drain();
       }
    }
    else
@@ -5909,6 +5919,8 @@ static void gl_context_reset(void)
 
 static void gl_context_destroy(void)
 {
+   GPU_Worker_Sync();
+
    if (static_renderer.state_data)
    {
       gl_renderer_free(static_renderer.state_data);

@@ -15,6 +15,7 @@ struct rthreads_pool
    unsigned thread_count;
 
    slock_t *lock;
+   slock_t *dispatch_lock;
    scond_t *work_cond;
    scond_t *done_cond;
 
@@ -85,10 +86,11 @@ rthreads_pool_t *rthreads_pool_new(unsigned num_threads)
       return NULL;
 
    pool->lock = slock_new();
+   pool->dispatch_lock = slock_new();
    pool->work_cond = scond_new();
    pool->done_cond = scond_new();
 
-   if (!pool->lock || !pool->work_cond || !pool->done_cond)
+   if (!pool->lock || !pool->dispatch_lock || !pool->work_cond || !pool->done_cond)
    {
       rthreads_pool_free(pool);
       return NULL;
@@ -105,6 +107,12 @@ rthreads_pool_t *rthreads_pool_new(unsigned num_threads)
          pool->thread_count = i;
          break;
       }
+   }
+
+   if (!pool->thread_count)
+   {
+      rthreads_pool_free(pool);
+      return NULL;
    }
 
    return pool;
@@ -125,8 +133,7 @@ void rthreads_pool_dispatch_and_wait(rthreads_pool_t *pool,
    if (!fn || task_count == 0)
       return;
 
-   /* If pool is inactive or has only 1 thread, execute synchronously on caller */
-   if (!pool || pool->thread_count <= 1)
+   if (!pool)
    {
       for (i = 0; i < task_count; i++)
       {
@@ -136,6 +143,9 @@ void rthreads_pool_dispatch_and_wait(rthreads_pool_t *pool,
       return;
    }
 
+   /* A second dispatcher must not replace task_data while the first batch's
+    * workers still use it. Hold a separate lock for the complete dispatch. */
+   slock_lock(pool->dispatch_lock);
    slock_lock(pool->lock);
 
    pool->current_fn = fn;
@@ -148,7 +158,7 @@ void rthreads_pool_dispatch_and_wait(rthreads_pool_t *pool,
    scond_broadcast(pool->work_cond);
 
    /* Wait for all tasks to finish */
-   while (pool->tasks_remaining > 0 && !pool->stopping)
+   while (pool->tasks_remaining > 0)
    {
       scond_wait_timeout(pool->done_cond, pool->lock, RTHREADS_POOL_WAIT_US);
    }
@@ -158,6 +168,7 @@ void rthreads_pool_dispatch_and_wait(rthreads_pool_t *pool,
    pool->current_task_count = 0;
 
    slock_unlock(pool->lock);
+   slock_unlock(pool->dispatch_lock);
 }
 
 void rthreads_pool_free(rthreads_pool_t *pool)
@@ -166,15 +177,15 @@ void rthreads_pool_free(rthreads_pool_t *pool)
    if (!pool)
       return;
 
+   if (pool->dispatch_lock)
+      slock_lock(pool->dispatch_lock);
+
    if (pool->lock)
    {
       slock_lock(pool->lock);
       pool->stopping = true;
       if (pool->work_cond)
          scond_broadcast(pool->work_cond);
-      /* Also release a dispatcher parked in rthreads_pool_dispatch_and_wait(). */
-      if (pool->done_cond)
-         scond_broadcast(pool->done_cond);
       slock_unlock(pool->lock);
    }
 
@@ -193,6 +204,11 @@ void rthreads_pool_free(rthreads_pool_t *pool)
       scond_free(pool->work_cond);
    if (pool->lock)
       slock_free(pool->lock);
+   if (pool->dispatch_lock)
+   {
+      slock_unlock(pool->dispatch_lock);
+      slock_free(pool->dispatch_lock);
+   }
 
    free(pool);
 }

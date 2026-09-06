@@ -11,7 +11,7 @@ extern "C" {
 
 typedef struct rthreads_pool rthreads_pool_t;
 
-typedef void (*rthreads_task_fn_t)(void *userdata, unsigned thread_index);
+typedef void (*rthreads_task_fn_t)(void *userdata, unsigned task_index);
 
 /**
  * Creates a worker thread pool with the specified number of worker threads.
@@ -27,7 +27,10 @@ unsigned rthreads_pool_get_thread_count(const rthreads_pool_t *pool);
 
 /**
  * Submits a batch of tasks to the pool and waits for all of them to complete.
- * If pool is NULL or num_threads == 0, runs all tasks synchronously on the calling thread.
+ * If pool is NULL, runs all tasks synchronously on the calling thread.
+ * Concurrent dispatches are serialized. A task must not recursively dispatch
+ * to, or destroy, its own pool. The callback index is the index within this
+ * batch, not the identity of the worker thread executing it.
  *
  * @param pool The thread pool handle.
  * @param fn The task function to execute.
@@ -41,6 +44,7 @@ void rthreads_pool_dispatch_and_wait(rthreads_pool_t *pool,
 
 /**
  * Destroys the thread pool, waiting for any pending work to finish and joining all threads.
+ * The owner must prevent new API calls before freeing the pool.
  */
 void rthreads_pool_free(rthreads_pool_t *pool);
 

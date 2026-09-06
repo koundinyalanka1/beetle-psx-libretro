@@ -171,7 +171,7 @@ uint8_t     *psx_bios = NULL;
 uint8_t     *psx_scratch = NULL;
 uint8_t     *lightrec_codebuffer = NULL;
 #if defined(HAVE_ASHMEM)
-int memfd;
+int memfd = -1;
 #endif
 #endif
 
@@ -1988,6 +1988,11 @@ static void PSX_Power(void)
 {
    unsigned i;
 
+   /* Drain before resetting shared CPU, IRQ and CD state, not only when
+    * the individual GPU/SPU reset functions are reached. */
+   GPU_Worker_Sync();
+   SPU_Worker_Sync();
+
    PSX_PRNG.x = 123456789;
    PSX_PRNG.y = 987654321;
    PSX_PRNG.z = 43219876;
@@ -2765,7 +2770,8 @@ int lightrec_init_mmap(void)
                  * opening /dev/ashmem
 		 * fallback to ASharedMemory_create available 
                  * since Android 8 / API 26 */
-		if (errno == EACCES)
+		/* New devices may remove /dev/ashmem entirely (ENOENT). */
+		if (errno == EACCES || errno == EPERM || errno == ENOENT || errno == ENODEV)
                 {
 			void *lib;
 			int (*create)(const char*, size_t);
@@ -2807,7 +2813,12 @@ int lightrec_init_mmap(void)
 		}
 	} else {
 		ioctl(memfd, ASHMEM_SET_NAME, "lightrec_memfd");
-		ioctl(memfd, ASHMEM_SET_SIZE, RAM_SIZE);
+		if (ioctl(memfd, ASHMEM_SET_SIZE, RAM_SIZE) < 0)
+		{
+			close(memfd);
+			memfd = -1;
+			return 0;
+		}
 	}
 #endif
 #ifdef HAVE_SHM
@@ -2885,6 +2896,13 @@ close_return:
 #ifdef HAVE_WIN_SHM
 	CloseHandle(memfd);
 #endif
+#ifdef HAVE_ASHMEM
+	if (ret == 0 && memfd >= 0)
+	{
+		close(memfd);
+		memfd = -1;
+	}
+#endif
 	return ret;
 }
 
@@ -2901,7 +2919,9 @@ void lightrec_free_mmap(void)
 
 #ifdef HAVE_ASHMEM
 	/* android shared memory is not pinned by mmap, it dies on close */
-	close(memfd);
+	if (memfd >= 0)
+		close(memfd);
+	memfd = -1;
 #endif
 }
 #endif /* HAVE_LIGHTREC */
@@ -4628,7 +4648,8 @@ static void check_variables(bool startup)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-	EventCycles = atoi(var.value);
+      unsigned long cycles = strtoul(var.value, NULL, 10);
+      EventCycles = (cycles >= 128 && cycles <= 2048) ? (int32_t)cycles : 128;
    }
    else
       EventCycles = 128;
@@ -4637,7 +4658,8 @@ static void check_variables(bool startup)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-	spu_samples = atoi(var.value);
+      unsigned long samples = strtoul(var.value, NULL, 10);
+      spu_samples = (samples == 1 || samples == 4 || samples == 16) ? (uint8_t)samples : 1;
    }
    else
       spu_samples = 1;
@@ -6370,7 +6392,7 @@ void retro_run(void)
     * ended with a sync, so this is normally free; it is here so no path
     * added above CPU_Run() can start racing the worker by accident. */
    GPU_Worker_Sync();
-
+   SPU_Worker_Sync();
 
    /* Keep the HDR encode in sync with the frontend's live HDR controls.
     * RetroArch's paper-white and Colour Boost sliders change at runtime and
@@ -6965,9 +6987,6 @@ void retro_run(void)
    if (led_state_cb)
       retro_led_interface();
 
-   #if defined(__GNUC__) || defined(__clang__)
-   __sync_synchronize();
-   #endif
 }
 
 void retro_get_system_info(struct retro_system_info *info)
@@ -7150,6 +7169,12 @@ size_t retro_serialize_size(void)
    if (enable_variable_serialization_size)
    {
       StateMem st;
+
+      if (!MainRAM || !PSX_CDC || !PSX_CPU || !PSX_FIO)
+         return 0;
+
+      GPU_Worker_Sync();
+      SPU_Worker_Sync();
 
       st.data           = NULL;
       st.loc            = 0;

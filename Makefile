@@ -103,8 +103,24 @@ ifneq ($(LIGHTREC_DEBUG), 0)
    endif
 endif
 
+# Android (pass CC/CXX from the NDK toolchain, or use jni/Android.mk).
+ifeq ($(platform), android)
+   TARGET := $(TARGET_NAME)_libretro_android.so
+   fpic := -fPIC
+   SHARED := -shared -Wl,--no-undefined -Wl,--version-script=link.T
+   LDFLAGS += -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 -ldl -llog -landroid -lm
+   FLAGS += -DANDROID -DHAVE_MMAP
+   ifeq ($(HAVE_LIGHTREC), 1)
+      FLAGS += -DHAVE_ASHMEM
+   endif
+   ifeq ($(HAVE_OPENGL), 1)
+      GLES = 1
+      GLES3 = 1
+      GL_LIB := -lGLESv3 -lEGL
+   endif
+
 # Unix
-ifneq (,$(findstring unix,$(platform)))
+else ifneq (,$(findstring unix,$(platform)))
    # local VFS may mmap FREQUENT_ACCESS files (cdstream zero-copy)
    FLAGS += -DHAVE_MMAP
    TARGET := $(TARGET_NAME)_libretro.so

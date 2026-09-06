@@ -210,7 +210,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       BEETLE_OPT(threaded_spu),
       "Threaded SPU (Audio)",
       NULL,
-      "Offload SPU audio synthesis and mixing to an asynchronous worker thread. Eliminates audio-related CPU stalls on multicore systems.",
+      "Batch SPU audio synthesis and mixing on a worker thread. CD audio and interrupt timing remain on the emulation thread. Performance depends on the game and available CPU cores.",
       NULL,
       "system",
       {

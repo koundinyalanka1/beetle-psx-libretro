@@ -13,12 +13,20 @@
  *
  * Usage: vkhost <core.so> <content> [savestate] [frames] [outdir]
  *   VKHOST_VARS: semicolon list of key=value core option overrides.
+ *   VKHOST_SYSTEM_DIR / VKHOST_SAVE_DIR: BIOS and save directories.
+ *   VKHOST_HASHES=1: per-frame main RAM, scratchpad and audio FNV-1a hashes.
+ *   VKHOST_ROUNDTRIP_FRAME=N: serialize/unserialize after frame N (1-based).
+ *   VKHOST_RESET_FRAME=N: repeat context_reset after frame N.
+ *   VKHOST_RECREATE_FRAME=N: destroy/renegotiate/reset after frame N.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <inttypes.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
 #include <dlfcn.h>
@@ -43,11 +51,60 @@ static VkInstance instance;
 static VkPhysicalDevice gpu;
 static VkDebugUtilsMessengerEXT messenger;
 static int validation_errors, validation_warnings;
+static bool validation_active;
 static const struct retro_vulkan_image *last_image;
 static unsigned frame_valid;
 static unsigned last_w, last_h;
 static char sysdir[512] = "/tmp/vkhost_sys";
 static char savedir[512] = "/tmp/vkhost_save";
+static struct retro_memory_descriptor *memory_descs;
+static unsigned memory_desc_count;
+static bool hash_frames;
+#define FNV64_OFFSET UINT64_C(14695981039346656037)
+#define FNV64_PRIME UINT64_C(1099511628211)
+static uint64_t audio_hash = FNV64_OFFSET;
+static size_t audio_frames;
+
+static uint64_t hash_bytes(uint64_t hash, const void *data, size_t size)
+{
+   const uint8_t *p = (const uint8_t *)data;
+   while (size--) { hash ^= *p++; hash *= FNV64_PRIME; }
+   return hash;
+}
+
+static uint64_t memory_hash(size_t start, size_t *size)
+{
+   unsigned i;
+   *size = 0;
+   for (i = 0; i < memory_desc_count; i++)
+   {
+      const struct retro_memory_descriptor *desc = &memory_descs[i];
+      if (desc->start == start && desc->ptr &&
+            (desc->flags & RETRO_MEMDESC_SYSTEM_RAM))
+      {
+         *size = desc->len;
+         return hash_bytes(FNV64_OFFSET,
+               (const uint8_t *)desc->ptr + desc->offset, desc->len);
+      }
+   }
+   return FNV64_OFFSET;
+}
+
+static bool make_directory(const char *path)
+{
+   char buf[1024];
+   char *p;
+   if (snprintf(buf, sizeof(buf), "%s", path) >= (int)sizeof(buf))
+      return false;
+   for (p = buf + 1; *p; p++)
+   {
+      if (*p != '/') continue;
+      *p = 0;
+      if (mkdir(buf, 0755) != 0 && errno != EEXIST) return false;
+      *p = '/';
+   }
+   return mkdir(buf, 0755) == 0 || errno == EEXIST;
+}
 
 /* ---- validation output ---- */
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(
@@ -104,6 +161,21 @@ static bool env_cb(unsigned cmd, void *data)
          return true;
       case RETRO_ENVIRONMENT_GET_CAN_DUPE:
          *(bool *)data = true; return true;
+      case RETRO_ENVIRONMENT_SET_MEMORY_MAPS:
+      {
+         const struct retro_memory_map *map = (const struct retro_memory_map *)data;
+         struct retro_memory_descriptor *copy = NULL;
+         if (map->num_descriptors)
+         {
+            copy = malloc(map->num_descriptors * sizeof(*copy));
+            if (!copy) return false;
+            memcpy(copy, map->descriptors, map->num_descriptors * sizeof(*copy));
+         }
+         free(memory_descs);
+         memory_descs = copy;
+         memory_desc_count = map->num_descriptors;
+         return true;
+      }
       case RETRO_ENVIRONMENT_SET_VARIABLES:
       {
          const struct retro_variable *v = (const struct retro_variable *)data;
@@ -203,8 +275,20 @@ static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, un
    }
    return 0;
 }
-static size_t audio_batch_cb(const int16_t *data, size_t frames) { (void)data; return frames; }
-static void audio_cb(int16_t l, int16_t r) { (void)l; (void)r; }
+static size_t audio_batch_cb(const int16_t *data, size_t frames)
+{
+   if (hash_frames)
+   {
+      audio_hash = hash_bytes(audio_hash, data, frames * 2 * sizeof(*data));
+      audio_frames += frames;
+   }
+   return frames;
+}
+static void audio_cb(int16_t l, int16_t r)
+{
+   int16_t samples[2] = { l, r };
+   audio_batch_cb(samples, 1);
+}
 
 /* ---- vulkan bring-up ---- */
 static PFN_vkGetInstanceProcAddr gipa;
@@ -214,6 +298,8 @@ static bool create_instance(void)
    const char *exts[]   = { VK_EXT_DEBUG_UTILS_EXTENSION_NAME };
    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
    VkInstanceCreateInfo ci = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+   bool debug_utils = false;
+   uint32_t count = 0, i;
 
 
    app.pApplicationName = "vkhost";
@@ -226,9 +312,29 @@ static bool create_instance(void)
    ci.pApplicationInfo = &app;
    /* VKHOST_NO_VALIDATION=1 drops the layer: needed under ThreadSanitizer,
     * where the layer's own rwlock teardown races and aborts the run. */
-   ci.enabledLayerCount = (getenv("VKHOST_NO_VALIDATION") != NULL) ? 0 : 1;
+   if (!getenv("VKHOST_NO_VALIDATION") &&
+         vkEnumerateInstanceLayerProperties(&count, NULL) == VK_SUCCESS && count)
+   {
+      VkLayerProperties *props = calloc(count, sizeof(*props));
+      if (props && vkEnumerateInstanceLayerProperties(&count, props) == VK_SUCCESS)
+         for (i = 0; i < count; i++)
+            if (!strcmp(props[i].layerName, layers[0])) validation_active = true;
+      free(props);
+   }
+   fprintf(stderr, "[vkhost] Vulkan validation: %s\n",
+         validation_active ? "enabled" : "disabled (no validation result)");
+   ci.enabledLayerCount = validation_active ? 1 : 0;
    ci.ppEnabledLayerNames = layers;
-   ci.enabledExtensionCount = 1;
+   count = 0;
+   if (vkEnumerateInstanceExtensionProperties(NULL, &count, NULL) == VK_SUCCESS && count)
+   {
+      VkExtensionProperties *props = calloc(count, sizeof(*props));
+      if (props && vkEnumerateInstanceExtensionProperties(NULL, &count, props) == VK_SUCCESS)
+         for (i = 0; i < count; i++)
+            if (!strcmp(props[i].extensionName, exts[0])) debug_utils = true;
+      free(props);
+   }
+   ci.enabledExtensionCount = debug_utils ? 1 : 0;
    ci.ppEnabledExtensionNames = exts;
    if (vkCreateInstance(&ci, NULL, &instance) != VK_SUCCESS)
       return false;
@@ -242,7 +348,7 @@ static bool create_instance(void)
       mi.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
                        VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
       mi.pfnUserCallback = debug_cb;
-      if (cdm) cdm(instance, &mi, NULL, &messenger);
+      if (debug_utils && cdm) cdm(instance, &mi, NULL, &messenger);
    }
 
    {

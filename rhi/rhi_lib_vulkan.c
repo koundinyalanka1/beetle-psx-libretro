@@ -19388,6 +19388,9 @@ static void vk_defer_dispatch(void *user, const rhi_defer_op_t *op)
 
 static void vk_context_reset(void)
 {
+   GPU_Worker_Sync();
+   inside_frame = false;
+
    if (!environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, (void**)&vulkan) || !vulkan)
       return;
 
@@ -19418,6 +19421,15 @@ static void vk_context_reset(void)
     * owned by libretro_create_device, not by reset, so it is preserved. */
    if (renderer)
    {
+      savestate_destroy(&save_state);
+      renderer_save_vram_state(renderer, &save_state);
+   }
+   /* These owning handles refer to the old device. Release them before that
+    * device's object pools are freed, including on a reset without destroy. */
+   scanouthandlevec_free_storage(&scanout_handles);
+   swapchainimagevec_free_storage(&swapchain_images);
+   if (renderer)
+   {
       renderer_fini(renderer);
       free(renderer);
       renderer = NULL;
@@ -19430,10 +19442,19 @@ static void vk_context_reset(void)
    }
 
    device = (Device *)malloc(sizeof(Device));
+   if (!device)
+      return;
    device_init(device);
    device_set_context(device, *&context);
 
    renderer = (Renderer *)malloc(sizeof(Renderer));
+   if (!renderer)
+   {
+      device_deinit(device);
+      free(device);
+      device = NULL;
+      return;
+   }
    renderer_init(renderer, device, scaling, msaa, owned_u32_empty(&save_state.vram) ? NULL : &save_state);
    if (!renderer_is_valid(renderer))
    {
@@ -19462,8 +19483,7 @@ static void vk_context_reset(void)
 
 static void vk_context_destroy(void)
 {
-   if (device == NULL)
-      return;
+   GPU_Worker_Sync();
 
    /* If the context is torn down mid-frame (e.g. a scale-factor change runs
     * check_variables -> SET_SYSTEM_AV_INFO between prepare_frame and
@@ -19473,21 +19493,29 @@ static void vk_context_destroy(void)
     * of operating on the freshly-rebuilt-but-not-yet-started context. */
    inside_frame = false;
 
-   savestate_destroy(&save_state);
-   renderer_save_vram_state(renderer, &save_state);
-   vulkan     = NULL;
+   if (renderer)
+   {
+      savestate_destroy(&save_state);
+      renderer_save_vram_state(renderer, &save_state);
+   }
    scanouthandlevec_free_storage(&scanout_handles);
    swapchainimagevec_free_storage(&swapchain_images);
 
-   renderer_fini(renderer);
+   if (renderer)
+      renderer_fini(renderer);
    free(renderer);
-   device_deinit(device);
+   if (device)
+      device_deinit(device);
    free(device);
-   context_deinit(context);
+   if (context)
+      context_deinit(context);
    free(context);
    renderer = NULL;
    device = NULL;
    context = NULL;
+   /* renderer_fini/device_deinit can submit and wait for Vulkan queues. Keep
+    * the frontend's lock callbacks available until all of that has finished. */
+   vulkan = NULL;
 
    /* Free the deferred-op storage. The earlier defer queue
     * never cleared on destroy, which meant any ops queued in the
@@ -19496,6 +19524,8 @@ static void vk_context_destroy(void)
     * empty. The new policy clears here, matching gl_context_destroy
     * and keeping behaviour symmetric across backends. */
    rhi_defer_clear(&defer);
+   free(vk_defer_stage);
+   vk_defer_stage = NULL;
 }
 
 static bool libretro_create_device(

@@ -32,7 +32,9 @@ bool rthreads_worker_post(rthreads_worker_t *worker, rthreads_job_fn_t fn, void 
 void rthreads_worker_wait(rthreads_worker_t *worker);
 
 /**
- * Shuts down the worker thread, joins it, and frees all resources.
+ * Finishes all queued jobs, joins the worker thread, and frees all resources.
+ * The owner must stop other callers before freeing the worker. Jobs must not
+ * post to, wait for, or destroy their own worker.
  */
 void rthreads_worker_free(rthreads_worker_t *worker);
 

@@ -36,7 +36,7 @@ static void worker_thread_entry(void *userdata)
 
    slock_lock(worker->lock);
 
-   while (!worker->stopping)
+   for (;;)
    {
       while (worker->count == 0 && !worker->stopping)
       {
@@ -79,6 +79,7 @@ rthreads_worker_t *rthreads_worker_new(const char *name, unsigned queue_capacity
 {
    rthreads_worker_t *worker;
 
+   (void)name;
    if (queue_capacity < 16)
       queue_capacity = 16;
 
@@ -153,7 +154,7 @@ void rthreads_worker_wait(rthreads_worker_t *worker)
       return;
 
    slock_lock(worker->lock);
-   while ((worker->count > 0 || !worker->idle) && !worker->stopping)
+   while (worker->count > 0 || !worker->idle)
    {
       scond_wait_timeout(worker->drained, worker->lock,
             RTHREADS_WORKER_WAIT_US);
@@ -174,9 +175,6 @@ void rthreads_worker_free(rthreads_worker_t *worker)
          scond_broadcast(worker->not_empty);
       if (worker->not_full)
          scond_broadcast(worker->not_full);
-      /* Also release anyone parked in rthreads_worker_wait(). */
-      if (worker->drained)
-         scond_broadcast(worker->drained);
       slock_unlock(worker->lock);
    }
 
