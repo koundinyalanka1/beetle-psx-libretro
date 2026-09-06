@@ -143,8 +143,25 @@ else ifneq (,$(findstring unix,$(platform)))
    else
       LDFLAGS += $(PTHREAD_FLAGS) -ldl
       ifeq ($(HAVE_LIGHTREC), 1)
-         LDFLAGS += -lrt
-         FLAGS += -DHAVE_SHM
+         # An NDK toolchain is commonly driven through platform=unix rather
+         # than platform=android - the TARGET/GLES overrides are easier to pass
+         # that way - and this branch would then emit a link no Android build
+         # can satisfy: there is no librt (it is folded into libc) and no
+         # shm_open. The result is that a packager hits the link failure and
+         # turns HAVE_LIGHTREC off, silently shipping the interpreter instead
+         # of the dynarec, which on a budget phone is most of the frame budget.
+         #
+         # Detect the real target from the compiler and use ashmem, exactly
+         # what the platform=android branch above already does. libretro.c has
+         # carried the matching #ifndef __ANDROID__ guard around shm_open for
+         # as long as HAVE_SHM has existed here.
+         TARGET_TRIPLE := $(shell $(CC) -dumpmachine 2>/dev/null)
+         ifneq (,$(findstring android,$(TARGET_TRIPLE)))
+            FLAGS += -DHAVE_ASHMEM
+         else
+            LDFLAGS += -lrt
+            FLAGS += -DHAVE_SHM
+         endif
       endif
    endif
    FLAGS   +=

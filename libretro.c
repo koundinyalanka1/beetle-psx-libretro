@@ -4597,7 +4597,8 @@ static void check_variables(bool startup)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
       GPU_SetThreaded(strcmp(var.value, "disabled") != 0);
    else
-      GPU_SetThreaded(true);
+      /* Matches the core option's own default. */
+      GPU_SetThreaded(false);
 
 #ifdef HAVE_LIGHTREC
    var.key = BEETLE_OPT(cpu_dynarec);
