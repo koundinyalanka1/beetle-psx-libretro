@@ -2001,6 +2001,10 @@ bool SPU_Worker_Active(void)
  */
 void SPU_Init(void)
 {
+   /* Defensive, matching GPU_Init: this clears every register and SPURAM,
+    * which the worker reads while synthesising. */
+   SPU_Worker_Kill();
+
    memset(Voices, 0, sizeof(Voices));
    memset(GlobalSweep, 0, sizeof(GlobalSweep));
    memset(&regs, 0, sizeof(regs));

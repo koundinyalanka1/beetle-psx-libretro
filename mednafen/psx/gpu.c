@@ -149,7 +149,24 @@ typedef struct
    uint32_t addr;
 } gpu_cmd_t;
 
-#define GPU_QUEUE_SIZE (128 * 1024)
+/*
+ * Big enough to hold more than one frame's worth of GP0 traffic.
+ *
+ * This is not a tuning knob - it is a correctness-of-pipelining constraint.
+ * If a frame can push more words than the queue holds, GPU_Worker_Push()
+ * blocks waiting for the worker to make room, and producer and consumer fall
+ * into lockstep: the emulation thread fills the queue, stalls, the worker
+ * drains it, repeat.  The frame then costs CPU time *plus* worker time
+ * instead of the larger of the two, which is the entire point of the worker.
+ *
+ * Measured worst case so far is ~137k words in a single frame (Tekken 3's
+ * FMV/loading phase streaming MDEC output to VRAM), which overflowed the
+ * original 128Ki and cost ~33 ms/frame of avoidable stall.  256Ki leaves
+ * ~2x headroom over that; the queue is 12 bytes per entry, so this is 3 MiB
+ * of RAM to keep the two threads actually overlapping.  Overflow beyond it
+ * still degrades safely (the push blocks) rather than dropping commands.
+ */
+#define GPU_QUEUE_SIZE (256 * 1024)
 #define GPU_QUEUE_MASK (GPU_QUEUE_SIZE - 1)
 
 static gpu_cmd_t gpu_queue[GPU_QUEUE_SIZE];
@@ -194,8 +211,17 @@ static uint32_t gpu_push_n        = 0;
 #define GPU_WORKER_WAIT_US 20000
 
 
-/* How much queue headroom the CPU-visible "FIFO has room" bit reserves. */
+/* How much queue headroom the CPU-visible "FIFO has room" bit reserves, and
+ * the point at which GPU_DMACanWrite() starts throttling DMA.  Kept well below
+ * the queue size so the throttle is a backstop, not the normal path. */
 #define GPU_QUEUE_FIFO_MARGIN 1024
+
+/* Time the emulation thread loses inside GPU_Worker_Push() because the queue
+ * was full.  Separate from the Sync figure: a full queue means the two threads
+ * are running in lockstep, which is a different (and worse) problem than the
+ * worker simply being behind at a sync point. */
+static uint64_t gpu_push_block_us = 0;
+static uint32_t gpu_push_block_n  = 0;
 
 static void GPU_WriteGP0_Internal(uint32_t InData, uint32_t addr);
 static void GPU_WriteGP1_Internal(uint32_t V);
@@ -1273,6 +1299,12 @@ bool GPU_Init(bool pal_clock_and_tv,
 {
    int x, y, v;
 
+   /* Defensive: this reallocates GPU.vram and resets state the worker reads.
+    * The lifecycle should already have stopped it (retro_unload_game and
+    * GPU_Destroy both do), so this is a no-op - but it is the difference
+    * between a use-after-free and nothing if that ever changes. */
+   GPU_Worker_Kill();
+
    GPU.vram = VRAM_Alloc(upscale_shift);
    if (!GPU.vram)
       return false;
@@ -1989,15 +2021,20 @@ void GPU_Worker_Sync(void)
 }
 
 void GPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
-                          uint32_t *pushes, uint32_t *queue_depth)
+                          uint32_t *pushes, uint32_t *queue_depth,
+                          uint64_t *full_us, uint32_t *fulls)
 {
    if (blocked_us)  *blocked_us  = gpu_sync_block_us;
    if (blocks)      *blocks      = gpu_sync_block_n;
    if (pushes)      *pushes      = gpu_push_n;
    if (queue_depth) *queue_depth = gpu_worker_running ? GPU_Queue_Count() : 0;
+   if (full_us)     *full_us     = gpu_push_block_us;
+   if (fulls)       *fulls       = gpu_push_block_n;
    gpu_sync_block_us = 0;
    gpu_sync_block_n  = 0;
    gpu_push_n        = 0;
+   gpu_push_block_us = 0;
+   gpu_push_block_n  = 0;
 }
 
 void GPU_Worker_Init(void)
@@ -2198,16 +2235,24 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
 {
    uint32_t head;
 
-   while (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
+   if (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
    {
-      slock_lock(gpu_queue_lock);
-      /* Kick the worker in case it is parked, then re-test under the lock so
-       * a not_full signal raised in between can't be missed. */
-      scond_broadcast(gpu_queue_not_empty);
-      if (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
-         scond_wait_timeout(gpu_queue_not_full, gpu_queue_lock,
-               GPU_WORKER_WAIT_US);
-      slock_unlock(gpu_queue_lock);
+      retro_time_t t0 = cpu_features_get_time_usec();
+
+      while (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
+      {
+         slock_lock(gpu_queue_lock);
+         /* Kick the worker in case it is parked, then re-test under the lock
+          * so a not_full signal raised in between can't be missed. */
+         scond_broadcast(gpu_queue_not_empty);
+         if (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
+            scond_wait_timeout(gpu_queue_not_full, gpu_queue_lock,
+                  GPU_WORKER_WAIT_US);
+         slock_unlock(gpu_queue_lock);
+      }
+
+      gpu_push_block_us += (uint64_t)(cpu_features_get_time_usec() - t0);
+      gpu_push_block_n++;
    }
 
    if (gpu_worker_stopping)
@@ -2243,22 +2288,40 @@ void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
       /*
        * GP1 is always applied here, on the emulation thread, never queued.
        *
-       * Every one of these commands either feeds GPUSTAT (which the CPU reads
-       * without draining the queue) or pokes the renderer through rhi_intf_*.
+       * Most of these either feed GPUSTAT (which the CPU reads without
+       * draining the queue) or poke the renderer through rhi_intf_*.
        * Splitting them - applying the display registers here *and* queueing a
        * copy for the worker, which is what this used to do - lets the worker
        * replay a stale value over a newer one and drives the renderer from two
        * threads at once.  Draining first and applying once keeps a single
-       * writer for every field, and GP1 traffic is a handful of writes per
-       * frame, so the sync costs nothing measurable.
+       * writer for every field.
+       *
+       * Two commands need neither, and they are the two a game may issue
+       * around every DMA block - draining on those would serialise the
+       * pipeline for nothing:
+       *   0x02  acknowledge IRQ - touches only the IRQ flags, which cross
+       *         threads atomically, and the worker never writes GPU.IRQPending
+       *         while threaded (Command_IRQ defers instead).
+       *   0x04  DMA direction   - writes GPU.DMAControl, which only GPUSTAT
+       *         reads; no drawing command looks at it.
        */
-      GPU_Worker_Sync();
-      GPU_WriteGP1_Internal(V);
+      const uint32_t gp1_cmd  = V >> 24;
+      const bool     needs_drain = (gp1_cmd != 0x02 && gp1_cmd != 0x04);
 
-      /* GP1 0x00/0x01 clear InCmd and the blitter FIFO; refresh the snapshot
-       * GPU_Read() reports, since the worker isn't going to. */
-      if (gpu_worker_running)
-         GPU_PublishStatus();
+      if (needs_drain)
+      {
+         GPU_Worker_Sync();
+         GPU_WriteGP1_Internal(V);
+
+         /* GP1 0x00/0x01 clear InCmd and the blitter FIFO; refresh the
+          * snapshot GPU_Read() reports, since the worker isn't going to.
+          * Only valid because we just drained - publishing without that would
+          * sample state the worker is still mutating. */
+         if (gpu_worker_running)
+            GPU_PublishStatus();
+      }
+      else
+         GPU_WriteGP1_Internal(V);
    }
    else        /* GP0 ("Data") */
    {
@@ -3216,6 +3279,12 @@ void GPU_FlushDeferredScanout(void)
 
 void GPU_RestoreStateP1(bool load)
 {
+   /* Reached from GPU_StateAction (already drained) but also straight from the
+    * GL backend's context_reset, on the frontend's thread, with the worker
+    * still live - and this rebuilds GPU.vram, which the worker rasterises
+    * into. */
+   GPU_Worker_Sync();
+
    if (!load && !rhi_intf_has_software_renderer())
    {
       /* Pure hardware renderer: the composited framebuffer lives only on the
@@ -3267,6 +3336,9 @@ void GPU_RestoreStateP1(bool load)
 
 void GPU_RestoreStateP2(bool load)
 {
+   /* Same call sites as P1; see the note there. */
+   GPU_Worker_Sync();
+
    if (GPU.upscale_shift > 0)
    {
       if (load && vram_new)
