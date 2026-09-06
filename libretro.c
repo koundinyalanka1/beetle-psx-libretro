@@ -6669,34 +6669,49 @@ void retro_run(void)
 
       if (++stat_frames >= 300)
       {
-         uint64_t gpu_us = 0, spu_us = 0, gpu_full_us = 0, gpu_busy_us = 0;
-         uint64_t spu_busy_us = 0;
-         uint32_t gpu_n = 0, spu_n = 0, gpu_push = 0, gpu_depth = 0;
-         uint32_t spu_jobs = 0, gpu_fulls = 0, gpu_spins = 0;
-         uint32_t gpu_inline = 0;
+         uint64_t spu_us = 0, spu_busy_us = 0;
+         uint32_t spu_n = 0, spu_jobs = 0;
+         gpu_worker_stats_t g;
 
-         GPU_Worker_TakeStats(&gpu_us, &gpu_n, &gpu_push, &gpu_depth,
-                              &gpu_full_us, &gpu_fulls, &gpu_spins,
-                              &gpu_busy_us, &gpu_inline);
+         GPU_Worker_TakeStats(&g);
          SPU_Worker_TakeStats(&spu_us, &spu_n, &spu_jobs, &spu_busy_us);
 
          /* queue-full time is called out separately: it means the two threads
-          * are running in lockstep rather than overlapping, which is a
-          * different failure than the worker merely being behind at a sync. */
+          * are both runnable and the ring is the limit, not the worker. */
          log_cb(RETRO_LOG_WARN,
                "Worker cost over %u frames: GPU busy %.2f ms/frame, sync "
                "%.2f ms/frame (%u blocked + %u spun), queue-full %.2f ms/frame "
-               "(%u stalls), %u words/frame (%u inline), depth %u | SPU busy "
+               "(%u stalls), %u words/frame (%u inline, %.2f ms/frame), "
+               "depth %u now / %.1f avg / %u max | SPU busy "
                "%.2f ms/frame, sync %.2f ms/frame (%u waits, %u jobs/frame)\n",
                stat_frames,
-               (double)gpu_busy_us / 1000.0 / (double)stat_frames,
-               (double)gpu_us / 1000.0 / (double)stat_frames,
-               gpu_n, gpu_spins,
-               (double)gpu_full_us / 1000.0 / (double)stat_frames, gpu_fulls,
-               gpu_push / stat_frames, gpu_inline / stat_frames, gpu_depth,
+               (double)g.worker_busy_us / 1000.0 / (double)stat_frames,
+               (double)g.sync_block_us / 1000.0 / (double)stat_frames,
+               g.sync_blocks, g.sync_spins,
+               (double)g.queue_full_us / 1000.0 / (double)stat_frames,
+               g.queue_fulls,
+               g.pushes / stat_frames, g.inlines / stat_frames,
+               (double)g.inline_us / 1000.0 / (double)stat_frames,
+               g.queue_depth,
+               g.queue_depth_n ? (double)g.queue_depth_sum / (double)g.queue_depth_n : 0.0,
+               g.queue_depth_max,
                (double)spu_busy_us / 1000.0 / (double)stat_frames,
                (double)spu_us / 1000.0 / (double)stat_frames, spu_n,
                spu_jobs / stat_frames);
+
+         /* The line that actually says whether threading can work.  A poll
+          * that collapses the queue is one the guest did not ask to be a
+          * synchronisation point; while these are non-zero the worker cannot
+          * hold any depth no matter how much GP0 arrives.  FBRead barriers
+          * are the legitimate ones - the emulated CPU asked for pixels. */
+         log_cb(RETRO_LOG_WARN,
+               "  GPU sync causes: GPUSTAT %u/frame (%u collapsed), "
+               "DMA-ready %u/frame (%u collapsed), FBRead %u/frame "
+               "(%u barriers, %.2f ms readback)\n",
+               g.stat_reads / stat_frames, g.stat_collapses / stat_frames,
+               g.dma_polls / stat_frames, g.dma_collapses / stat_frames,
+               g.fbreads / stat_frames, g.fbread_barriers / stat_frames,
+               (double)g.readback_us / 1000.0 / (double)stat_frames);
 
          stat_frames = 0;
       }

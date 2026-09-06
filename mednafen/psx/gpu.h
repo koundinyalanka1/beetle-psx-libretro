@@ -336,13 +336,50 @@ void GPU_SetThreaded(bool enabled);
 bool GPU_GetThreaded(void);
 bool GPU_Worker_Active(void);
 void GPU_Worker_Refresh(void);
-/* Read-and-reset: microseconds the emulation thread spent blocked waiting on
- * the worker, how many times it blocked, GP0 words queued, current depth. */
-void GPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
-                          uint32_t *pushes, uint32_t *queue_depth,
-                          uint64_t *full_us, uint32_t *fulls,
-                          uint32_t *spins, uint64_t *busy_us,
-                          uint32_t *inlines);
+/* One window's worth of GPU-worker accounting, read-and-reset.
+ *
+ * The design goal for threading is not "sync < busy" but "the guest's GPUSTAT
+ * and DMA-ready polls stop collapsing the queue".  A poll that forces the
+ * pipeline flat is what keeps the worker at zero occupancy no matter how many
+ * GP0 words arrive, so the collapse counters below are the ones that decide
+ * whether the worker is doing anything at all. */
+typedef struct
+{
+   /* Emulation thread blocked on the worker. */
+   uint64_t sync_block_us;
+   uint32_t sync_blocks;
+   uint32_t sync_spins;
+   /* Queue back-pressure: both threads runnable but the ring was full. */
+   uint64_t queue_full_us;
+   uint32_t queue_fulls;
+   /* Work actually done, on each side. */
+   uint64_t worker_busy_us;
+   uint64_t inline_us;
+   uint32_t pushes;    /* GP0 words handed to the worker */
+   uint32_t inlines;   /* GP0 words retired on the emulation thread instead */
+
+   /* Queue occupancy. A worker that is being useful keeps depth well above
+    * zero; a queue that keeps collapsing to empty is the symptom to chase. */
+   uint32_t queue_depth;      /* instantaneous, at read time */
+   uint32_t queue_depth_max;
+   uint64_t queue_depth_sum;  /* over queue_depth_n samples */
+   uint32_t queue_depth_n;
+
+   /* Why the pipeline collapsed.  A "collapse" is any point where the
+    * emulation thread had to make the worker's progress observable - whether
+    * it blocked, spun, or resolved the staging buffer inline.  The target for
+    * status and DMA-ready polling is zero. */
+   uint32_t stat_reads;
+   uint32_t stat_collapses;
+   uint32_t dma_polls;
+   uint32_t dma_collapses;
+   /* GP0 C0h: the one synchronisation the emulated machine really asks for. */
+   uint32_t fbreads;
+   uint32_t fbread_barriers;
+   uint64_t readback_us;
+} gpu_worker_stats_t;
+
+void GPU_Worker_TakeStats(gpu_worker_stats_t *out);
 
 #ifdef __cplusplus
 }

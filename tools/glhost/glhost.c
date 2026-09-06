@@ -12,6 +12,10 @@
  *
  * Usage: glhost <core.so> <content> [savestate|-] [frames] [outdir]
  *   GLHOST_VARS: semicolon list of key=value core option overrides.
+ *   GLHOST_SYSTEM_DIR / GLHOST_SAVE_DIR: BIOS and save directories.
+ *   GLHOST_STATEHASH=1: main RAM, scratchpad and audio hashes per retro_run.
+ *   GLHOST_RECREATE_AT=N: destroy/recreate the EGL context before frame N.
+ * Build with GLES=1 and an Android NDK clang CC for an actual GLES3 pbuffer.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -20,9 +24,15 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#ifdef GLHOST_GLES
+#include <GLES3/gl3.h>
+#else
 #include <GL/gl.h>
+#endif
 #include "libretro.h"
 
 /* ---- core option overrides / harvested defaults ---- */
@@ -37,6 +47,7 @@ static void *core;
 static struct retro_hw_render_callback hw_render;
 static EGLDisplay egl_dpy;
 static EGLContext egl_ctx;
+static EGLSurface egl_surface = EGL_NO_SURFACE;
 static GLuint fbo, fbo_tex, fbo_depth;
 static unsigned fbo_w = 4096, fbo_h = 4096;
 static unsigned last_w, last_h, frames_presented;
@@ -48,8 +59,44 @@ static unsigned last_w, last_h, frames_presented;
  * the rejection-retry ladder). */
 static int ctx_gl2, ctx_rejcore;
 static int avflags_on;
-static char sysdir[512] = "/tmp/vkhost_sys";
-static char savedir[512] = "/tmp/vkhost_save";
+#ifdef __ANDROID__
+static const char *sysdir = "/data/local/tmp/glhost/system";
+static const char *savedir = "/data/local/tmp/glhost/save";
+#else
+static const char *sysdir = "/tmp/vkhost_sys";
+static const char *savedir = "/tmp/vkhost_save";
+#endif
+static struct retro_memory_descriptor main_memory, scratch_memory;
+static unsigned audio_hash;
+static size_t audio_frames;
+static int statehash_on;
+static int test_failures;
+
+static int make_directory(const char *path)
+{
+   char *copy, *p;
+   if (!path || !*path) return 0;
+   copy = strdup(path);
+   if (!copy) return 0;
+   for (p = copy + 1; ; p++)
+   {
+      if (*p == '/' || !*p)
+      {
+         char saved = *p;
+         *p = 0;
+         if (mkdir(copy, 0755) && errno != EEXIST)
+         {
+            fprintf(stderr, "[glhost] mkdir %s: %s\n", copy, strerror(errno));
+            free(copy);
+            return 0;
+         }
+         *p = saved;
+         if (!saved) break;
+      }
+   }
+   free(copy);
+   return 1;
+}
 
 static void log_cb(enum retro_log_level level, const char *fmt, ...)
 { va_list ap; (void)level; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap); }
@@ -89,6 +136,28 @@ static unsigned fnv1a(const unsigned char *d, size_t n)
   for (i = 0; i < n; i++) { h ^= d[i]; h *= 16777619u; }
   return h; }
 
+static int read_framebuffer(unsigned width, unsigned height, void *pixels)
+{
+   typedef void (*bind_t)(GLenum, GLuint);
+   bind_t bind_fbo = (bind_t)eglGetProcAddress("glBindFramebuffer");
+   bind_t bind_buffer = (bind_t)eglGetProcAddress("glBindBuffer");
+   if (!bind_fbo || !bind_buffer || width > fbo_w || height > fbo_h)
+   {
+      fprintf(stderr, "[glhost] cannot read %ux%u host framebuffer\n", width, height);
+      test_failures++;
+      return 0;
+   }
+   bind_fbo(GL_FRAMEBUFFER, fbo);
+   bind_buffer(GL_PIXEL_PACK_BUFFER, 0);
+   glPixelStorei(GL_PACK_ALIGNMENT, 1);
+   glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+   glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+   glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+   glReadPixels(0, 0, (GLsizei)width, (GLsizei)height,
+                GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+   return 1;
+}
+
 static bool env_cb(unsigned cmd, void *data)
 {
    switch (cmd)
@@ -99,6 +168,25 @@ static bool env_cb(unsigned cmd, void *data)
          *(const char **)data = sysdir; return true;
       case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
          *(const char **)data = savedir; return true;
+      case RETRO_ENVIRONMENT_SET_MEMORY_MAPS:
+      {
+         const struct retro_memory_map *map = data;
+         unsigned i;
+         memset(&main_memory, 0, sizeof(main_memory));
+         memset(&scratch_memory, 0, sizeof(scratch_memory));
+         for (i = 0; i < map->num_descriptors; i++)
+         {
+            const struct retro_memory_descriptor *d = &map->descriptors[i];
+            if (!(d->flags & RETRO_MEMDESC_SYSTEM_RAM) || !d->ptr)
+               continue;
+            /* The descriptor array may be stack storage; keep copies. */
+            if (d->start == 0 && !main_memory.ptr) main_memory = *d;
+            if (d->start == 0x1f800000 && !scratch_memory.ptr) scratch_memory = *d;
+         }
+         fprintf(stderr, "[glhost] memory map main=%zu scratch=%zu bytes\n",
+                 main_memory.len, scratch_memory.len);
+         return true;
+      }
       case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
          soft_fmt = *(const unsigned *)data;
          return true;
@@ -159,13 +247,24 @@ static bool env_cb(unsigned cmd, void *data)
          return true;
       }
       case RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER:
+#ifdef GLHOST_GLES
+         *(unsigned *)data = RETRO_HW_CONTEXT_OPENGLES3;
+         return true;
+#else
          if (!ctx_gl2) return false;
          *(unsigned *)data = RETRO_HW_CONTEXT_OPENGL;
          fprintf(stderr, "[glhost] GET_PREFERRED_HW_RENDER -> OPENGL\n");
          return true;
+#endif
       case RETRO_ENVIRONMENT_SET_HW_RENDER:
       {
          struct retro_hw_render_callback *cb = (struct retro_hw_render_callback *)data;
+#ifdef GLHOST_GLES
+         if (cb->context_type != RETRO_HW_CONTEXT_OPENGLES3 &&
+             !(cb->context_type == RETRO_HW_CONTEXT_OPENGLES_VERSION &&
+               cb->version_major == 3 && cb->version_minor == 0))
+            return false;
+#else
          if ((ctx_gl2 || ctx_rejcore) && cb->context_type != RETRO_HW_CONTEXT_OPENGL)
          {
             fprintf(stderr, "[glhost] SET_HW_RENDER type=%d REJECTED (mode)\n",
@@ -175,6 +274,7 @@ static bool env_cb(unsigned cmd, void *data)
          if (cb->context_type != RETRO_HW_CONTEXT_OPENGL_CORE &&
              cb->context_type != RETRO_HW_CONTEXT_OPENGL)
             return false;
+#endif
          cb->get_current_framebuffer = get_current_framebuffer;
          cb->get_proc_address        = get_proc_address;
          hw_render = *cb;
@@ -193,20 +293,15 @@ static void video_cb(const void *data, unsigned width, unsigned height, size_t p
   if (width != last_w || height != last_h)
      fprintf(stderr, "[glhost] geometry %ux%u\n", width, height);
   last_w = width; last_h = height; frames_presented++;
-  if ((!data || data == (const void *)-1) && getenv("GLHOST_FRAMEHASH")
+  if (!soft_mode && (!data || data == (const void *)-1) && getenv("GLHOST_FRAMEHASH")
       && width && height)
   {
      /* hw-render frame: hash a readback of the host FBO the core just
       * rendered into, so GL runs get the same equivalence oracle. */
      size_t need = (size_t)width * height * 4;
-     typedef void (*bindfb_t)(GLenum, GLuint);
-     bindfb_t pbind = (bindfb_t)eglGetProcAddress("glBindFramebuffer");
      if (need > soft_cap) { free(soft_buf); soft_buf = malloc(need); soft_cap = need; }
-     if (soft_buf && pbind)
+     if (soft_buf && read_framebuffer(width, height, soft_buf))
      {
-        pbind(GL_FRAMEBUFFER, fbo);
-        glReadPixels(0, 0, (GLsizei)width, (GLsizei)height,
-                     GL_RGBA, GL_UNSIGNED_BYTE, soft_buf);
         fprintf(stderr, "[glhost] frame %u hash %08x%s\n",
                 input_frame, fnv1a(soft_buf, need),
                 in_replay ? " (replay)" : "");
@@ -233,8 +328,26 @@ static void video_cb(const void *data, unsigned width, unsigned height, size_t p
      }
   }
 }
-static void audio_sample_cb(int16_t l, int16_t r) { (void)l; (void)r; }
-static size_t audio_batch_cb(const int16_t *d, size_t f) { (void)d; return f; }
+static size_t audio_batch_cb(const int16_t *d, size_t f)
+{
+   if (statehash_on)
+   {
+      const unsigned char *bytes = (const unsigned char *)d;
+      size_t i;
+      for (i = 0; i < f * 2 * sizeof(*d); i++)
+      {
+         audio_hash ^= bytes[i];
+         audio_hash *= 16777619u;
+      }
+      audio_frames += f;
+   }
+   return f;
+}
+static void audio_sample_cb(int16_t l, int16_t r)
+{
+   int16_t pair[2] = { l, r };
+   audio_batch_cb(pair, 1);
+}
 static void input_poll_cb(void) {}
 static int16_t input_state_cb(unsigned port, unsigned dev, unsigned idx, unsigned id)
 {
@@ -253,9 +366,18 @@ static int16_t input_state_cb(unsigned port, unsigned dev, unsigned idx, unsigne
    return 0;
 }
 
-/* ---- EGL surfaceless desktop-GL core context ---- */
+/* ---- EGL desktop GL or GLES3 pbuffer context ---- */
 static int egl_init(void)
 {
+#ifdef GLHOST_GLES
+   static const EGLint cfg_attr[] = {
+      EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR,
+      EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+      EGL_NONE };
+   static const EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+   static const EGLint surface_attr[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+#else
    static const EGLint cfg_attr[] = {
       EGL_SURFACE_TYPE, 0,
       EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
@@ -268,21 +390,39 @@ static int egl_init(void)
    static const EGLint ctx_attr_compat[] = {
       EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT,
       EGL_NONE };
+#endif
    EGLConfig cfg; EGLint n;
+#ifndef __ANDROID__
    setenv("EGL_PLATFORM", "surfaceless", 0); /* headless Mesa default */
+#endif
    egl_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
    if (egl_dpy == EGL_NO_DISPLAY || !eglInitialize(egl_dpy, NULL, NULL))
    { fprintf(stderr, "[glhost] eglInitialize failed\n"); return 0; }
-   if (!eglBindAPI(EGL_OPENGL_API))
-   { fprintf(stderr, "[glhost] eglBindAPI(GL) failed\n"); return 0; }
+   if (!eglBindAPI(
+#ifdef GLHOST_GLES
+            EGL_OPENGL_ES_API
+#else
+            EGL_OPENGL_API
+#endif
+            ))
+   { fprintf(stderr, "[glhost] eglBindAPI failed: 0x%x\n", eglGetError()); return 0; }
    if (!eglChooseConfig(egl_dpy, cfg_attr, &cfg, 1, &n) || n < 1)
    { fprintf(stderr, "[glhost] eglChooseConfig failed\n"); return 0; }
    egl_ctx = eglCreateContext(egl_dpy, cfg, EGL_NO_CONTEXT,
+#ifdef GLHOST_GLES
+                              ctx_attr);
+#else
                               (ctx_gl2 || ctx_rejcore) ? ctx_attr_compat : ctx_attr);
+#endif
    if (egl_ctx == EGL_NO_CONTEXT)
    { fprintf(stderr, "[glhost] eglCreateContext failed\n"); return 0; }
-   if (!eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_ctx))
-   { fprintf(stderr, "[glhost] surfaceless eglMakeCurrent failed\n"); return 0; }
+#ifdef GLHOST_GLES
+   egl_surface = eglCreatePbufferSurface(egl_dpy, cfg, surface_attr);
+   if (egl_surface == EGL_NO_SURFACE)
+   { fprintf(stderr, "[glhost] eglCreatePbufferSurface failed: 0x%x\n", eglGetError()); return 0; }
+#endif
+   if (!eglMakeCurrent(egl_dpy, egl_surface, egl_surface, egl_ctx))
+   { fprintf(stderr, "[glhost] eglMakeCurrent failed: 0x%x\n", eglGetError()); return 0; }
    fprintf(stderr, "[glhost] GL: %s | %s\n",
            (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
    return 1;
@@ -298,6 +438,9 @@ static int fbo_init(void)
    bindfb_t pglBindFramebuffer  = (bindfb_t)eglGetProcAddress("glBindFramebuffer");
    fbtex_t  pglFramebufferTexture2D = (fbtex_t)eglGetProcAddress("glFramebufferTexture2D");
    checkfb_t pglCheckFramebufferStatus = (checkfb_t)eglGetProcAddress("glCheckFramebufferStatus");
+   if (!pglGenFramebuffers || !pglBindFramebuffer ||
+       !pglFramebufferTexture2D || !pglCheckFramebufferStatus)
+   { fprintf(stderr, "[glhost] missing FBO entry point\n"); return 0; }
    glGenTextures(1, &fbo_tex);
    glBindTexture(GL_TEXTURE_2D, fbo_tex);
    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, fbo_w, fbo_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
@@ -351,11 +494,8 @@ static void dump_frame(const char *path)
    }
    unsigned char *buf = malloc((size_t)w * h * 4);
    FILE *f;
-   typedef void (*bindfb_t)(GLenum, GLuint);
-   bindfb_t pglBindFramebuffer = (bindfb_t)eglGetProcAddress("glBindFramebuffer");
    if (!buf) return;
-   pglBindFramebuffer(GL_FRAMEBUFFER, fbo);
-   glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+   if (!read_framebuffer(w, h, buf)) { free(buf); return; }
    f = fopen(path, "wb");
    if (f)
    {
@@ -441,19 +581,68 @@ typedef bool (*unser_t)(const void *, size_t);
 typedef bool (*ser_t)(void *, size_t);
 typedef size_t (*ssize_t_t)(void);
 
+static void run_frame(run_t run)
+{
+   audio_hash = 2166136261u;
+   audio_frames = 0;
+   run();
+   if (statehash_on)
+   {
+      unsigned ram_hash = 0, scratch_hash = 0;
+      if (main_memory.ptr && main_memory.len)
+         ram_hash = fnv1a((const unsigned char *)main_memory.ptr + main_memory.offset,
+                         main_memory.len);
+      if (scratch_memory.ptr && scratch_memory.len)
+         scratch_hash = fnv1a((const unsigned char *)scratch_memory.ptr + scratch_memory.offset,
+                             scratch_memory.len);
+      fprintf(stderr, "[glhost] state frame %u ram %08x scratch %08x audio %08x samples %zu%s\n",
+              input_frame, ram_hash, scratch_hash, audio_hash, audio_frames,
+              in_replay ? " (replay)" : "");
+   }
+}
+
+static void egl_shutdown(void)
+{
+   typedef void (*delete_t)(GLsizei, const GLuint *);
+   delete_t delete_fbo = (delete_t)eglGetProcAddress("glDeleteFramebuffers");
+   delete_t delete_buffer = (delete_t)eglGetProcAddress("glDeleteBuffers");
+   if (delete_fbo && fbo) delete_fbo(1, &fbo);
+   if (delete_buffer && dirty_pbo) delete_buffer(1, &dirty_pbo);
+   if (fbo_tex) glDeleteTextures(1, &fbo_tex);
+   if (fbo_depth) glDeleteTextures(1, &fbo_depth);
+   if (dirty_tex) glDeleteTextures(1, &dirty_tex);
+   fbo = fbo_tex = fbo_depth = dirty_pbo = dirty_tex = 0;
+   eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+   if (egl_surface != EGL_NO_SURFACE) eglDestroySurface(egl_dpy, egl_surface);
+   if (egl_ctx != EGL_NO_CONTEXT) eglDestroyContext(egl_dpy, egl_ctx);
+   eglTerminate(egl_dpy);
+   egl_surface = EGL_NO_SURFACE;
+   egl_ctx = EGL_NO_CONTEXT;
+   egl_dpy = EGL_NO_DISPLAY;
+}
+
 int main(int argc, char **argv)
 {
+#ifdef __ANDROID__
+   const char *core_path, *content, *state_path = NULL, *outdir = "/data/local/tmp/glhost/out";
+#else
    const char *core_path, *content, *state_path = NULL, *outdir = "/tmp/glhost_out";
+#endif
    int frames = 60, i;
-   char cmd[1024];
+   int recreate_at = 0;
+   const char *setting;
    if (argc < 3)
    { fprintf(stderr, "usage: %s <core.so> <content> [state|-] [frames] [outdir]\n", argv[0]); return 1; }
    core_path = argv[1]; content = argv[2];
    if (argc > 3 && strcmp(argv[3], "-")) state_path = argv[3];
    if (argc > 4) frames = atoi(argv[4]);
    if (argc > 5) outdir = argv[5];
-   snprintf(cmd, sizeof(cmd), "mkdir -p %s %s %s", outdir, sysdir, savedir);
-   if (system(cmd) != 0) {}
+   setting = getenv("GLHOST_SYSTEM_DIR"); if (setting) sysdir = setting;
+   setting = getenv("GLHOST_SAVE_DIR"); if (setting) savedir = setting;
+   setting = getenv("GLHOST_STATEHASH"); statehash_on = setting && atoi(setting);
+   setting = getenv("GLHOST_RECREATE_AT"); if (setting) recreate_at = atoi(setting);
+   if (!make_directory(outdir) || !make_directory(sysdir) || !make_directory(savedir))
+      return 1;
 
    { const char *ov = getenv("GLHOST_VARS");    /* overrides win: added first */
      if (ov) { char *dup = strdup(ov), *tok = strtok(dup, ";");
@@ -502,6 +691,12 @@ int main(int argc, char **argv)
    else
       hw_render.context_reset();
 
+   if (statehash_on && (!main_memory.ptr || !scratch_memory.ptr))
+   {
+      fprintf(stderr, "[glhost] STATEHASH requires main RAM and scratchpad memory maps\n");
+      test_failures++;
+   }
+
    if (state_path)
    {
       FILE *f = fopen(state_path, "rb");
@@ -544,6 +739,14 @@ int main(int argc, char **argv)
      for (i = 1; i <= frames; i++)
      {
         input_frame = (unsigned)i;
+        if (i == recreate_at && !soft_mode)
+        {
+           fprintf(stderr, "[glhost] recreating EGL context before frame %d\n", i);
+           if (hw_render.context_destroy) hw_render.context_destroy();
+           egl_shutdown();
+           if (!egl_init() || !fbo_init()) return 3;
+           hw_render.context_reset();
+        }
         if (preempt && (i < 5 || (i % 50) == 0))
            fprintf(stderr, "[glhost] frame %d serialize_size=%zu\n", i, ssz());
         if (preempt == 1)
@@ -613,7 +816,7 @@ int main(int argc, char **argv)
                     fprintf(stderr, "[glhost] rollback unser FAILED frame %d\n", i);
                  input_frame = (unsigned)i - 1;
                  in_replay   = 1;
-                 run(); /* replay previous frame */
+                 run_frame(run); /* replay previous frame */
                  in_replay   = 0;
                  input_frame = (unsigned)i;
                  if (getenv("GLHOST_DIRTY"))
@@ -625,7 +828,7 @@ int main(int argc, char **argv)
               have_prev = 1;
            }
         }
-        run();
+        run_frame(run);
         if (getenv("GLHOST_DIRTY"))
            frontend_dirty_state();
         if ((i % 30) == 0 || i == frames)
@@ -639,6 +842,11 @@ int main(int argc, char **argv)
            frames, frames_presented, last_w, last_h);
 
    ((fn_t)dlsym(core, "retro_unload_game"))();
+   if (hw_render.context_destroy) hw_render.context_destroy();
    ((fn_t)dlsym(core, "retro_deinit"))();
-   return 0;
+   dlclose(core);
+   egl_shutdown();
+   free(soft_buf);
+   for (i = 0; i < n_vars; i++) { free(var_keys[i]); free(var_vals[i]); }
+   return test_failures ? 5 : 0;
 }

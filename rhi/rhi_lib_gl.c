@@ -116,6 +116,17 @@ static unsigned gl_diag_wraps;
 static unsigned gl_map_failures;
 #define GL_DIAG_ON() (gl_diag_state >= 0 ? gl_diag_state : \
       (gl_diag_state = (getenv("BEETLE_GL_DIAG") ? 1 : 0)))
+
+/* Compatibility escape hatch for the framebuffer-feedback mirror; see
+ * gl_mirror_fb_out_to_fb_texture.  Off unless a driver is found that needs
+ * it. */
+static int gl_mirror_finish_state = -1;
+static bool gl_mirror_finish_quirk(void)
+{
+   if (gl_mirror_finish_state < 0)
+      gl_mirror_finish_state = getenv("BEETLE_GL_MIRROR_FINISH") ? 1 : 0;
+   return gl_mirror_finish_state != 0;
+}
 /* Compare a full-VRAM diagnostic re-read against a reference copy and
  * report the first divergence. The two probes below split the
  * savestate cycle into its stages so a field log can say WHICH stage
@@ -267,6 +278,7 @@ static void gl_normalize_inherited_state(void)
 #include "shaders_gl/output_fragment.glsl.h"
 #include "shaders_gl/image_load_vertex.glsl.h"
 #include "shaders_gl/image_load_fragment.glsl.h"
+#include "shaders_gl/vram_copy_fragment.glsl.h"
 
 #include "libretro.h"
 #include "libretro_options.h"
@@ -380,6 +392,31 @@ typedef void (BEETLE_GL_APIENTRYP PFN_BEETLE_GL_BLITFRAMEBUFFER)(
       GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
       GLbitfield mask, GLenum filter);
 
+/* Timer queries, for the native-pass cost report (BEETLE_GL_STATS=1).  Core
+ * in GL 3.3 and, on GLES, GL_EXT_disjoint_timer_query - which defines its own
+ * EXT-suffixed entry points, hence the suffix ladder at the resolve site. */
+typedef void (BEETLE_GL_APIENTRYP PFN_BEETLE_GL_GENQUERIES)(
+      GLsizei n, GLuint *ids);
+typedef void (BEETLE_GL_APIENTRYP PFN_BEETLE_GL_DELETEQUERIES)(
+      GLsizei n, const GLuint *ids);
+typedef void (BEETLE_GL_APIENTRYP PFN_BEETLE_GL_BEGINQUERY)(
+      GLenum target, GLuint id);
+typedef void (BEETLE_GL_APIENTRYP PFN_BEETLE_GL_ENDQUERY)(GLenum target);
+typedef void (BEETLE_GL_APIENTRYP PFN_BEETLE_GL_GETQUERYOBJECTUIV)(
+      GLuint id, GLenum pname, GLuint *params);
+typedef void (BEETLE_GL_APIENTRYP PFN_BEETLE_GL_GETQUERYOBJECTUI64V)(
+      GLuint id, GLenum pname, uint64_t *params);
+
+#ifndef GL_TIME_ELAPSED
+#define GL_TIME_ELAPSED 0x88BF
+#endif
+#ifndef GL_QUERY_RESULT
+#define GL_QUERY_RESULT 0x8866
+#endif
+#ifndef GL_QUERY_RESULT_AVAILABLE
+#define GL_QUERY_RESULT_AVAILABLE 0x8867
+#endif
+
 typedef void (BEETLE_GL_APIENTRYP PFN_BEETLE_GL_COPYIMAGESUBDATA)(
       GLuint srcName, GLenum srcTarget, GLint srcLevel,
       GLint srcX, GLint srcY, GLint srcZ,
@@ -409,6 +446,15 @@ typedef struct gl_caps
    /* Resolved entry points.  NULL when not available. */
    PFN_BEETLE_GL_BLITFRAMEBUFFER  fp_glBlitFramebuffer;
    PFN_BEETLE_GL_COPYIMAGESUBDATA fp_glCopyImageSubData;
+
+   /* Timer queries; all six or none.  Diagnostics only. */
+   PFN_BEETLE_GL_GENQUERIES          fp_glGenQueries;
+   PFN_BEETLE_GL_DELETEQUERIES       fp_glDeleteQueries;
+   PFN_BEETLE_GL_BEGINQUERY          fp_glBeginQuery;
+   PFN_BEETLE_GL_ENDQUERY            fp_glEndQuery;
+   PFN_BEETLE_GL_GETQUERYOBJECTUIV   fp_glGetQueryObjectuiv;
+   PFN_BEETLE_GL_GETQUERYOBJECTUI64V fp_glGetQueryObjectui64v;
+   int has_timer_query;
 
    /* Set to 1 when the detected version is below the floor
     * beetle's GL renderer needs to function (GL/GLES 3.0).
@@ -923,6 +969,36 @@ typedef struct gl_draw_buffer gl_draw_buffer;
 #define GL_VRAM_SYNC_TILES_Y (VRAM_HEIGHT / GL_VRAM_SYNC_TILE_SIZE)
 #define GL_VRAM_SYNC_WRITERS_PER_TILE 8u
 
+/* Per-pass cost accounting for the fb_out / fb_native raster passes.
+ *
+ * The native pass is a second rasterisation of every primitive, so "what does
+ * it actually cost" is a question the code should be able to answer rather
+ * than have argued about.  Enabled by BEETLE_GL_STATS=1 and completely idle
+ * otherwise.
+ *
+ * GPU time comes from GL_TIME_ELAPSED queries read back through a ring, and a
+ * result is only ever collected once the driver says it is available -
+ * blocking on the query would reintroduce precisely the stall the rest of
+ * this work exists to remove. */
+#define GL_STATS_QUERIES 8
+#define GL_STATS_WINDOW  300
+
+struct gl_pass_stats
+{
+   GLuint   query[GL_STATS_QUERIES];
+   bool     inflight[GL_STATS_QUERIES];
+   unsigned head;
+   bool     created;
+   bool     timing;
+   /* Accumulated over the report window. */
+   uint64_t gpu_ns;
+   uint32_t timed;    /* passes whose GPU time was harvested */
+   uint32_t dropped;  /* passes left untimed because the ring was busy */
+   uint32_t passes;
+   uint32_t batches;
+   uint32_t indices;
+};
+
 struct gl_vram_sync_writer
 {
    uint64_t sequence;
@@ -971,6 +1047,55 @@ struct gl_renderer {
    /* gl_framebuffer used as an output when running draw commands */
    gl_texture fb_out;
 
+   /* Native-resolution PS1 VRAM held on the GPU: always 1024x512 and always
+    * GL_RGB5_A1, whatever the upscale and Internal Color Depth options say.
+    *
+    * fb_out is the *enhanced output* target - its size follows the upscale
+    * factor and its format follows the colour-depth option - so the pixels
+    * it holds are not the pixels the emulated CPU is entitled to see.  Every
+    * consumer that speaks for real PS1 VRAM (GP0 C0h read-back, savestate
+    * capture, and the framebuffer-as-texture resolves that make motion blur
+    * and other feedback effects work) resolves against fb_native instead, so
+    * what the guest observes does not change when the user moves the upscale
+    * slider.  fb_native is rasterised from the same geometry rather than
+    * downsampled from fb_out, so it is a real native rendering and not a
+    * NEAREST decimation of an upscaled one.
+    *
+    * Live only while native_target_enabled.  At 1x fb_out is already
+    * PS1-sized and the second pass would be pure duplicate work; with the
+    * software framebuffer on, the CPU rasteriser maintains GPU.vram and
+    * nothing consults the GPU copy at all. */
+   gl_texture fb_native;
+   gl_texture fb_native_depth;
+   bool       native_target_enabled;
+
+   /* --- VRAM-to-VRAM copy (GP0 80h) staging ---
+    *
+    * A copy whose source and destination rectangles overlap cannot be done in
+    * place: glCopyImageSubData is explicitly undefined for overlapping
+    * regions of one image, and the glCopyTexSubImage2D fallback reads and
+    * writes the same texture through one binding, which is no better defined.
+    * A mask-tested copy additionally has to read the destination while
+    * writing it.  Both go through this scratch texture, grown on demand and
+    * kept - copy_rect is a hot GP0 command and reallocating per call would
+    * cost more than the copy.
+    *
+    * vram_copy_buffer is only built the first time a mask-tested copy shows
+    * up, which for most games is never; overlap alone is handled by two
+    * blits and needs no program at all. */
+   /* One slot per surface: fb_out and fb_native differ in both scale and
+    * format, so a single shared staging texture would be reallocated twice
+    * on every staged copy. [0] is fb_out, [1] fb_native. */
+   gl_texture      fb_copy_scratch[2];
+   GLenum          fb_copy_scratch_format[2];
+   GLuint          copy_read_fbo;
+   GLuint          copy_draw_fbo;
+   gl_draw_buffer *vram_copy_buffer;
+   bool            vram_copy_build_failed;
+   /* Storage format fb_out was created with; the staging texture has to
+    * match it for the blits into and out of it to be format-preserving. */
+   GLenum          fb_out_format;
+
    /* Analog cable chain. NULL until the option is first switched on; the
     * chain owns a dozen programs and six render targets, so a session that
     * never enables it never pays for it. Freed with the renderer. */
@@ -986,6 +1111,10 @@ struct gl_renderer {
    uint32_t frontend_resolution[2];
    /* Current internal resolution upscaling factor */
    uint32_t internal_upscaling;
+   /* Divisor applied to gl_FragCoord before indexing the 4x4 dither matrix,
+    * i.e. the size of one dither cell in fb_out texels.  Mirrored here
+    * because the native pass has to override the uniform and put it back. */
+   uint32_t dither_scaling;
    /* Current internal color depth */
    uint8_t internal_color_depth;
    /* fb_out is GL_RGBA16F: 30-bit/HDR color format requested and fp16 is
@@ -1040,6 +1169,10 @@ struct gl_renderer {
    /* Persistent FBOs for fb_out -> fb_texture dependency resolves. */
    GLuint vram_sync_read_fbo;
    GLuint vram_sync_draw_fbo;
+
+   /* [0] fb_out, [1] fb_native. See struct gl_pass_stats. */
+   struct gl_pass_stats stats[2];
+   uint32_t             stats_frames;
 
    /* fb_out receives primitive rendering while fb_texture supplies texels.
     * Remember native VRAM regions that are newer in fb_out so a later draw
@@ -1549,7 +1682,16 @@ static void gl_draw_buffer_disable_attribute(gl_draw_buffer *drawbuffer, const c
    } while (0)
 #endif
 
-static void gl_draw_buffer_draw(gl_draw_buffer *drawbuffer, GLenum mode)
+/* Unmap the buffer and issue the pending vertices into the bound target,
+ * stopping short of advancing the write cursor and re-mapping.
+ *
+ * Split out of gl_draw_buffer_draw so the same vertices can be issued more
+ * than once - the fb_native pass replays them at PS1 resolution.  A buffer
+ * that is currently mapped must not be used as a draw source, so every repeat
+ * has to happen inside this one unmapped window; gl_draw_buffer_draw_end
+ * closes it.  On the map-failure path nothing is drawn and the buffer is left
+ * mapped, which is what _again and _end both test for. */
+static void gl_draw_buffer_draw_begin(gl_draw_buffer *drawbuffer, GLenum mode)
 {
    if (!drawbuffer->map)
    {
@@ -1572,11 +1714,36 @@ static void gl_draw_buffer_draw(gl_draw_buffer *drawbuffer, GLenum mode)
 
    /* Length in number of vertices */
    glDrawArrays(mode, drawbuffer->map_start, drawbuffer->map_index);
+}
+
+/* Re-issue the vertices gl_draw_buffer_draw_begin drew, into whatever target
+ * is bound now.  No-op if _begin bailed out (buffer still mapped). */
+static void gl_draw_buffer_draw_again(gl_draw_buffer *drawbuffer, GLenum mode)
+{
+   if (drawbuffer->map)
+      return;
+
+   glBindVertexArray(drawbuffer->vao);
+   glUseProgram(drawbuffer->program->id);
+   glDrawArrays(mode, drawbuffer->map_start, drawbuffer->map_index);
+}
+
+/* Advance past the vertices just drawn and re-map for the next batch. */
+static void gl_draw_buffer_draw_end(gl_draw_buffer *drawbuffer)
+{
+   if (drawbuffer->map)
+      return;
 
    drawbuffer->map_start += drawbuffer->map_index;
    drawbuffer->map_index  = 0;
 
    gl_draw_buffer_map_no_bind(drawbuffer);
+}
+
+static void gl_draw_buffer_draw(gl_draw_buffer *drawbuffer, GLenum mode)
+{
+   gl_draw_buffer_draw_begin(drawbuffer, mode);
+   gl_draw_buffer_draw_end(drawbuffer);
 }
 
 /* Map the buffer for write-only access */
@@ -2938,86 +3105,250 @@ static gl_draw_buffer *gl_draw_buffer_build(const char *vertex_shader_src,
    return db;
 }
 
-static void gl_renderer_draw(gl_renderer *renderer)
+static INLINE void gl_apply_scissor_scale(gl_renderer *renderer,
+      GLsizei upscale);
+
+static bool gl_stats_on(void)
 {
-   gl_framebuffer _fb;
-   int16_t x;
-   int16_t y;
-   size_t bi;
+   static int state = -1;
+   if (state < 0)
+      state = getenv("BEETLE_GL_STATS") ? 1 : 0;
+   return state != 0;
+}
 
-   if (!renderer || static_renderer.state == GL_STATE_INVALID)
+/* Collect every query the driver has already finished with.  Never waits: an
+ * unavailable result is simply left for a later frame. */
+static void gl_stats_harvest(struct gl_pass_stats *s)
+{
+   unsigned i;
+
+   for (i = 0; i < GL_STATS_QUERIES; i++)
+   {
+      GLuint   ready = 0;
+      uint64_t ns    = 0;
+
+      if (!s->inflight[i])
+         continue;
+
+      gl_caps.fp_glGetQueryObjectuiv(s->query[i],
+            GL_QUERY_RESULT_AVAILABLE, &ready);
+      if (!ready)
+         continue;
+
+      gl_caps.fp_glGetQueryObjectui64v(s->query[i], GL_QUERY_RESULT, &ns);
+      s->gpu_ns += ns;
+      s->timed++;
+      s->inflight[i] = false;
+   }
+}
+
+static void gl_stats_pass_begin(gl_renderer *renderer, unsigned slot)
+{
+   struct gl_pass_stats *s = &renderer->stats[slot];
+
+   if (!gl_stats_on())
       return;
 
-   if (!renderer->command_buffer->map)
+   s->passes++;
+   s->batches += (uint32_t)renderer->batches.count;
+   s->indices += renderer->vertex_index_pos;
+
+   if (!gl_caps.has_timer_query)
+      return;
+
+   if (!s->created)
    {
-      /* A previous command-buffer map failed; nothing was pushed and the
-       * buffer is not mapped, so there is nothing to unmap or draw.
-       * Clear the batch bookkeeping and retry the map. */
-      renderer->command_buffer->map_index = 0;
-      renderer->primitive_ordering        = 0;
-      gl_primitive_batch_vec_clear(&renderer->batches);
-      renderer->vertex_index_pos          = 0;
-      gl_draw_buffer_map_no_bind(renderer->command_buffer);
+      gl_caps.fp_glGenQueries(GL_STATS_QUERIES, s->query);
+      s->created = true;
+   }
+
+   gl_stats_harvest(s);
+
+   if (s->inflight[s->head])
+   {
+      /* The GPU is still that far behind; skip timing this pass rather than
+       * stall waiting for a free slot. */
+      s->dropped++;
       return;
    }
 
-   x = renderer->config.draw_offset[0];
-   y = renderer->config.draw_offset[1];
+   gl_caps.fp_glBeginQuery(GL_TIME_ELAPSED, s->query[s->head]);
+   s->timing = true;
+}
 
-   if (renderer->command_buffer->program)
+static void gl_stats_pass_end(gl_renderer *renderer, unsigned slot)
+{
+   struct gl_pass_stats *s = &renderer->stats[slot];
+
+   if (!s->timing)
+      return;
+
+   gl_caps.fp_glEndQuery(GL_TIME_ELAPSED);
+   s->inflight[s->head] = true;
+   s->head              = (s->head + 1) % GL_STATS_QUERIES;
+   s->timing            = false;
+}
+
+/* Once per GL_STATS_WINDOW frames, say what each raster pass cost.
+ *
+ * GPU time is scaled from the passes that were actually timed up to the total
+ * pass count, and both numbers are printed so the extrapolation is visible.
+ * A query still in flight at the window boundary lands in the next window,
+ * which is fine at this resolution. */
+static void gl_stats_report(gl_renderer *renderer)
+{
+   unsigned slot;
+
+   if (!gl_stats_on())
+      return;
+   if (++renderer->stats_frames < GL_STATS_WINDOW)
+      return;
+
+   for (slot = 0; slot < 2; slot++)
    {
-      glUseProgram(renderer->command_buffer->program->id);
-      glUniform2i(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "offset"), (GLint)x, (GLint)y);
-      /* We use texture unit 0 */
-      glUniform1i(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "fb_texture"), 0);
-      /* HD replacement texture lives on unit 1 */
-      glUniform1i(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "hd_texture"), 1);
+      struct gl_pass_stats *s = &renderer->stats[slot];
+      double frames           = (double)renderer->stats_frames;
+      double gpu_ms           = 0.0;
+
+      if (gl_caps.has_timer_query && s->created)
+         gl_stats_harvest(s);
+
+      if (s->passes && s->timed)
+         gpu_ms = ((double)s->gpu_ns / 1.0e6)
+               * ((double)s->passes / (double)s->timed) / frames;
+
+      if (s->passes && log_cb)
+         log_cb(RETRO_LOG_INFO,
+               "[gl_stats] %-9s %6.2f passes/frame, %7.1f draws/frame, "
+               "%8.0f tris/frame, GPU %.3f ms/frame "
+               "(%u timed, %u untimed%s)\n",
+               slot ? "fb_native" : "fb_out",
+               s->passes  / frames,
+               s->batches / frames,
+               s->indices / frames / 3.0,
+               gpu_ms, s->timed, s->dropped,
+               gl_caps.has_timer_query ? "" : ", no timer query");
+
+      s->gpu_ns  = 0;
+      s->timed   = 0;
+      s->dropped = 0;
+      s->passes  = 0;
+      s->batches = 0;
+      s->indices = 0;
    }
 
-   /* Bind the out framebuffer */
-   gl_framebuffer_init(&_fb, &renderer->fb_out);
+   renderer->stats_frames = 0;
+}
 
+static void gl_stats_free(gl_renderer *renderer)
+{
+   unsigned slot;
+
+   for (slot = 0; slot < 2; slot++)
+   {
+      struct gl_pass_stats *s = &renderer->stats[slot];
+      if (s->created && gl_caps.fp_glDeleteQueries)
+         gl_caps.fp_glDeleteQueries(GL_STATS_QUERIES, s->query);
+      memset(s, 0, sizeof(*s));
+   }
+}
+
+/* Is the native mirror needed?
+ *
+ * Only when fb_out is not itself a faithful PS1 VRAM surface.  Upscaling is
+ * the obvious case, but Internal Color Depth is the same kind of thing: a
+ * 32bpp or fp16 fb_out carries more precision than PS1 VRAM has, so a
+ * read-back has to round it back down and the guest sees values the hardware
+ * would have dithered to instead.  Both are enhanced output, and neither
+ * should decide what the emulated CPU reads.
+ *
+ * None of it matters with the software framebuffer on: the CPU rasteriser
+ * maintains GPU.vram and nothing consults the GPU copy. */
+static bool gl_native_target_wanted(uint32_t upscaling, GLenum fb_out_storage)
+{
+   if (has_software_fb)
+      return false;
+   return upscaling > 1 || fb_out_storage != (GLenum)GL_RGB5_A1;
+}
+
+static void gl_native_target_free(gl_renderer *renderer)
+{
+   if (renderer->fb_native.id)
+      glDeleteTextures(1, &renderer->fb_native.id);
+   renderer->fb_native.id     = 0;
+   renderer->fb_native.width  = 0;
+   renderer->fb_native.height = 0;
+
+   if (renderer->fb_native_depth.id)
+      glDeleteTextures(1, &renderer->fb_native_depth.id);
+   renderer->fb_native_depth.id     = 0;
+   renderer->fb_native_depth.width  = 0;
+   renderer->fb_native_depth.height = 0;
+}
+
+/* (Re)allocate the native PS1-resolution mirror.  See fb_native's
+ * declaration for what it is for.
+ *
+ * `enabled` is the whole policy: above 1x fb_out no longer holds PS1 pixels,
+ * so a guest-visible read of VRAM has to come from somewhere else - unless
+ * the software framebuffer is on, in which case the CPU rasteriser is
+ * already maintaining GPU.vram and the GPU copy is never consulted. */
+static void gl_native_target_init(gl_renderer *renderer, bool enabled)
+{
+   gl_native_target_free(renderer);
+   renderer->native_target_enabled = enabled;
+   if (!enabled)
+      return;
+
+   gl_texture_init(&renderer->fb_native,
+         (uint32_t) VRAM_WIDTH_PIXELS, (uint32_t) VRAM_HEIGHT,
+         GL_RGB5_A1);
+   gl_texture_init(&renderer->fb_native_depth,
+         (uint32_t) VRAM_WIDTH_PIXELS, (uint32_t) VRAM_HEIGHT,
+         GL_DEPTH24_STENCIL8);
+
+   /* glTexStorage2D leaves the contents undefined, and the stencil plane is
+    * the PS1 mask bit: start it at zero so a mask-tested draw before the
+    * first fill cannot be rejected by uninitialised state.  fb_out inherits
+    * the same undefined start and has always lived with it, but there is no
+    * reason to reproduce that here.  A full-VRAM load_image follows shortly
+    * (GPU_RestoreStateP3) and overwrites the colour. */
+   {
+      gl_framebuffer nfb;
+      GLboolean scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+
+      gl_framebuffer_init(&nfb, &renderer->fb_native);
 #ifdef HAVE_OPENGLES3
-   glFramebufferTexture2D( GL_DRAW_FRAMEBUFFER,
-         GL_DEPTH_STENCIL_ATTACHMENT,
-         GL_TEXTURE_2D,
-         renderer->fb_out_depth.id,
-         0);
+      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,
+            GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D,
+            renderer->fb_native_depth.id, 0);
 #else
-   glFramebufferTexture(   GL_DRAW_FRAMEBUFFER,
-         GL_DEPTH_STENCIL_ATTACHMENT,
-         renderer->fb_out_depth.id,
-         0);
+      glFramebufferTexture(GL_DRAW_FRAMEBUFFER,
+            GL_DEPTH_STENCIL_ATTACHMENT,
+            renderer->fb_native_depth.id, 0);
 #endif
-
-   glClear(GL_DEPTH_BUFFER_BIT);
-
-   glStencilMask(1);
-   glEnable(GL_STENCIL_TEST);
-
-   /* Bind and unmap the command buffer */
-   glBindBuffer(GL_ARRAY_BUFFER, renderer->command_buffer->id);
-   glUnmapBuffer(GL_ARRAY_BUFFER);
-
-   /* The VAO needs to be bound here or the glDrawElements calls
-    * will error out on some systems */
-   glBindVertexArray(renderer->command_buffer->vao);
-
-   renderer->command_buffer->map = NULL;
-
-   if (renderer->batches.count > 0)
-   {
-      struct gl_primitive_batch *last = &renderer->batches.items[renderer->batches.count - 1];
-      last->count = renderer->vertex_index_pos - last->first;
+      if (scissor_was_enabled)
+         glDisable(GL_SCISSOR_TEST);
+      glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+      glStencilMask(1);
+      glClearStencil(0);
+      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT
+            | GL_DEPTH_BUFFER_BIT);
+      if (scissor_was_enabled)
+         glEnable(GL_SCISSOR_TEST);
+      glDeleteFramebuffers(1, &nfb.id);
    }
+}
 
-   /* Upload index data to EBO (required for core profile - client-side
-    * index pointers are not allowed) */
-   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, renderer->index_buffer);
-   glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0,
-                   renderer->vertex_index_pos * sizeof(GLushort),
-                   renderer->vertex_indices);
-
+/* Issue every recorded batch into the currently bound draw framebuffer.
+ *
+ * Split out of gl_renderer_draw so the same geometry can be replayed into a
+ * second target.  Everything in here is either per-batch state it sets itself
+ * or state the caller established - the framebuffer binding, the viewport and
+ * the scissor - so a second call rasterises the identical primitives into a
+ * differently sized target with no further setup. */
+static void gl_renderer_issue_batches(gl_renderer *renderer)
+{
    {
       size_t bi;
       for (bi = 0; bi < renderer->batches.count; bi++)
@@ -3171,8 +3502,152 @@ static void gl_renderer_draw(gl_renderer *renderer)
       }
       }
    }
+}
 
-   glDisable(GL_STENCIL_TEST);
+static void gl_renderer_draw(gl_renderer *renderer)
+{
+   gl_framebuffer _fb;
+   int16_t x;
+   int16_t y;
+
+   if (!renderer || static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   if (!renderer->command_buffer->map)
+   {
+      /* A previous command-buffer map failed; nothing was pushed and the
+       * buffer is not mapped, so there is nothing to unmap or draw.
+       * Clear the batch bookkeeping and retry the map. */
+      renderer->command_buffer->map_index = 0;
+      renderer->primitive_ordering        = 0;
+      gl_primitive_batch_vec_clear(&renderer->batches);
+      renderer->vertex_index_pos          = 0;
+      gl_draw_buffer_map_no_bind(renderer->command_buffer);
+      return;
+   }
+
+   x = renderer->config.draw_offset[0];
+   y = renderer->config.draw_offset[1];
+
+   if (renderer->command_buffer->program)
+   {
+      glUseProgram(renderer->command_buffer->program->id);
+      glUniform2i(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "offset"), (GLint)x, (GLint)y);
+      /* We use texture unit 0 */
+      glUniform1i(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "fb_texture"), 0);
+      /* HD replacement texture lives on unit 1 */
+      glUniform1i(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "hd_texture"), 1);
+   }
+
+   /* Bind and unmap the command buffer */
+   glBindBuffer(GL_ARRAY_BUFFER, renderer->command_buffer->id);
+   glUnmapBuffer(GL_ARRAY_BUFFER);
+
+   /* The VAO needs to be bound here or the glDrawElements calls
+    * will error out on some systems */
+   glBindVertexArray(renderer->command_buffer->vao);
+
+   renderer->command_buffer->map = NULL;
+
+   if (renderer->batches.count > 0)
+   {
+      struct gl_primitive_batch *last = &renderer->batches.items[renderer->batches.count - 1];
+      last->count = renderer->vertex_index_pos - last->first;
+   }
+
+   /* Upload index data to EBO (required for core profile - client-side
+    * index pointers are not allowed) */
+   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, renderer->index_buffer);
+   glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0,
+                   renderer->vertex_index_pos * sizeof(GLushort),
+                   renderer->vertex_indices);
+
+   /* Rasterise the batch list once per live target.
+    *
+    * Pass 0 is fb_out, the enhanced-output surface the display is composed
+    * from.  Pass 1 is fb_native, PS1-resolution VRAM in PS1 format - see
+    * fb_native's declaration.  It is a genuine second rasterisation rather
+    * than a downsample of the first, which is what makes read-back and
+    * framebuffer-as-texture independent of the upscale setting.
+    *
+    * Nothing has to be re-specified between the passes: the vertex shader
+    * maps PS1 coordinates to NDC, so it is resolution-agnostic by
+    * construction, and the fragment shader fetches fb_texture by absolute
+    * texel.  What differs is the bound target, the viewport (which
+    * gl_framebuffer_init derives from the attached texture), the scissor
+    * scale and the dither cell size. */
+   {
+      const bool native_pass =
+            renderer->native_target_enabled && renderer->fb_native.id != 0;
+      const GLint dither_loc = renderer->command_buffer->program
+            ? gl_uniform_map_get(
+                  &renderer->command_buffer->program->uniforms,
+                  "dither_scaling")
+            : -1;
+      unsigned passes = native_pass ? 2u : 1u;
+      unsigned pass;
+
+      for (pass = 0; pass < passes; pass++)
+      {
+         bool        native = (pass == 1);
+         gl_texture *color  = native ? &renderer->fb_native
+                                     : &renderer->fb_out;
+         gl_texture *depth  = native ? &renderer->fb_native_depth
+                                     : &renderer->fb_out_depth;
+
+         gl_framebuffer_init(&_fb, color);
+
+#ifdef HAVE_OPENGLES3
+         glFramebufferTexture2D( GL_DRAW_FRAMEBUFFER,
+               GL_DEPTH_STENCIL_ATTACHMENT,
+               GL_TEXTURE_2D,
+               depth->id,
+               0);
+#else
+         glFramebufferTexture(   GL_DRAW_FRAMEBUFFER,
+               GL_DEPTH_STENCIL_ATTACHMENT,
+               depth->id,
+               0);
+#endif
+
+         if (native)
+         {
+            /* The dither matrix is indexed by gl_FragCoord over a cell
+             * dither_scaling texels wide, sized for fb_out.  At 1x a cell is
+             * one pixel - the PS1's own grid - and reusing fb_out's scale
+             * here would stretch a single cell across the whole surface. */
+            gl_apply_scissor_scale(renderer, 1);
+            if (dither_loc >= 0)
+               glUniform1ui(dither_loc, 1u);
+         }
+
+         glClear(GL_DEPTH_BUFFER_BIT);
+
+         glStencilMask(1);
+         glEnable(GL_STENCIL_TEST);
+
+         gl_stats_pass_begin(renderer, native ? 1u : 0u);
+         gl_renderer_issue_batches(renderer);
+         gl_stats_pass_end(renderer, native ? 1u : 0u);
+
+         glDisable(GL_STENCIL_TEST);
+         glDeleteFramebuffers(1, &_fb.id);
+
+         if (native)
+         {
+            if (dither_loc >= 0)
+               glUniform1ui(dither_loc, renderer->dither_scaling
+                     ? renderer->dither_scaling : 1u);
+            gl_apply_scissor_scale(renderer,
+                  (GLsizei)renderer->internal_upscaling);
+            /* Leave the viewport describing fb_out: callers that draw after
+             * this without binding a target of their own expect it. */
+            glViewport(0, 0,
+                  (GLsizei)renderer->fb_out.width,
+                  (GLsizei)renderer->fb_out.height);
+         }
+      }
+   }
 
    renderer->command_buffer->map_start += renderer->command_buffer->map_index;
    renderer->command_buffer->map_index  = 0;
@@ -3185,8 +3660,6 @@ static void gl_renderer_draw(gl_renderer *renderer)
    renderer->mask_test = false;
    renderer->set_mask = false;
    renderer->force_mask = false;
-
-   glDeleteFramebuffers(1, &_fb.id);
 }
 
 static void gl_renderer_upload_textures(
@@ -3264,7 +3737,31 @@ static void gl_renderer_upload_textures(
    gl_framebuffer_init(&_fb, &renderer->fb_out);
 
    if (!gl_draw_buffer_is_empty(renderer->image_load_buffer))
-      gl_draw_buffer_draw(renderer->image_load_buffer, GL_TRIANGLE_STRIP);
+   {
+      gl_draw_buffer_draw_begin(renderer->image_load_buffer,
+            GL_TRIANGLE_STRIP);
+
+      /* Seed the native mirror from the same upload.  This is the path that
+       * runs at renderer creation and whenever the upscale or colour depth
+       * changes, so without it fb_native would start blank and stay that way
+       * until every region had been drawn over again. */
+      if (renderer->native_target_enabled && renderer->fb_native.id)
+      {
+         gl_framebuffer nfb;
+
+         gl_framebuffer_init(&nfb, &renderer->fb_native);
+         gl_draw_buffer_draw_again(renderer->image_load_buffer,
+               GL_TRIANGLE_STRIP);
+         glDeleteFramebuffers(1, &nfb.id);
+
+         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, _fb.id);
+         glViewport(0, 0,
+               (GLsizei)renderer->fb_out.width,
+               (GLsizei)renderer->fb_out.height);
+      }
+
+      gl_draw_buffer_draw_end(renderer->image_load_buffer);
+   }
 
    glEnable(GL_SCISSOR_TEST);
 
@@ -3341,7 +3838,11 @@ static bool gl_renderer_new(gl_renderer *renderer, gl_draw_config config)
          has_software_fb = false;
    }
    else
-      has_software_fb = true;
+      /* Matches the core option's own default.  The CPU rasteriser is a
+       * compatibility fallback now that fb_native keeps a native-resolution
+       * PS1 framebuffer on the GPU; a frontend too old to hand us the option
+       * should get the architecture, not the fallback. */
+      has_software_fb = false;
 
    get_variables(&upscaling, &display_vram);
 
@@ -3553,6 +4054,7 @@ static bool gl_renderer_new(gl_renderer *renderer, gl_draw_config config)
       uint32_t native_rgb5 = depth == 16 && !renderer->fb_out_fp16;
       uint32_t fixed_point_modulation = !psx_pgxp_color;
 
+      renderer->dither_scaling = dither_scaling;
       glUseProgram(command_buffer->program->id);
       glUniform1ui(gl_uniform_map_get(&command_buffer->program->uniforms, "dither_scaling"), dither_scaling);
       glUniform1ui(gl_uniform_map_get(&command_buffer->program->uniforms,
@@ -3580,6 +4082,7 @@ static bool gl_renderer_new(gl_renderer *renderer, gl_draw_config config)
    if (renderer->fb_out_fp16)
       texture_storage = GL_RGBA16F;
 
+   renderer->fb_out_format = texture_storage;
    gl_texture_init(
          &renderer->fb_out,
          native_width  * upscaling,
@@ -3591,6 +4094,9 @@ static bool gl_renderer_new(gl_renderer *renderer, gl_draw_config config)
          renderer->fb_out.width,
          renderer->fb_out.height,
          GL_DEPTH24_STENCIL8);
+
+   gl_native_target_init(renderer,
+         gl_native_target_wanted(upscaling, texture_storage));
 
    renderer->filter_type = filter;
    renderer->command_buffer = command_buffer;
@@ -3641,6 +4147,8 @@ static bool gl_renderer_new(gl_renderer *renderer, gl_draw_config config)
    glGenFramebuffers(1, &renderer->tt_draw_fbo);
    glGenFramebuffers(1, &renderer->vram_sync_read_fbo);
    glGenFramebuffers(1, &renderer->vram_sync_draw_fbo);
+   glGenFramebuffers(1, &renderer->copy_read_fbo);
+   glGenFramebuffers(1, &renderer->copy_draw_fbo);
    {
       TTGpuBackend vt = gl_tt_make_backend(renderer);
       renderer->tracker = texture_tracker_new(&vt, NULL);
@@ -4545,6 +5053,11 @@ static void gl_renderer_free(gl_renderer *renderer)
    renderer->fb_out_depth.width  = 0;
    renderer->fb_out_depth.height = 0;
 
+   gl_native_target_free(renderer);
+   renderer->native_target_enabled = false;
+
+   gl_stats_free(renderer);
+
    /* Shared HD texture replacement/tracking teardown. The tracker
     * releases every TTGpuImage it holds through the GL backend, so this
     * must run while the context is still current (it is: we're called
@@ -4564,6 +5077,32 @@ static void gl_renderer_free(gl_renderer *renderer)
    renderer->vram_sync_read_fbo = 0;
    renderer->vram_sync_draw_fbo = 0;
 
+   if (renderer->copy_read_fbo)
+      glDeleteFramebuffers(1, &renderer->copy_read_fbo);
+   if (renderer->copy_draw_fbo)
+      glDeleteFramebuffers(1, &renderer->copy_draw_fbo);
+   renderer->copy_read_fbo = 0;
+   renderer->copy_draw_fbo = 0;
+
+   {
+      unsigned s;
+      for (s = 0; s < 2; s++)
+      {
+         if (renderer->fb_copy_scratch[s].id)
+            glDeleteTextures(1, &renderer->fb_copy_scratch[s].id);
+         renderer->fb_copy_scratch[s].id     = 0;
+         renderer->fb_copy_scratch[s].width  = 0;
+         renderer->fb_copy_scratch[s].height = 0;
+      }
+   }
+
+   if (renderer->vram_copy_buffer)
+   {
+      gl_draw_buffer_free(renderer->vram_copy_buffer);
+      free(renderer->vram_copy_buffer);
+   }
+   renderer->vram_copy_buffer = NULL;
+
    {
       unsigned i;
       for (i = 0; i < INDEX_BUFFER_LEN; i++)
@@ -4571,13 +5110,16 @@ static void gl_renderer_free(gl_renderer *renderer)
    }
 }
 
-static INLINE void apply_scissor(gl_renderer *renderer)
+/* Set the scissor to the PS1 draw area scaled by `upscale`.  Split out from
+ * apply_scissor so the native pass can ask for the same rectangle at 1x
+ * without the caller having to lie about internal_upscaling. */
+static INLINE void gl_apply_scissor_scale(gl_renderer *renderer,
+      GLsizei upscale)
 {
    uint16_t _x = renderer->config.draw_area_top_left[0];
    uint16_t _y = renderer->config.draw_area_top_left[1];
    int _w      = renderer->config.draw_area_bot_right[0] - _x;
    int _h      = renderer->config.draw_area_bot_right[1] - _y;
-   GLsizei upscale;
    GLsizei x;
    GLsizei y;
    GLsizei w;
@@ -4589,8 +5131,6 @@ static INLINE void apply_scissor(gl_renderer *renderer)
    if (_h < 0)
       _h = 0;
 
-   upscale = (GLsizei)renderer->internal_upscaling;
-
    /* We need to scale those to match the internal resolution if
     * upscaling is enabled */
    x = (GLsizei) _x * upscale;
@@ -4599,6 +5139,11 @@ static INLINE void apply_scissor(gl_renderer *renderer)
    h = (GLsizei) _h * upscale;
 
    glScissor(x, y, w, h);
+}
+
+static INLINE void apply_scissor(gl_renderer *renderer)
+{
+   gl_apply_scissor_scale(renderer, (GLsizei)renderer->internal_upscaling);
 }
 
 static gl_display_rect compute_gl_display_rect(gl_renderer *renderer)
@@ -4819,9 +5364,10 @@ static bool retro_refresh_variables(gl_renderer *renderer)
          has_software_fb = false;
    }
    else
-      /* If 'BEETLE_OPT(renderer_software_fb)' option is not found, then
-       * we are running in software mode */
-      has_software_fb = true;
+      /* Matches the core option's own default and the initial read in
+       * gl_renderer_new: the CPU rasteriser is a compatibility fallback now
+       * that fb_native keeps native-resolution PS1 VRAM on the GPU. */
+      has_software_fb = false;
 
    get_variables(&upscaling, &display_vram);
 
@@ -4958,24 +5504,53 @@ static bool retro_refresh_variables(gl_renderer *renderer)
       if (renderer->fb_out_fp16)
          texture_storage = GL_RGBA16F;
 
+      /* Retire anything still queued against the outgoing surfaces before
+       * they are deleted.  The upload below flushes the command buffer as
+       * its first act, which would otherwise rasterise a batch built for the
+       * old scale into the newly created fb_out. */
+      if (!gl_draw_buffer_is_empty(renderer->command_buffer))
+         gl_renderer_draw(renderer);
+
       glDeleteTextures(1, &renderer->fb_out.id);
       renderer->fb_out.id     = 0;
       renderer->fb_out.width  = 0;
       renderer->fb_out.height = 0;
+      renderer->fb_out_format = texture_storage;
       gl_texture_init(&renderer->fb_out, w, h, texture_storage);
-
-      /* This is a bit wasteful since it'll re-upload the data
-       * to 'fb_texture' even though we haven't touched it but
-       * this code is not very performance-critical anyway. */
-
-      if (renderer)
-         gl_renderer_upload_textures(renderer, top_left, dimensions, GPU_get_vram());
 
       glDeleteTextures(1, &renderer->fb_out_depth.id);
       renderer->fb_out_depth.id     = 0;
       renderer->fb_out_depth.width  = 0;
       renderer->fb_out_depth.height = 0;
       gl_texture_init(&renderer->fb_out_depth, w, h, GL_DEPTH24_STENCIL8);
+
+      /* The fb_out staging texture tracks its format and scale; drop it so
+       * the next copy re-creates it to match. */
+      if (renderer->fb_copy_scratch[0].id)
+         glDeleteTextures(1, &renderer->fb_copy_scratch[0].id);
+      renderer->fb_copy_scratch[0].id     = 0;
+      renderer->fb_copy_scratch[0].width  = 0;
+      renderer->fb_copy_scratch[0].height = 0;
+
+      /* fb_native's own size never changes, but whether it is wanted does:
+       * dropping back to 1x at 16bpp makes fb_out native again and retires
+       * it. */
+      gl_native_target_init(renderer,
+            gl_native_target_wanted(upscaling, texture_storage));
+
+      /* From here on the new geometry is what the draw paths must scale to.
+       * The assignment further down is then a no-op. */
+      renderer->internal_upscaling = upscaling;
+
+      /* This is a bit wasteful since it'll re-upload the data
+       * to 'fb_texture' even though we haven't touched it but
+       * this code is not very performance-critical anyway.
+       *
+       * Ordered after every surface has been (re)created so the upload seeds
+       * fb_out and fb_native together; gl_native_target_init clears the
+       * mirror, so an upload before it would be thrown away. */
+      if (renderer)
+         gl_renderer_upload_textures(renderer, top_left, dimensions, GPU_get_vram());
    }
 
    if (renderer->command_buffer->program)
@@ -4984,6 +5559,7 @@ static bool retro_refresh_variables(gl_renderer *renderer)
       uint32_t native_rgb5 = depth == 16 && !renderer->fb_out_fp16;
       uint32_t fixed_point_modulation = !psx_pgxp_color;
 
+      renderer->dither_scaling = dither_scaling;
       glUseProgram(renderer->command_buffer->program->id);
       glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "dither_scaling"), dither_scaling);
       glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms,
@@ -5499,6 +6075,9 @@ static void gl_caps_init(void)
    static const char *const blit_framebuffer_suffixes[] = {
       "EXT", "NV", "ANGLE", NULL
    };
+   static const char *const timer_query_suffixes[] = {
+      "EXT", "ARB", NULL
+   };
 
    retro_get_proc_address_t get_proc = NULL;
    const GLubyte *gl_version_str;
@@ -5564,6 +6143,33 @@ static void gl_caps_init(void)
       gl_caps.fp_glBlitFramebuffer =
          (PFN_BEETLE_GL_BLITFRAMEBUFFER)gl_caps_resolve(
             get_proc, "glBlitFramebuffer", blit_framebuffer_suffixes);
+
+      gl_caps.fp_glGenQueries =
+         (PFN_BEETLE_GL_GENQUERIES)gl_caps_resolve(
+            get_proc, "glGenQueries", timer_query_suffixes);
+      gl_caps.fp_glDeleteQueries =
+         (PFN_BEETLE_GL_DELETEQUERIES)gl_caps_resolve(
+            get_proc, "glDeleteQueries", timer_query_suffixes);
+      gl_caps.fp_glBeginQuery =
+         (PFN_BEETLE_GL_BEGINQUERY)gl_caps_resolve(
+            get_proc, "glBeginQuery", timer_query_suffixes);
+      gl_caps.fp_glEndQuery =
+         (PFN_BEETLE_GL_ENDQUERY)gl_caps_resolve(
+            get_proc, "glEndQuery", timer_query_suffixes);
+      gl_caps.fp_glGetQueryObjectuiv =
+         (PFN_BEETLE_GL_GETQUERYOBJECTUIV)gl_caps_resolve(
+            get_proc, "glGetQueryObjectuiv", timer_query_suffixes);
+      gl_caps.fp_glGetQueryObjectui64v =
+         (PFN_BEETLE_GL_GETQUERYOBJECTUI64V)gl_caps_resolve(
+            get_proc, "glGetQueryObjectui64v", timer_query_suffixes);
+
+      gl_caps.has_timer_query =
+            gl_caps.fp_glGenQueries          != NULL
+         && gl_caps.fp_glDeleteQueries       != NULL
+         && gl_caps.fp_glBeginQuery          != NULL
+         && gl_caps.fp_glEndQuery            != NULL
+         && gl_caps.fp_glGetQueryObjectuiv   != NULL
+         && gl_caps.fp_glGetQueryObjectui64v != NULL;
 
       gl_caps.fp_glCopyImageSubData =
          (PFN_BEETLE_GL_COPYIMAGESUBDATA)gl_caps_resolve(
@@ -5923,6 +6529,28 @@ static void gl_context_destroy(void)
 
    if (static_renderer.state_data)
    {
+      /* The frontend is about to take the GL context away - an Android
+       * surface loss, a window recreation, a driver reset - and every GL
+       * object goes with it, fb_native included.  Nothing rebuilds those
+       * pixels afterwards: the next gl_context_reset re-uploads VRAM from
+       * GPU.vram (GPU_RestoreStateP3), and without the software framebuffer
+       * that mirror is only coherent where the game happened to issue an
+       * FBRead.  Everything the GPU rendered and the guest never read back
+       * would return as whatever the CPU copy last held - which is what a
+       * backgrounded-and-resumed session looks like today.
+       *
+       * Pull the whole framebuffer down before the teardown so the restore
+       * has real pixels to upload.  A full-VRAM read-back is exactly the
+       * thing this renderer works to avoid, but here it is paid once per
+       * context loss rather than per frame, and the alternative is a corrupt
+       * framebuffer for the rest of the session.  libretro calls
+       * context_destroy while the context is still current, so the read is
+       * legal at this point; if the journal owner check refuses it,
+       * rhi_gl_read_vram returns false and we are no worse off than before. */
+      if (!rhi_gl_has_software_renderer())
+         (void)rhi_gl_read_vram(0, 0, VRAM_WIDTH_PIXELS, VRAM_HEIGHT,
+               GPU_get_vram());
+
       gl_renderer_free(static_renderer.state_data);
       free(static_renderer.state_data);
    }
@@ -6542,11 +7170,17 @@ void rhi_gl_finalize_frame(const void *fb, unsigned width,
       }
    }
 
-   /* TODO - Hack: copy fb_out back into fb_texture at the end of every
-    * frame to make offscreen rendering kinda sorta work. Very messy
-    * and slow. */
+   /* Copy this frame's VRAM back into fb_texture so the next frame's
+    * textured draws can sample it: offscreen rendering, motion blur and
+    * every other framebuffer-as-texture effect depend on it.
+    *
+    * The source is fb_native when it is live - a 1:1 copy of a PS1-resolution
+    * rendering - and fb_out otherwise, in which case the shader point-samples
+    * one texel out of each upscale x upscale block. */
    {
       gl_framebuffer _fb;
+      bool mirror_native = renderer->native_target_enabled
+            && renderer->fb_native.id != 0;
       gl_image_load_vertex slice[4] =
       {
          {   {   0,   0   }   },
@@ -6554,6 +7188,14 @@ void rhi_gl_finalize_frame(const void *fb, unsigned width,
          {   {   0, 511   }   },
          {   {1023, 511   }   },
       };
+
+      /* Texture unit 1 still holds fb_out from the output draw above. */
+      if (mirror_native)
+      {
+         glActiveTexture(GL_TEXTURE1);
+         glBindTexture(GL_TEXTURE_2D, renderer->fb_native.id);
+         glActiveTexture(GL_TEXTURE0);
+      }
 
       if (renderer->image_load_buffer)
       {
@@ -6578,7 +7220,8 @@ void rhi_gl_finalize_frame(const void *fb, unsigned width,
       if (renderer->image_load_buffer->program)
       {
          glUseProgram(renderer->image_load_buffer->program->id);
-         glUniform1ui(gl_uniform_map_get(&renderer->image_load_buffer->program->uniforms, "internal_upscaling"), renderer->internal_upscaling);
+         glUniform1ui(gl_uniform_map_get(&renderer->image_load_buffer->program->uniforms, "internal_upscaling"),
+               mirror_native ? 1u : renderer->internal_upscaling);
       }
 
       if (!gl_draw_buffer_is_empty(renderer->image_load_buffer))
@@ -6590,6 +7233,8 @@ void rhi_gl_finalize_frame(const void *fb, unsigned width,
    /* The unconditional full-VRAM fb_out -> fb_texture copy above makes
     * every tile current for the start of the next frame. */
    gl_vram_sync_clear(renderer);
+
+   gl_stats_report(renderer);
 
    cleanup_gl_state();
 
@@ -7454,12 +8099,40 @@ void rhi_gl_load_image(
    gl_framebuffer_init(&_fb, &renderer->fb_out);
 
    if (!gl_draw_buffer_is_empty(renderer->image_load_buffer))
-      gl_draw_buffer_draw(renderer->image_load_buffer, GL_TRIANGLE_STRIP);
+   {
+      gl_draw_buffer_draw_begin(renderer->image_load_buffer,
+            GL_TRIANGLE_STRIP);
+
+      /* A CPU-to-VRAM transfer is guest-visible VRAM state, so it has to
+       * land in the native mirror too, or the next read-back would report
+       * whatever fb_native held before the upload.  The quad is the same:
+       * the vertex shader works in PS1 coordinates and internal_upscaling
+       * was already pinned to 1 above because fb_texture, the source, is
+       * always native. */
+      if (renderer->native_target_enabled && renderer->fb_native.id)
+      {
+         gl_framebuffer nfb;
+
+         gl_framebuffer_init(&nfb, &renderer->fb_native);
+         gl_draw_buffer_draw_again(renderer->image_load_buffer,
+               GL_TRIANGLE_STRIP);
+         glDeleteFramebuffers(1, &nfb.id);
+
+         /* Put the binding and viewport back where the fb_out draw left
+          * them; the delete below assumes _fb is still the bound target. */
+         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, _fb.id);
+         glViewport(0, 0,
+               (GLsizei)renderer->fb_out.width,
+               (GLsizei)renderer->fb_out.height);
+      }
+
+      gl_draw_buffer_draw_end(renderer->image_load_buffer);
+   }
 
    if (scissor_was_enabled)
       glEnable(GL_SCISSOR_TEST);
 
-   /* The CPU upload is applied to both fb_texture and fb_out. */
+   /* The CPU upload is applied to fb_texture, fb_out and fb_native. */
    gl_vram_sync_clean_rect(renderer, x, y, w, h);
    gl_vram_sync_update_gpu_written_rect(renderer, x, y, w, h, false);
 
@@ -7489,6 +8162,68 @@ void rhi_gl_load_image(
          free(again);
       }
    }
+}
+
+/* The GL transfer type whose uint16 layout is what the rest of this file
+ * expects back from a 5/5/5/1 read. */
+#ifdef HAVE_OPENGLES3
+#define GL_PS1_PACKED_1555 GL_UNSIGNED_SHORT_5_5_5_1
+#else
+#define GL_PS1_PACKED_1555 GL_UNSIGNED_SHORT_1_5_5_5_REV
+#endif
+
+/* Read a rectangle out of the bound read framebuffer as PS1 5/5/5/1.
+ *
+ * glReadPixels guarantees exactly two format/type pairs: GL_RGBA with
+ * GL_UNSIGNED_BYTE, and whatever GL_IMPLEMENTATION_COLOR_READ_FORMAT and
+ * GL_IMPLEMENTATION_COLOR_READ_TYPE report for the framebuffer that is bound
+ * right now.  The packed 1555 pair is neither - it is merely what most
+ * drivers happen to offer for an RGB5_A1 attachment.  One that does not
+ * raises GL_INVALID_OPERATION; the caller sees the read fail, keeps the
+ * previous contents, and FBRead then returns stale VRAM for the rest of the
+ * session.  That is a silent wrong-pixels failure confined to whichever
+ * mobile driver declines the pair, which is the worst way to find out.
+ *
+ * So ask first, and keep the always-legal RGBA8 read in reserve.  Expanding
+ * 5-bit channels to 8 and back is exact, so the fallback costs bandwidth and
+ * a conversion pass, not accuracy.  When the query itself is unavailable (it
+ * needs GL 4.1 or ARB_ES2_compatibility on desktop) the packed read is still
+ * attempted rather than assumed broken, so no driver that works today is
+ * pushed onto the slower path.
+ *
+ * Returns 0 on failure, 1 when scratch_pixels holds packed 1555, and 2 when
+ * *scratch_rgba8 holds RGBA8 that the caller still has to convert. */
+static int gl_readback_1555(GLint x, GLint y, GLsizei w, GLsizei h,
+      uint16_t *scratch_pixels, uint32_t **scratch_rgba8)
+{
+   GLint fmt       = 0;
+   GLint type      = 0;
+   bool  query_ok;
+   bool  advertised;
+
+   while (glGetError() != GL_NO_ERROR)
+      ;
+
+   glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &fmt);
+   glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &type);
+   query_ok   = (glGetError() == GL_NO_ERROR) && type != 0;
+   advertised = (fmt == GL_RGBA && type == (GLint)GL_PS1_PACKED_1555);
+
+   if (advertised || !query_ok)
+   {
+      glReadPixels(x, y, w, h, GL_RGBA, GL_PS1_PACKED_1555, scratch_pixels);
+      if (glGetError() == GL_NO_ERROR)
+         return 1;
+   }
+
+   if (!*scratch_rgba8)
+      *scratch_rgba8 = (uint32_t *)malloc(
+            (size_t)w * (size_t)h * sizeof(uint32_t));
+   if (!*scratch_rgba8)
+      return 0;
+
+   glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, *scratch_rgba8);
+   return glGetError() == GL_NO_ERROR ? 2 : 0;
 }
 
 /* GP0 0xC0 (FBRead / Image Store): VRAM-to-CPU transfer.  The PS1
@@ -7552,6 +8287,12 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
    uint32_t *scratch_rgba8  = NULL;
    float    *scratch_f      = NULL;
    size_t   row;
+   bool     read_native;
+   GLuint   src_tex;
+   /* Set when the 16bpp read had to fall back to RGBA8: the packed-1555
+    * transfer pair is not one glReadPixels is required to accept.  The
+    * caller-side conversion is then the same one the 32bpp target uses. */
+   bool     from_rgba8 = false;
 
    /* A read-back has to see the recorded drawing, so replay it first.  Only
     * reachable from the emulation thread: threaded GL requires the software
@@ -7571,13 +8312,33 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
    if (vram == NULL)
       return false;
 
-   /* Wrap-around FBReads aren't supported here. */
-   if ((unsigned)x + (unsigned)w > VRAM_WIDTH_PIXELS)
-      return false;
-   if ((unsigned)y + (unsigned)h > VRAM_HEIGHT)
+   x &= VRAM_WIDTH_PIXELS - 1;
+   y &= VRAM_HEIGHT - 1;
+   if (w > VRAM_WIDTH_PIXELS || h > VRAM_HEIGHT)
       return false;
    if (w == 0 || h == 0)
       return true;
+   /* PS1 transfer coordinates wrap independently in both dimensions. Split
+    * into non-wrapping rectangles; each read writes back at native VRAM
+    * coordinates, which is where the emulated transfer FIFO reads it. */
+   if ((unsigned)x + w > VRAM_WIDTH_PIXELS ||
+       (unsigned)y + h > VRAM_HEIGHT)
+   {
+      uint16_t first_w = w < VRAM_WIDTH_PIXELS - x ? w : VRAM_WIDTH_PIXELS - x;
+      uint16_t first_h = h < VRAM_HEIGHT - y ? h : VRAM_HEIGHT - y;
+      if (!rhi_gl_read_vram(x, y, first_w, first_h, vram))
+         return false;
+      if (w > first_w &&
+          !rhi_gl_read_vram(0, y, w - first_w, first_h, vram))
+         return false;
+      if (h > first_h &&
+          !rhi_gl_read_vram(x, 0, first_w, h - first_h, vram))
+         return false;
+      if (w > first_w && h > first_h &&
+          !rhi_gl_read_vram(0, 0, w - first_w, h - first_h, vram))
+         return false;
+      return true;
+   }
 
    diag_full_read = GL_DIAG_ON() && !gl_diag_nested &&
          x == 0 && y == 0 && w == VRAM_WIDTH_PIXELS && h == VRAM_HEIGHT;
@@ -7602,6 +8363,24 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
    upscale  = renderer->internal_upscaling;
    if (upscale == 0)
       upscale = 1;
+
+   /* Prefer the native mirror.  It is PS1-sized and GL_RGB5_A1 whatever the
+    * upscale factor and Internal Color Depth option are set to, so the guest
+    * gets the same pixels at 8x as at 1x, the blit-down scratch below is not
+    * needed, and neither is the 32bpp/fp16 requantisation - the render target
+    * already carries exactly the 5/5/5/1 the PS1 defines.  fb_out remains the
+    * source when the mirror is off (1x, or the software framebuffer on), where
+    * it is either native already or nobody is reading this back. */
+   read_native = renderer->native_target_enabled
+         && renderer->fb_native.id != 0;
+   src_tex     = read_native ? renderer->fb_native.id : renderer->fb_out.id;
+   if (read_native)
+   {
+      is_32bpp = false;
+      is_fp16  = false;
+      upscale  = 1;
+   }
+
    if (upscale > 1 && !gl_caps.fp_glBlitFramebuffer)
       return false;
 
@@ -7677,10 +8456,10 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
 #ifdef HAVE_OPENGLES3
       glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
             GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-            renderer->fb_out.id, 0);
+            src_tex, 0);
 #else
       glFramebufferTexture(GL_READ_FRAMEBUFFER,
-            GL_COLOR_ATTACHMENT0, renderer->fb_out.id, 0);
+            GL_COLOR_ATTACHMENT0, src_tex, 0);
 #endif
       glReadBuffer(GL_COLOR_ATTACHMENT0);
 
@@ -7706,16 +8485,11 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
          }
          else
          {
-            glReadPixels(
-                  (GLint) x, gl_y,
-                  (GLsizei) w, (GLsizei) h,
-                  GL_RGBA,
-#ifdef HAVE_OPENGLES3
-                  GL_UNSIGNED_SHORT_5_5_5_1,
-#else
-                  GL_UNSIGNED_SHORT_1_5_5_5_REV,
-#endif
-                  scratch_pixels);
+            int mode = gl_readback_1555((GLint) x, gl_y,
+                  (GLsizei) w, (GLsizei) h, scratch_pixels, &scratch_rgba8);
+            from_rgba8 = (mode == 2);
+            if (!mode)
+               goto cleanup;
          }
          ok = (glGetError() == GL_NO_ERROR);
       }
@@ -7747,10 +8521,10 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
 #ifdef HAVE_OPENGLES3
       glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
             GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-            renderer->fb_out.id, 0);
+            src_tex, 0);
 #else
       glFramebufferTexture(GL_READ_FRAMEBUFFER,
-            GL_COLOR_ATTACHMENT0, renderer->fb_out.id, 0);
+            GL_COLOR_ATTACHMENT0, src_tex, 0);
 #endif
       glReadBuffer(GL_COLOR_ATTACHMENT0);
 
@@ -7805,32 +8579,24 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
          }
          else
          {
-            glReadPixels(
-                  0, 0,
-                  (GLsizei) w, (GLsizei) h,
-                  GL_RGBA,
-#ifdef HAVE_OPENGLES3
-                  GL_UNSIGNED_SHORT_5_5_5_1,
-#else
-                  GL_UNSIGNED_SHORT_1_5_5_5_REV,
-#endif
-                  scratch_pixels);
+            int mode = gl_readback_1555(0, 0,
+                  (GLsizei) w, (GLsizei) h, scratch_pixels, &scratch_rgba8);
+            from_rgba8 = (mode == 2);
+            if (!mode)
+               goto cleanup;
          }
          ok = (glGetError() == GL_NO_ERROR);
       }
    }
 
-   /* In 32bpp mode, downsample RGBA8 scratch -> 1555 scratch.  PS1
+   /* In 32bpp mode, convert RGBA8 scratch -> PS1 ABGR1555 scratch. PS1
     * VRAM is 16bpp natively so the extra precision the 32bpp render
     * target captured is unavoidably lost here; any FBRead consumer
     * is operating in 16bpp anyway.
     *
-    * The 1555 layout is platform-specific, matching the rest of the
-    * codebase:
-    *   Desktop (GL_UNSIGNED_SHORT_1_5_5_5_REV): (a<<15)|(b<<10)|(g<<5)|r
-    *   GLES3   (GL_UNSIGNED_SHORT_5_5_5_1):     (r<<11)|(g<<6)|(b<<1)|a
-    * which are the same packings the command_fragment shader
-    * `rebuild_psx_color` produces. */
+    * The CPU-visible layout is identical on every backend: bit 15 is the
+    * mask, then B/G/R in bits 10/5/0. GLES RGBA5551 is a GL transfer format,
+    * never the layout of GPU.vram or serialized PS1 VRAM. */
    /* fp16 mode: quantise the float readback to 1555 in C, exactly what
     * the driver conversion was asked to do before: clamp to [0,1],
     * round each channel to 5 bits, alpha thresholds at half. Identical
@@ -7847,17 +8613,12 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
          uint32_t g5 = gf <= 0.0f ? 0u : gf >= 1.0f ? 31u : (uint32_t)(gf * 31.0f + 0.5f);
          uint32_t b5 = bf <= 0.0f ? 0u : bf >= 1.0f ? 31u : (uint32_t)(bf * 31.0f + 0.5f);
          uint32_t a1 = (af >= 0.5f) ? 1u : 0u;
-#ifdef HAVE_OPENGLES3
-         scratch_pixels[k] = (uint16_t)(
-               (r5 << 11) | (g5 << 6) | (b5 << 1) | a1);
-#else
          scratch_pixels[k] = (uint16_t)(
                (a1 << 15) | (b5 << 10) | (g5 << 5) | r5);
-#endif
       }
    }
 
-   if (ok && is_32bpp)
+   if (ok && (is_32bpp || from_rgba8))
    {
       size_t n = (size_t)w * (size_t)h;
       size_t k;
@@ -7885,15 +8646,29 @@ bool rhi_gl_read_vram(uint16_t x, uint16_t y,
          uint32_t g5 = (g8 * 31u + 127u) / 255u;
          uint32_t b5 = (b8 * 31u + 127u) / 255u;
          uint32_t a1 = (a8 >= 128u) ? 1u : 0u;
-#ifdef HAVE_OPENGLES3
-         scratch_pixels[k] = (uint16_t)(
-               (r5 << 11) | (g5 << 6) | (b5 << 1) | a1);
-#else
          scratch_pixels[k] = (uint16_t)(
                (a1 << 15) | (b5 << 10) | (g5 << 5) | r5);
-#endif
       }
    }
+
+#ifdef HAVE_OPENGLES3
+   /* Only the packed read lands in GLES RGBA5551 order; the RGBA8 fallback
+    * was converted straight to the PS1 layout above. */
+   if (ok && !is_fp16 && !is_32bpp && !from_rgba8)
+   {
+      size_t n = (size_t)w * (size_t)h;
+      size_t k;
+      for (k = 0; k < n; k++)
+      {
+         uint16_t rgba5551 = scratch_pixels[k];
+         scratch_pixels[k] = (uint16_t)(
+               ((rgba5551 & 1u) << 15) |
+               (((rgba5551 >> 1) & 31u) << 10) |
+               (((rgba5551 >> 6) & 31u) << 5) |
+               ((rgba5551 >> 11) & 31u));
+      }
+   }
+#endif
 
    if (ok)
    {
@@ -8031,12 +8806,15 @@ cleanup:
  *     mode. (The codebase's GL caps floor is GL/GLES 3.0 anyway, so
  *     this branch is taken in practice.)
  *
- * fb_texture is permanently 1x: the blit downsamples upscaled detail
- * to native resolution. That is a fundamental consequence of the
- * dual-surface architecture, not a defect of the mirror.
+ * fb_texture is permanently 1x.  When fb_native is live the blit is a
+ * 1:1 copy of a surface that was rasterised at PS1 resolution, which is
+ * what a texture fetch of that VRAM region should see.  Without it the
+ * source is fb_out and the blit decimates upscaled detail to native - a
+ * consequence of the dual-surface architecture rather than a defect of
+ * the mirror, but a lossy one, and the reason fb_native exists.
  *
  * Args are PS1 native coords for the destination rect; the source rect
- * in fb_out is the same rect scaled by internal_upscaling. */
+ * is the same rect scaled by the source surface's own factor. */
 static void gl_mirror_fb_out_to_fb_texture(gl_renderer *renderer,
                                            uint16_t x, uint16_t y,
                                            uint16_t w, uint16_t h,
@@ -8048,12 +8826,16 @@ static void gl_mirror_fb_out_to_fb_texture(gl_renderer *renderer,
    GLint     uw;
    GLint     uh;
    uint32_t  upscale;
+   bool      native;
+   GLuint    src;
 
    if ((!allow_with_software_fb && has_software_fb) ||
        !gl_caps.fp_glBlitFramebuffer)
       return;
 
-   upscale = renderer->internal_upscaling;
+   native  = renderer->native_target_enabled && renderer->fb_native.id != 0;
+   src     = native ? renderer->fb_native.id : renderer->fb_out.id;
+   upscale = native ? 1u : renderer->internal_upscaling;
    ux      = (GLint) x * (GLint) upscale;
    uy      = (GLint) y * (GLint) upscale;
    uw      = (GLint) w * (GLint) upscale;
@@ -8061,18 +8843,18 @@ static void gl_mirror_fb_out_to_fb_texture(gl_renderer *renderer,
 
    scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
 
-   /* Read source: fb_out at upscaled coords. */
+   /* Read source: the native mirror 1:1, or fb_out at upscaled coords. */
    glBindFramebuffer(GL_READ_FRAMEBUFFER, renderer->vram_sync_read_fbo);
 #ifdef HAVE_OPENGLES3
    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
          GL_COLOR_ATTACHMENT0,
          GL_TEXTURE_2D,
-         renderer->fb_out.id,
+         src,
          0);
 #else
    glFramebufferTexture(GL_READ_FRAMEBUFFER,
          GL_COLOR_ATTACHMENT0,
-         renderer->fb_out.id,
+         src,
          0);
 #endif
    glReadBuffer(GL_COLOR_ATTACHMENT0);
@@ -8103,9 +8885,27 @@ static void gl_mirror_fb_out_to_fb_texture(gl_renderer *renderer,
          GL_COLOR_BUFFER_BIT,
          GL_NEAREST);
 
-   /* Some drivers do not make dependency-driven framebuffer mirrors visible
-    * to the following texture fetch without explicit completion. */
-   if (allow_with_software_fb)
+   /* No glFinish here.
+    *
+    * This used to end with one, on the theory that a dependency-driven mirror
+    * would not be visible to the texture fetch that follows it.  Within a
+    * single context that theory is wrong: GL commands are an ordered stream
+    * and a later command observes the results of earlier ones, so the
+    * blit-then-sample sequence is the driver's dependency to schedule, not
+    * ours to enforce.  What glFinish actually did was block the CPU until the
+    * entire GPU went idle, in the middle of a frame - and on a tiler that
+    * also forces a tile resolve and the memory traffic that comes with it.
+    * It was the single worst stall left in the GL path once fb_native
+    * removed the CPU-coherence read-backs.
+    *
+    * A fence would be the same mistake wearing a better hat: the point is not
+    * to wait more cheaply, it is not to wait.
+    *
+    * If a specific driver turns out to genuinely need the barrier, it is a
+    * driver quirk and not the architecture: set BEETLE_GL_MIRROR_FINISH=1 to
+    * put it back without a rebuild, and please record which driver needed
+    * it. */
+   if (gl_mirror_finish_quirk())
       glFinish();
 
    if (scissor_was_enabled)
@@ -8181,34 +8981,63 @@ void rhi_gl_fill_rect(
 
    /* This scope is intentional, just like in the Rust version */
    {
-      /* Bind the out framebuffer */
-      gl_framebuffer _fb;
-      gl_framebuffer_init(&_fb, &renderer->fb_out);
+      /* Fill both live targets: fb_out for display, fb_native for the
+       * guest-visible copy.  glClear honours the scissor, which the block
+       * above set to the fill rectangle, so the native pass only has to
+       * re-scale that rectangle to 1x. */
+      bool native = renderer->native_target_enabled
+            && renderer->fb_native.id != 0;
+      unsigned passes = native ? 2u : 1u;
+      unsigned pass;
+
+      for (pass = 0; pass < passes; pass++)
+      {
+         gl_framebuffer _fb;
+         bool        is_native = (pass == 1);
+         gl_texture *color     = is_native ? &renderer->fb_native
+                                           : &renderer->fb_out;
+         gl_texture *depth     = is_native ? &renderer->fb_native_depth
+                                           : &renderer->fb_out_depth;
+
+         gl_framebuffer_init(&_fb, color);
 
 #ifdef HAVE_OPENGLES3
-      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,
-            GL_DEPTH_STENCIL_ATTACHMENT,
-            GL_TEXTURE_2D,
-            renderer->fb_out_depth.id,
-            0);
+         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,
+               GL_DEPTH_STENCIL_ATTACHMENT,
+               GL_TEXTURE_2D,
+               depth->id,
+               0);
 #else
-      glFramebufferTexture(GL_DRAW_FRAMEBUFFER,
-            GL_DEPTH_STENCIL_ATTACHMENT,
-            renderer->fb_out_depth.id,
-            0);
+         glFramebufferTexture(GL_DRAW_FRAMEBUFFER,
+               GL_DEPTH_STENCIL_ATTACHMENT,
+               depth->id,
+               0);
 #endif
 
-      glClearColor(   (float) col[0] / 255.0,
-            (float) col[1] / 255.0,
-            (float) col[2] / 255.0,
-            /* TODO - XXX Not entirely sure what happens to
-               the mask bit in fill_rect commands */
-            0.0);
-      glStencilMask(1);
-      glClearStencil(0);
-      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+         if (is_native)
+            gl_apply_scissor_scale(renderer, 1);
 
-      glDeleteFramebuffers(1, &_fb.id);
+         glClearColor(   (float) col[0] / 255.0,
+               (float) col[1] / 255.0,
+               (float) col[2] / 255.0,
+               /* TODO - XXX Not entirely sure what happens to
+                  the mask bit in fill_rect commands */
+               0.0);
+         glStencilMask(1);
+         glClearStencil(0);
+         glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
+         glDeleteFramebuffers(1, &_fb.id);
+
+         if (is_native)
+         {
+            gl_apply_scissor_scale(renderer,
+                  (GLsizei)renderer->internal_upscaling);
+            glViewport(0, 0,
+                  (GLsizei)renderer->fb_out.width,
+                  (GLsizei)renderer->fb_out.height);
+         }
+      }
    }
 
    /* Reconfigure the draw area */
@@ -8244,23 +9073,348 @@ void rhi_gl_fill_rect(
    gl_vram_sync_update_gpu_written_rect(renderer, x, y, w, h, true);
 }
 
+/* Blit one same-size rectangle between two textures through the persistent
+ * copy FBOs.  Both sides share a format, so GL_NEAREST makes it an exact
+ * move rather than a resample. */
+static void gl_copy_blit(gl_renderer *renderer,
+      GLuint src_tex, GLint sx, GLint sy,
+      GLuint dst_tex, GLint dx, GLint dy,
+      GLsizei w, GLsizei h)
+{
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, renderer->copy_read_fbo);
+#ifdef HAVE_OPENGLES3
+   glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, src_tex, 0);
+#else
+   glFramebufferTexture(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         src_tex, 0);
+#endif
+   glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, renderer->copy_draw_fbo);
+#ifdef HAVE_OPENGLES3
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, dst_tex, 0);
+#else
+   glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         dst_tex, 0);
+#endif
+
+   gl_caps.fp_glBlitFramebuffer(sx, sy, sx + w, sy + h,
+         dx, dy, dx + w, dy + h,
+         GL_COLOR_BUFFER_BIT, GL_NEAREST);
+}
+
+/* Make sure the copy staging texture is at least w x h in `fmt`.  It only
+ * ever grows, so a run of copies settles on one allocation instead of
+ * reallocating per call. */
+static bool gl_copy_scratch_ensure(gl_renderer *renderer, unsigned slot,
+      GLsizei w, GLsizei h, GLenum fmt)
+{
+   gl_texture *tex    = &renderer->fb_copy_scratch[slot];
+   GLsizei     want_w = w;
+   GLsizei     want_h = h;
+
+   if (tex->id
+         && renderer->fb_copy_scratch_format[slot] == fmt
+         && (GLsizei)tex->width  >= w
+         && (GLsizei)tex->height >= h)
+      return true;
+
+   if (tex->id)
+   {
+      if (renderer->fb_copy_scratch_format[slot] == fmt)
+      {
+         if ((GLsizei)tex->width > want_w)
+            want_w = (GLsizei)tex->width;
+         if ((GLsizei)tex->height > want_h)
+            want_h = (GLsizei)tex->height;
+      }
+      /* glTexStorage2D is immutable: resizing means a new object. */
+      glDeleteTextures(1, &tex->id);
+      tex->id = 0;
+   }
+
+   gl_texture_init(tex, (uint32_t)want_w, (uint32_t)want_h, fmt);
+   renderer->fb_copy_scratch_format[slot] = fmt;
+
+   return tex->id != 0;
+}
+
+/* Build the mask-aware copy program on first use.  Most games never issue a
+ * mask-tested VRAM copy, and overlap on its own is handled by two blits, so
+ * this usually never runs. */
+static bool gl_vram_copy_program_ready(gl_renderer *renderer)
+{
+   size_t n_attrs                  = 0;
+   const struct gl_attribute *attrs;
+
+   if (renderer->vram_copy_buffer)
+      return true;
+   if (renderer->vram_copy_build_failed)
+      return false;
+
+   attrs = gl_image_load_vertex_attributes(&n_attrs);
+   renderer->vram_copy_buffer = gl_draw_buffer_build(
+         image_load_vertex, vram_copy_fragment, 4,
+         sizeof(gl_image_load_vertex), attrs, n_attrs);
+
+   if (!renderer->vram_copy_buffer)
+   {
+      renderer->vram_copy_build_failed = true;
+      log_cb(RETRO_LOG_WARN,
+            "[rhi_gl_copy_rect] VRAM copy program failed to build; "
+            "mask-tested copies will ignore the mask test\n");
+      return false;
+   }
+
+   return true;
+}
+
+/* GP0(80h) VRAM-to-VRAM copy, applied to one surface.
+ *
+ * Three things the copy this replaces did not do:
+ *
+ *  - Overlapping rectangles.  glCopyImageSubData is explicitly undefined when
+ *    the source and destination regions of the same image overlap, and the
+ *    glCopyTexSubImage2D fallback reads and writes one texture through a
+ *    single binding, which is no better defined.  Games do overlap them -
+ *    scrolling a region over itself is the ordinary way to do it - so the
+ *    result was whatever the driver felt like.  Stage through a scratch
+ *    texture whenever the rectangles meet.
+ *
+ *  - The mask bit.  The command honours both mask settings: with mask_test,
+ *    a destination pixel whose bit 15 is set is preserved; with set_mask,
+ *    every written pixel gets bit 15 forced on.  An image copy cannot consult
+ *    the destination at all, so a mask-tested copy is issued as a quad
+ *    through vram_copy_fragment instead, which is also where the Vulkan
+ *    backend's blit_vram shader draws the line.
+ *
+ *  - fb_native.  A copy moves guest-visible VRAM, so it has to happen on the
+ *    native mirror too or the next read-back reports pre-copy pixels.
+ *
+ * A rectangle that runs off the edge of VRAM still is not split into its
+ * wrapped parts - that limitation is unchanged - but it is now routed through
+ * staging rather than copied in place, so it can no longer be undefined on
+ * top of being clipped. */
+static void gl_copy_rect_surface(gl_renderer *renderer,
+      gl_texture *color, gl_texture *depth, uint32_t upscale,
+      uint16_t src_x, uint16_t src_y,
+      uint16_t dst_x, uint16_t dst_y,
+      uint16_t w, uint16_t h,
+      bool mask_test, bool set_mask)
+{
+   GLint     sx  = (GLint)src_x * (GLint)upscale;
+   GLint     sy  = (GLint)src_y * (GLint)upscale;
+   GLint     dx  = (GLint)dst_x * (GLint)upscale;
+   GLint     dy  = (GLint)dst_y * (GLint)upscale;
+   GLsizei   cw  = (GLsizei)w * (GLsizei)upscale;
+   GLsizei   ch  = (GLsizei)h * (GLsizei)upscale;
+   bool      is_native = (color == &renderer->fb_native);
+   unsigned  slot      = is_native ? 1u : 0u;
+   GLenum    fmt       = is_native
+         ? (GLenum)GL_RGB5_A1 : renderer->fb_out_format;
+   gl_texture *scratch = &renderer->fb_copy_scratch[slot];
+   GLboolean scissor_was_enabled;
+   bool      wraps;
+   bool      overlap;
+   bool      staged;
+
+   if (!cw || !ch || !color->id)
+      return;
+
+   if (mask_test && !gl_vram_copy_program_ready(renderer))
+      mask_test = false;
+
+   wraps   = (unsigned)src_x + w > VRAM_WIDTH_PIXELS
+          || (unsigned)src_y + h > VRAM_HEIGHT
+          || (unsigned)dst_x + w > VRAM_WIDTH_PIXELS
+          || (unsigned)dst_y + h > VRAM_HEIGHT;
+   overlap = wraps
+          || ((unsigned)src_x < (unsigned)dst_x + w
+           && (unsigned)dst_x < (unsigned)src_x + w
+           && (unsigned)src_y < (unsigned)dst_y + h
+           && (unsigned)dst_y < (unsigned)src_y + h);
+   staged  = mask_test || overlap;
+
+   if (staged
+         && (!gl_caps.fp_glBlitFramebuffer
+            || !gl_copy_scratch_ensure(renderer, slot,
+                  mask_test ? cw * 2 : cw, ch, fmt)))
+   {
+      /* No way to stage: fall back to the in-place copy rather than dropping
+       * the command outright. */
+      staged    = false;
+      mask_test = false;
+   }
+
+   scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+   if (scissor_was_enabled)
+      glDisable(GL_SCISSOR_TEST);
+
+   if (staged)
+   {
+      /* Source at the scratch origin; for a mask test the destination goes
+       * directly to its right, where the shader expects to find it. */
+      gl_copy_blit(renderer, color->id, sx, sy,
+            scratch->id, 0, 0, cw, ch);
+      if (mask_test)
+         gl_copy_blit(renderer, color->id, dx, dy,
+               scratch->id, cw, 0, cw, ch);
+   }
+
+   if (mask_test)
+   {
+      gl_framebuffer  fb;
+      gl_draw_buffer *db = renderer->vram_copy_buffer;
+      GLboolean depth_was_enabled = glIsEnabled(GL_DEPTH_TEST);
+      gl_image_load_vertex quad[4] =
+      {
+         {  { dst_x,             dst_y             }  },
+         {  { (uint16_t)(dst_x + w), dst_y         }  },
+         {  { dst_x,             (uint16_t)(dst_y + h) }  },
+         {  { (uint16_t)(dst_x + w), (uint16_t)(dst_y + h) }  },
+      };
+
+      gl_framebuffer_init(&fb, color);
+#ifdef HAVE_OPENGLES3
+      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,
+            GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, depth->id, 0);
+#else
+      glFramebufferTexture(GL_DRAW_FRAMEBUFFER,
+            GL_DEPTH_STENCIL_ATTACHMENT, depth->id, 0);
+#endif
+
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, scratch->id);
+
+      gl_draw_buffer_push_slice(db, quad, 4, sizeof(gl_image_load_vertex));
+
+      if (db->program)
+      {
+         const struct gl_uniform_map *um = &db->program->uniforms;
+         glUseProgram(db->program->id);
+         glUniform1i (gl_uniform_map_get(um, "copy_source"), 0);
+         glUniform2i (gl_uniform_map_get(um, "copy_offset"), -dx, -dy);
+         glUniform1i (gl_uniform_map_get(um, "copy_dst_offset"), (GLint)cw);
+         glUniform1ui(gl_uniform_map_get(um, "copy_mask_test"), 1u);
+         glUniform1ui(gl_uniform_map_get(um, "copy_set_mask"),
+               set_mask ? 1u : 0u);
+      }
+
+      glDisable(GL_BLEND);
+      if (depth_was_enabled)
+         glDisable(GL_DEPTH_TEST);
+      glDepthMask(GL_FALSE);
+
+      /* Keep the stencil plane in step with the alpha this draw writes, but
+       * only where the answer is unambiguous.  set_mask forces bit 15 on, so
+       * the stencil goes to 1 with it.  A plain copy carries each source
+       * pixel's own bit, which no fixed stencil op can express: alpha is
+       * updated and the stencil left alone, which is already what a CPU
+       * upload does. */
+      if (set_mask)
+      {
+         glEnable(GL_STENCIL_TEST);
+         glStencilMask(1);
+         glStencilFunc(GL_ALWAYS, 1, 1);
+         glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+      }
+      else
+         glStencilMask(0);
+
+      if (!gl_draw_buffer_is_empty(db))
+         gl_draw_buffer_draw(db, GL_TRIANGLE_STRIP);
+
+      if (set_mask)
+         glDisable(GL_STENCIL_TEST);
+      glStencilMask(1);
+      glDepthMask(GL_TRUE);
+      if (depth_was_enabled)
+         glEnable(GL_DEPTH_TEST);
+
+      glDeleteFramebuffers(1, &fb.id);
+      /* Unit 0 belongs to fb_texture as far as every other draw is
+       * concerned. */
+      glBindTexture(GL_TEXTURE_2D, renderer->fb_texture.id);
+   }
+   else if (staged)
+   {
+      gl_copy_blit(renderer, scratch->id, 0, 0,
+            color->id, dx, dy, cw, ch);
+   }
+   else if (gl_caps.fp_glCopyImageSubData)
+   {
+      gl_caps.fp_glCopyImageSubData(
+            color->id, GL_TEXTURE_2D, 0, sx, sy, 0,
+            color->id, GL_TEXTURE_2D, 0, dx, dy, 0,
+            cw, ch, 1);
+   }
+   else
+   {
+      /* Portable fallback for profiles without copy_image: read-bind the
+       * texture to an FBO and copy through it.  Known to flicker on some
+       * high-res interlaced titles (Dead or Alive, Tekken 3). */
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, renderer->copy_read_fbo);
+#ifdef HAVE_OPENGLES3
+      glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D, color->id, 0);
+#else
+      glFramebufferTexture(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            color->id, 0);
+#endif
+      glReadBuffer(GL_COLOR_ATTACHMENT0);
+      glBindTexture(GL_TEXTURE_2D, color->id);
+      glCopyTexSubImage2D(GL_TEXTURE_2D, 0, dx, dy, sx, sy, cw, ch);
+      glBindTexture(GL_TEXTURE_2D, renderer->fb_texture.id);
+   }
+
+   if (set_mask && !mask_test)
+   {
+      /* MaskSetOR forces bit 15 on every pixel written.  The copy above
+       * carried the source's bit instead, so overwrite that one channel -
+       * and the stencil plane with it - over the destination rectangle.  A
+       * colour-masked scissored clear does it without a draw. */
+      gl_framebuffer fb;
+
+      gl_framebuffer_init(&fb, color);
+#ifdef HAVE_OPENGLES3
+      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,
+            GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, depth->id, 0);
+#else
+      glFramebufferTexture(GL_DRAW_FRAMEBUFFER,
+            GL_DEPTH_STENCIL_ATTACHMENT, depth->id, 0);
+#endif
+      glEnable(GL_SCISSOR_TEST);
+      glScissor(dx, dy, cw, ch);
+      glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+      glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+      glStencilMask(1);
+      glClearStencil(1);
+      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+      glDisable(GL_SCISSOR_TEST);
+      glDeleteFramebuffers(1, &fb.id);
+   }
+
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
+   /* The MaskSetOR clear narrowed the scissor box to the destination
+    * rectangle; put the draw area back before handing control on. */
+   if (set_mask && !mask_test)
+      apply_scissor(renderer);
+   if (scissor_was_enabled)
+      glEnable(GL_SCISSOR_TEST);
+}
+
 void rhi_gl_copy_rect(
       uint16_t src_x, uint16_t src_y,
       uint16_t dst_x, uint16_t dst_y,
       uint16_t w, uint16_t h,
-      bool mask_test, bool set_mask) /* TODO use mask for copy. See software renderer */
+      bool mask_test, bool set_mask)
 {
    gl_renderer *renderer;
-   uint16_t source_top_left[2];
-   uint16_t target_top_left[2];
-   uint16_t dimensions[2];
-   uint32_t upscale;
-   GLint new_src_x;
-   GLint new_src_y;
-   GLint new_dst_x;
-   GLint new_dst_y;
-   GLsizei new_w;
-   GLsizei new_h;
 
    if (static_renderer.state == GL_STATE_INVALID)
       return;
@@ -8287,88 +9441,31 @@ void rhi_gl_copy_rect(
       texture_tracker_blit(renderer->tracker, _dst, _src);
    }
 
-   source_top_left[0] = src_x;
-   source_top_left[1] = src_y;
-   target_top_left[0] = dst_x;
-   target_top_left[1] = dst_y;
-   dimensions[0]      = w;
-   dimensions[1]      = h;
-
    /* Draw pending commands */
    if (!gl_draw_buffer_is_empty(renderer->command_buffer))
       gl_renderer_draw(renderer);
 
-   upscale = renderer->internal_upscaling;
+   /* Both live surfaces move: fb_out because it is what gets displayed, and
+    * fb_native because the copy is guest-visible VRAM movement that a later
+    * read-back has to see.  gl_copy_rect_surface picks the mechanism -
+    * in-place image copy, staged blit, or a mask-aware draw. */
+   gl_copy_rect_surface(renderer,
+         &renderer->fb_out, &renderer->fb_out_depth,
+         renderer->internal_upscaling,
+         src_x, src_y, dst_x, dst_y, w, h, mask_test, set_mask);
 
-   new_src_x = (GLint) source_top_left[0] * (GLint) upscale;
-   new_src_y = (GLint) source_top_left[1] * (GLint) upscale;
-   new_dst_x = (GLint) target_top_left[0] * (GLint) upscale;
-   new_dst_y = (GLint) target_top_left[1] * (GLint) upscale;
-
-   new_w = (GLsizei) dimensions[0] * (GLsizei) upscale;
-   new_h = (GLsizei) dimensions[1] * (GLsizei) upscale;
-
-   /* === Choose the copy mechanism at runtime ===
-    *
-    * Preference order:
-    *
-    *   1. glCopyImageSubData (GL 4.3 / GLES 3.2 / GL_ARB_copy_image
-    *      / GL_OES_copy_image / GL_EXT_copy_image / GL_NV_copy_image).
-    *      Direct texture-to-texture, no framebuffer dance.  XXX it
-    *      gives undefined results if the source and target areas
-    *      overlap; this is not handled explicitly.
-    *
-    *   2. Portable fallback: bind fb_out to a transient FBO, use
-    *      glCopyTexSubImage2D from the read-bound FBO into the
-    *      same texture.  Works on every profile that has FBO
-    *      support (GL 3.0+, GLES 2.0+).  This is the path used
-    *      historically by the NEW_COPY_RECT codepath, kept here
-    *      as the universal fallback.  Known to cause screen
-    *      flickering on Dead or Alive / Tekken 3 (high-res
-    *      interlaced); investigate before relying on it for
-    *      serious work. */
-   if (gl_caps.fp_glCopyImageSubData)
+   if (renderer->native_target_enabled && renderer->fb_native.id)
    {
-      gl_caps.fp_glCopyImageSubData(
-            renderer->fb_out.id, GL_TEXTURE_2D, 0, new_src_x, new_src_y, 0,
-            renderer->fb_out.id, GL_TEXTURE_2D, 0, new_dst_x, new_dst_y, 0,
-            new_w, new_h, 1);
+      gl_copy_rect_surface(renderer,
+            &renderer->fb_native, &renderer->fb_native_depth, 1,
+            src_x, src_y, dst_x, dst_y, w, h, mask_test, set_mask);
+
+      /* gl_framebuffer_init left the viewport describing whichever surface it
+       * bound last. */
+      glViewport(0, 0,
+            (GLsizei)renderer->fb_out.width,
+            (GLsizei)renderer->fb_out.height);
    }
-#ifdef GL_READ_FRAMEBUFFER
-   else
-   {
-      GLuint fb;
-      glGenFramebuffers(1, &fb);
-      glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
-
-      /* glFramebufferTexture (layered, GL 3.2+) is not present on
-       * GLES; use the 2D variant on GLES profiles. */
-#ifdef HAVE_OPENGLES3
-      glFramebufferTexture2D(GL_READ_FRAMEBUFFER,
-            GL_COLOR_ATTACHMENT0,
-            GL_TEXTURE_2D,
-            renderer->fb_out.id,
-            0);
-#else
-      glFramebufferTexture(GL_READ_FRAMEBUFFER,
-            GL_COLOR_ATTACHMENT0,
-            renderer->fb_out.id,
-            0);
-#endif
-
-      glReadBuffer(GL_COLOR_ATTACHMENT0);
-
-      /* TODO - binding the same texture to the framebuffer and
-       * GL_TEXTURE_2D may be undefined; consider using
-       * glReadPixels / glTexSubImage2D via a scratch buffer
-       * instead. */
-      glBindTexture(GL_TEXTURE_2D, renderer->fb_out.id);
-      glCopyTexSubImage2D(GL_TEXTURE_2D, 0, new_dst_x, new_dst_y,
-            new_src_x, new_src_y, new_w, new_h);
-
-      glDeleteFramebuffers(1, &fb);
-   }
-#endif /* GL_READ_FRAMEBUFFER */
 
    /* Mirror the FBCopy result into fb_texture for same-frame
     * sampling. See gl_mirror_fb_out_to_fb_texture for the full

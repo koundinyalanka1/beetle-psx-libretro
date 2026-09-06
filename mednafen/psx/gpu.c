@@ -202,6 +202,80 @@ static gpu_cmd_t gpu_stage[GPU_STAGE_MAX];
 static uint32_t gpu_stage_count = 0;
 /* Words retired on the emulation thread rather than handed over (diagnostic). */
 static uint32_t gpu_stage_inline_n = 0;
+/* Time GP0 execution costs the emulation thread when it runs inline.  This is
+ * the same work gpu_worker_busy_us measures on the worker, and since the
+ * worker no longer engages it is the only place the cost is visible.  It is
+ * also what says whether the software framebuffer (which rasterises every
+ * primitive on the CPU on top of the hardware renderer) is worth its keep. */
+static uint64_t gpu_inline_us = 0;
+/*
+ * VRAM read-back accounting.  These two decide whether the software
+ * framebuffer is worth keeping.
+ *
+ * With it on, the CPU rasterises every primitive so a read can be served from
+ * GPU.vram.  With it off, Command_FBRead has to flush the renderer and block
+ * on a fence (renderer_copy_vram_to_cpu_synchronous) - cheap if the guest
+ * never reads VRAM back, ruinous if it does per frame.
+ *
+ * gpu_fbread_n counts the reads whether or not the software path is on, so a
+ * normal run answers "would turning it off cost anything?" without having to
+ * turn it off first.  gpu_readback_us is only non-zero when it is already off.
+ */
+static uint32_t gpu_fbread_n = 0;
+static uint64_t gpu_readback_us = 0;
+/* Times the emulation thread actually performed a deferred read-back on the
+ * worker's behalf - the real synchronisation points, as opposed to the polls
+ * below which should not be synchronisation points at all. */
+static uint32_t gpu_fbread_barriers = 0;
+
+/*
+ * Why the pipeline collapses.
+ *
+ * The worker measures at zero occupancy not because there is no work but
+ * because the guest polls GPUSTAT and DMA-ready between almost every short
+ * burst of GP0, and each poll currently drains.  Counting the polls separately
+ * from the polls that *collapsed* the queue is what turns "the worker never
+ * engages" into an actionable number, and gives the success condition a shape:
+ * stat_collapses and dma_collapses must reach zero.
+ */
+static uint32_t gpu_stat_read_n     = 0;
+static uint32_t gpu_stat_collapse_n = 0;
+static uint32_t gpu_dma_poll_n      = 0;
+static uint32_t gpu_dma_collapse_n  = 0;
+/* Queue occupancy sampled at each push. */
+static uint32_t gpu_depth_max = 0;
+static uint64_t gpu_depth_sum = 0;
+static uint32_t gpu_depth_n   = 0;
+
+/*
+ * Deferred GP0 C0h (VRAM -> CPU) read-back.
+ *
+ * The pixels live on the GPU now that fb_native holds native-resolution PS1
+ * VRAM, and on OpenGL they can only be fetched from the thread holding the
+ * context.  The worker therefore does not perform the read: Command_FBRead
+ * records the rectangle, the worker parks at that exact point in the command
+ * stream, and the emulation thread performs the transfer when something
+ * actually needs the pixels.
+ *
+ * Parking rather than reading is what keeps the result correct: a later
+ * drawing command must not reach that VRAM region before the snapshot is
+ * taken, which is also how the existing model behaves (ProcessFIFO stops
+ * dispatching while InCmd == INCMD_FBREAD).
+ *
+ * This is the one place the emulated machine genuinely asked the host to
+ * synchronise, which is what makes it an acceptable barrier - unlike a
+ * GPUSTAT poll, which asked for nothing of the sort.
+ */
+static bool     gpu_fbread_pending = false;
+static uint16_t gpu_fbread_x = 0;
+static uint16_t gpu_fbread_y = 0;
+static uint16_t gpu_fbread_w = 0;
+static uint16_t gpu_fbread_h = 0;
+/* Set by Command_FBRead while it runs on the worker; consumed by the worker's
+ * own batch loop one command later.  Worker-thread-local by construction. */
+static bool     gpu_fbread_req = false;
+/* Identifies the worker so command code can tell which side it is on. */
+static uintptr_t gpu_worker_thread_id = 0;
 
 static bool gpu_worker_idle = true;
 static bool gpu_worker_running = false;
@@ -289,6 +363,21 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr);
 static void GPU_Stage_Resolve(void);
 static bool GPU_Stage_CanRunInline(void);
 static void GPU_AdvanceDrawing(int32_t clocks, int32_t limit);
+
+/* Which side of the handoff is this code running on?  Command execution is
+ * shared between the worker and the emulation thread (the staging buffer
+ * retires inline whenever the worker is parked), so a command that needs a
+ * synchronous answer from the renderer has to know. */
+static INLINE bool GPU_OnWorkerThread(void)
+{
+   return gpu_worker_thread_id != 0
+      && (uintptr_t)sthread_get_current_thread_id() == gpu_worker_thread_id;
+}
+
+/* Would a GPU_Worker_Sync() from here have to make the worker's progress
+ * observable - by blocking, spinning, or retiring the staging buffer inline?
+ * Diagnostic only; this is the predicate the collapse counters report on. */
+static INLINE bool GPU_Sync_Would_Collapse(void);
 
 static INLINE uint32_t GPU_Queue_Count(void)
 {
@@ -975,16 +1064,41 @@ static void Command_FBRead(PS_GPU* g, const uint32_t *cb)
    if(g->FBRW_W != 0 && g->FBRW_H != 0)
       g->InCmd = INCMD_FBREAD;
 
+   gpu_fbread_n++;
+
    if (!rhi_intf_has_software_renderer())
    {
-       /* Need a hard readback from GPU renderer.  Return value
-        * is intentionally discarded here - on Vulkan-renderer
-        * failure or non-Vulkan hardware the call is a no-op and
-        * g->vram keeps its prior contents. */
-       (void)rhi_intf_read_vram(
-               g->FBRW_X, g->FBRW_Y,
-               g->FBRW_W, g->FBRW_H,
-               g->vram);
+      /* The pixels are on the GPU.  On the worker we must not fetch them
+       * ourselves - OpenGL is thread-affine and even Vulkan would be turning
+       * the whole queue into a rendezvous - so publish the rectangle and let
+       * the worker park here.  The emulation thread takes the snapshot when
+       * something actually needs it (GPU_FBRead_Service), which is at worst
+       * the next hard drain and at best not until the guest reads the data
+       * port.  Parking is what keeps it correct: no later drawing command may
+       * reach this VRAM before the snapshot is taken. */
+      if (GPU_OnWorkerThread())
+      {
+         gpu_fbread_x   = g->FBRW_X;
+         gpu_fbread_y   = g->FBRW_Y;
+         gpu_fbread_w   = g->FBRW_W;
+         gpu_fbread_h   = g->FBRW_H;
+         gpu_fbread_req = true;
+      }
+      else
+      {
+         /* Running inline on the emulation thread: just do it.  Return value
+          * is intentionally discarded - on renderer failure the call is a
+          * no-op and g->vram keeps its prior contents. */
+         retro_time_t rb_t0 = cpu_features_get_time_usec();
+
+         (void)rhi_intf_read_vram(
+                 g->FBRW_X, g->FBRW_Y,
+                 g->FBRW_W, g->FBRW_H,
+                 g->vram);
+
+         gpu_readback_us += (uint64_t)(cpu_features_get_time_usec() - rb_t0);
+         gpu_fbread_barriers++;
+      }
    }
 }
 
@@ -1871,6 +1985,41 @@ static INLINE void GPU_WriteCB(uint32_t InData, uint32_t addr)
       ProcessFIFO(GPU_BlitterFIFO.in_count);
 }
 
+static INLINE bool GPU_Sync_Would_Collapse(void)
+{
+   if (!__atomic_load_n(&gpu_worker_running, __ATOMIC_ACQUIRE))
+      return false;
+   return gpu_stage_count != 0
+      || !GPU_Queue_Empty()
+      || !__atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE);
+}
+
+/* Perform a read-back the worker deferred, on the thread that is allowed to.
+ * Emulation thread only. */
+static void GPU_FBRead_Service(void)
+{
+   retro_time_t t0;
+
+   if (!__atomic_load_n(&gpu_fbread_pending, __ATOMIC_ACQUIRE))
+      return;
+
+   t0 = cpu_features_get_time_usec();
+   (void)rhi_intf_read_vram(gpu_fbread_x, gpu_fbread_y,
+         gpu_fbread_w, gpu_fbread_h, GPU.vram);
+   gpu_readback_us += (uint64_t)(cpu_features_get_time_usec() - t0);
+   gpu_fbread_barriers++;
+
+   __atomic_store_n(&gpu_fbread_pending, false, __ATOMIC_RELEASE);
+
+   /* Release the parked worker. */
+   if (gpu_queue_lock)
+   {
+      slock_lock(gpu_queue_lock);
+      scond_broadcast(gpu_queue_not_empty);
+      slock_unlock(gpu_queue_lock);
+   }
+}
+
 static void GPU_WriteGP0_Internal(uint32_t InData, uint32_t addr)
 {
    GPU_WriteCB(InData, addr);
@@ -2022,6 +2171,8 @@ static void gpu_worker_thread_loop(void *arg)
 {
    (void)arg;
 
+   gpu_worker_thread_id = (uintptr_t)sthread_get_current_thread_id();
+
    slock_lock(gpu_queue_lock);
 
    for (;;)
@@ -2033,7 +2184,13 @@ static void gpu_worker_thread_loop(void *arg)
 
          __atomic_store_n(&gpu_worker_idle, true, __ATOMIC_SEQ_CST);
 
-         if (!GPU_Queue_Empty())
+         /* Parked on a published read-back: there is queued work, but running
+          * it would overwrite VRAM the emulation thread has not sampled yet.
+          * Wait for GPU_FBRead_Service() to clear it.  Reporting idle here is
+          * accurate - no command is executing - and harmless, because every
+          * "is the worker caught up" test also requires an empty queue. */
+         if (!GPU_Queue_Empty()
+               && !__atomic_load_n(&gpu_fbread_pending, __ATOMIC_ACQUIRE))
             break;
 
          scond_broadcast(gpu_queue_drained);
@@ -2049,7 +2206,9 @@ static void gpu_worker_thread_loop(void *arg)
          uint32_t tail  = __atomic_load_n(&gpu_queue_tail, __ATOMIC_RELAXED);
          uint32_t head  = __atomic_load_n(&gpu_queue_head, __ATOMIC_ACQUIRE);
          uint32_t count = (head - tail) & GPU_QUEUE_MASK;
+         uint32_t done  = 0;
          uint32_t i;
+         bool     park  = false;
 
          if (count > 256)
             count = 256;
@@ -2071,12 +2230,29 @@ static void gpu_worker_thread_loop(void *arg)
                         (int32_t)gpu_queue[idx].addr);
                   break;
             }
+
+            done = i + 1;
+
+            /* Command_FBRead published a rectangle.  Stop the batch here so
+             * nothing later in the stream can disturb that VRAM before the
+             * emulation thread has sampled it. */
+            if (gpu_fbread_req)
+            {
+               gpu_fbread_req = false;
+               park           = true;
+               break;
+            }
          }
 
          /* Retire only after the batch has run: GPU_Worker_Sync() reads an
           * empty queue plus an idle worker as "everything is applied". */
-         __atomic_store_n(&gpu_queue_tail, (tail + count) & GPU_QUEUE_MASK,
+         __atomic_store_n(&gpu_queue_tail, (tail + done) & GPU_QUEUE_MASK,
                __ATOMIC_RELEASE);
+
+         /* Published after the retire and with release ordering, so a reader
+          * that sees the flag also sees the rectangle and the retired tail. */
+         if (park)
+            __atomic_store_n(&gpu_fbread_pending, true, __ATOMIC_RELEASE);
 
          /* Relaxed: read once per 300 frames by the emulation thread, and an
           * occasional torn/stale sample would only skew a diagnostic. */
@@ -2091,6 +2267,7 @@ done:
    __atomic_store_n(&gpu_worker_idle, true, __ATOMIC_SEQ_CST);
    scond_broadcast(gpu_queue_drained);
    slock_unlock(gpu_queue_lock);
+   gpu_worker_thread_id = 0;
 }
 
 void GPU_Worker_Sync(void)
@@ -2104,6 +2281,10 @@ void GPU_Worker_Sync(void)
 
    if (!__atomic_load_n(&gpu_worker_running, __ATOMIC_ACQUIRE) || !gpu_queue_lock)
       return;
+
+   /* A drain cannot complete while the worker is parked on a read-back, so
+    * settle that first - otherwise the wait below never sees an empty queue. */
+   GPU_FBRead_Service();
 
    /* Lock-free fast path: nothing queued and the worker parked. */
    if (GPU_Queue_Empty() && __atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
@@ -2144,6 +2325,16 @@ void GPU_Worker_Sync(void)
             && (!GPU_Queue_Empty()
                || !__atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE)))
       {
+         /* The worker can park mid-wait; service it outside the lock so the
+          * broadcast that releases it is not fighting us for the mutex. */
+         if (__atomic_load_n(&gpu_fbread_pending, __ATOMIC_ACQUIRE))
+         {
+            slock_unlock(gpu_queue_lock);
+            GPU_FBRead_Service();
+            slock_lock(gpu_queue_lock);
+            continue;
+         }
+
          /* Timed: the predicate is re-tested every pass, so a lost signal
           * costs a few microseconds instead of wedging the emulation thread. */
          scond_wait_timeout(gpu_queue_drained, gpu_queue_lock,
@@ -2158,25 +2349,47 @@ void GPU_Worker_Sync(void)
    GPU_ApplyIRQ();
 }
 
-void GPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
-                          uint32_t *pushes, uint32_t *queue_depth,
-                          uint64_t *full_us, uint32_t *fulls,
-                          uint32_t *spins, uint64_t *busy_us,
-                          uint32_t *inlines)
+void GPU_Worker_TakeStats(gpu_worker_stats_t *out)
 {
-   if (inlines)     *inlines     = gpu_stage_inline_n;
-   if (blocked_us)  *blocked_us  = gpu_sync_block_us;
-   if (blocks)      *blocks      = gpu_sync_block_n;
-   if (spins)       *spins       = gpu_sync_spin_n;
-   if (busy_us)     *busy_us     = gpu_worker_busy_us;
-   if (pushes)      *pushes      = gpu_push_n;
-   if (queue_depth) *queue_depth = gpu_worker_running ? GPU_Queue_Count() : 0;
-   if (full_us)     *full_us     = gpu_push_block_us;
-   if (fulls)       *fulls       = gpu_push_block_n;
+   if (out)
+   {
+      out->sync_block_us   = gpu_sync_block_us;
+      out->sync_blocks     = gpu_sync_block_n;
+      out->sync_spins      = gpu_sync_spin_n;
+      out->queue_full_us   = gpu_push_block_us;
+      out->queue_fulls     = gpu_push_block_n;
+      out->worker_busy_us  = gpu_worker_busy_us;
+      out->inline_us       = gpu_inline_us;
+      out->pushes          = gpu_push_n;
+      out->inlines         = gpu_stage_inline_n;
+      out->queue_depth     = gpu_worker_running ? GPU_Queue_Count() : 0;
+      out->queue_depth_max = gpu_depth_max;
+      out->queue_depth_sum = gpu_depth_sum;
+      out->queue_depth_n   = gpu_depth_n;
+      out->stat_reads      = gpu_stat_read_n;
+      out->stat_collapses  = gpu_stat_collapse_n;
+      out->dma_polls       = gpu_dma_poll_n;
+      out->dma_collapses   = gpu_dma_collapse_n;
+      out->fbreads         = gpu_fbread_n;
+      out->fbread_barriers = gpu_fbread_barriers;
+      out->readback_us     = gpu_readback_us;
+   }
+
+   gpu_depth_max       = 0;
+   gpu_depth_sum       = 0;
+   gpu_depth_n         = 0;
+   gpu_stat_read_n     = 0;
+   gpu_stat_collapse_n = 0;
+   gpu_dma_poll_n      = 0;
+   gpu_dma_collapse_n  = 0;
+   gpu_fbread_barriers = 0;
    gpu_sync_block_us = 0;
    gpu_sync_block_n  = 0;
    gpu_sync_spin_n   = 0;
    gpu_stage_inline_n = 0;
+   gpu_inline_us      = 0;
+   gpu_fbread_n       = 0;
+   gpu_readback_us    = 0;
    gpu_worker_busy_us = 0;
    gpu_push_n        = 0;
    gpu_push_block_us = 0;
@@ -2204,6 +2417,8 @@ void GPU_Worker_Init(void)
    gpu_worker_idle = true;
    gpu_worker_stopping = false;
    gpu_worker_irq_pending = GPU.IRQPending;
+   gpu_fbread_pending = false;
+   gpu_fbread_req     = false;
    gpu_irq_command_possible = true;
    gpu_field_ram_readout_emu = GPU.field_ram_readout;
    GPU_ApplyIRQ();
@@ -2306,16 +2521,18 @@ static bool GPU_Worker_Permitted(void)
     * index buffer fills mid-primitive.  The backend therefore records calls
     * instead of issuing them (rhi_intf_set_threaded_recording) and the
     * emulation thread replays them at end of frame.  That works only while
-    * nothing on the worker needs a synchronous answer from GL - which means
-    * the software framebuffer must be on, since without it Command_FBRead()
-    * asks for a hard read-back mid-command. */
+    * nothing on the worker needs a synchronous answer from GL.
+    *
+    * That used to mean the software framebuffer had to be on, because
+    * Command_FBRead() fetched pixels mid-command.  It no longer does: the
+    * worker publishes the rectangle and parks, and the emulation thread - the
+    * one holding the context - performs the transfer (GPU_FBRead_Service).
+    * So the requirement is gone, which is what allows the configuration the
+    * native-VRAM target was built for: software framebuffer off, worker on. */
    switch (rhi_intf_is_type())
    {
       case RHI_VULKAN:
-         break;
       case RHI_OPENGL:
-         if (!rhi_intf_has_software_renderer())
-            return false;
          break;
       default:
          return false;
@@ -2385,6 +2602,13 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
 
       while (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
       {
+         /* The worker may be parked on a published read-back rather than
+          * merely behind.  Kicking it would achieve nothing - it is waiting
+          * for us - so settle the read-back first.  Without this the ring
+          * fills, this loop waits for the worker, and the worker waits for
+          * the emulation thread: a hang with both threads looking innocent. */
+         GPU_FBRead_Service();
+
          slock_lock(gpu_queue_lock);
          /* Kick the worker in case it is parked, then re-test under the lock
           * so a not_full signal raised in between can't be missed. */
@@ -2401,6 +2625,14 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
 
    if (gpu_worker_stopping)
       return;
+
+   {
+      uint32_t depth = GPU_Queue_Count();
+      gpu_depth_sum += depth;
+      gpu_depth_n++;
+      if (depth > gpu_depth_max)
+         gpu_depth_max = depth;
+   }
 
    head = __atomic_load_n(&gpu_queue_head, __ATOMIC_RELAXED);
    gpu_queue[head].type = type;
@@ -2460,8 +2692,14 @@ static void GPU_Stage_Resolve(void)
    gpu_stage_count     = 0;
    gpu_stage_inline_n += n;
 
-   for (i = 0; i < n; i++)
-      GPU_WriteGP0_Internal(gpu_stage[i].data, gpu_stage[i].addr);
+   {
+      retro_time_t t0 = cpu_features_get_time_usec();
+
+      for (i = 0; i < n; i++)
+         GPU_WriteGP0_Internal(gpu_stage[i].data, gpu_stage[i].addr);
+
+      gpu_inline_us += (uint64_t)(cpu_features_get_time_usec() - t0);
+   }
 }
 
 static INLINE void GPU_Stage_GP0(uint32_t V, uint32_t addr)
@@ -2571,9 +2809,23 @@ uint32_t GPU_Read(const int32_t timestamp, uint32_t A)
 {
    uint32_t ret = 0;
 
+   /* Count before syncing: a status read that finds the worker busy is a poll
+    * that flattened the pipeline, and driving that number to zero is the point
+    * of the threading work.  The data port is a different matter - the guest
+    * genuinely wants pixels there - so only the status half counts. */
+   if (A & 4)
+   {
+      gpu_stat_read_n++;
+      if (GPU_Sync_Would_Collapse())
+         gpu_stat_collapse_n++;
+   }
+
    /* Resolve all earlier writes and clock advances before observing GPU
     * state. Host queue depth/worker speed must never drive guest busy loops,
-    * framebuffer read readiness, or DMA handshake bits. */
+    * framebuffer read readiness, or DMA handshake bits.
+    *
+    * This drain is what the front/back state split has to remove: every bit
+    * the status word needs is emulated PS1 state, not host progress. */
    GPU_Worker_Sync();
 
    if(A & 4)   /* Status */
@@ -3767,8 +4019,15 @@ uint8_t GPU_get_upscale_shift(void)
 
 bool GPU_DMACanWrite(void)
 {
+   gpu_dma_poll_n++;
+   if (GPU_Sync_Would_Collapse())
+      gpu_dma_collapse_n++;
+
    /* DMA tests this at block boundaries. Apply the preceding block before
-    * testing the PS1 FIFO; the host work queue is not a hardware FIFO. */
+    * testing the PS1 FIFO; the host work queue is not a hardware FIFO.
+    *
+    * Same story as the status read: CalcFIFOReadyBit() is a function of the
+    * emulated command FIFO, which the emulation thread could maintain itself. */
    GPU_Worker_Sync();
    return CalcFIFOReadyBit();
 }

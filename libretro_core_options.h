@@ -358,7 +358,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       BEETLE_OPT(renderer_software_fb),
       "Software Framebuffer",
       NULL,
-      "Enable accurate emulation of framebuffer effects (e.g. motion blur, FF7 battle swirl) when using hardware renderers by running a copy of the software renderer at native resolution in the background. If disabled, these operations are omitted (OpenGL) or rendered on the GPU (Vulkan). Disabling can improve performance but may cause severe graphical errors. Leave enabled if unsure.",
+      "Compatibility fallback: run a full copy of the software renderer at native resolution alongside the hardware one, so framebuffer effects (motion blur, the FF7 battle swirl) read correct pixels from the CPU-side VRAM mirror. The hardware renderers now keep a native-resolution PS1 framebuffer on the GPU instead and serve those effects from it, which costs a fraction of what rasterising every primitive twice on the CPU does - so this should stay disabled. Enable it only if a game shows framebuffer-effect corruption that turning it on fixes, and please report that game.",
       NULL,
       "video",
       {
@@ -366,7 +366,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
          { "enabled",  NULL },
          { NULL, NULL },
       },
-      "enabled"
+      "disabled"
    },
    {
       BEETLE_OPT(color_format),
