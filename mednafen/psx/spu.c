@@ -136,6 +136,9 @@ static sthread_t *spu_thread = NULL;
 static uint64_t spu_sync_block_us = 0;
 static uint32_t spu_sync_block_n  = 0;
 static uint32_t spu_job_n         = 0;
+/* Time the worker spends synthesising. The counterpart to spu_sync_block_us:
+ * threading only pays if this is the larger of the two. */
+static uint64_t spu_worker_busy_us = 0;
 
 static void SPU_SynthesizeSamples_Internal(int32_t sample_clocks,
       const int32_t (*cd_audio)[2]);
@@ -1775,7 +1778,13 @@ static void spu_worker_thread_loop(void *arg)
          uint32_t tail = __atomic_load_n(&spu_queue_tail, __ATOMIC_RELAXED);
          int32_t sample_clocks = spu_queue[tail].sample_clocks;
 
+         retro_time_t work_t0 = cpu_features_get_time_usec();
+
          SPU_SynthesizeSamples_Internal(sample_clocks, spu_queue[tail].cd_audio);
+
+         /* Relaxed: read once per 300 frames by the emulation thread, and an
+          * occasional stale sample would only skew a diagnostic. */
+         spu_worker_busy_us += (uint64_t)(cpu_features_get_time_usec() - work_t0);
 
          /* Retire only after the work is done: SPU_Worker_Sync() treats an
           * empty queue plus an idle worker as "everything is applied". */
@@ -1872,11 +1881,13 @@ void SPU_Worker_Sync(void)
 }
 
 void SPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
-                          uint32_t *jobs)
+                          uint32_t *jobs, uint64_t *busy_us)
 {
    if (blocked_us) *blocked_us = spu_sync_block_us;
    if (blocks)     *blocks     = spu_sync_block_n;
    if (jobs)       *jobs       = spu_job_n;
+   if (busy_us)    *busy_us    = spu_worker_busy_us;
+   spu_worker_busy_us = 0;
    spu_sync_block_us = 0;
    spu_sync_block_n  = 0;
    spu_job_n         = 0;

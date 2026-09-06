@@ -173,6 +173,36 @@ static gpu_cmd_t gpu_queue[GPU_QUEUE_SIZE];
 static uint32_t gpu_queue_head = 0;
 static uint32_t gpu_queue_tail = 0;
 
+/*
+ * GP0 staging buffer.
+ *
+ * Handing a word to the worker only pays off if the worker gets to run *ahead*
+ * of the emulation thread.  Measured on Tekken 3 the guest interleaves ~8-13
+ * GP0 words with a GPUSTAT or DMA-ready poll, and every poll is a full drain,
+ * so the worker never accumulates a backlog - reported queue depth is 0 in
+ * every sample - while the emulation thread pays a futex round trip per poll.
+ * In that regime the core reported 4.4 ms/frame of sync to overlap 0.44
+ * ms/frame of drawing: a 10x net loss, and the cause of the cutscene slowdown.
+ *
+ * So GP0 words accumulate here first, on the emulation thread, and are only
+ * published to the worker once there are enough of them for a handshake to pay
+ * for itself.  A drain arriving while the batch is still small runs it inline
+ * instead - the same work, minus the handoff.  Threading then engages exactly
+ * where it wins (a guest streaming long bursts between polls) and gets out of
+ * the way where it loses.
+ *
+ * Ordering: staged words are always *newer* than anything already in the ring,
+ * so they may only run inline when the ring is empty and the worker is parked.
+ * Otherwise they are published and the normal wait applies.  Resolving the
+ * buffer therefore never adds a handshake; it only ever removes one.
+ */
+#define GPU_STAGE_MAX 1024
+
+static gpu_cmd_t gpu_stage[GPU_STAGE_MAX];
+static uint32_t gpu_stage_count = 0;
+/* Words retired on the emulation thread rather than handed over (diagnostic). */
+static uint32_t gpu_stage_inline_n = 0;
+
 static bool gpu_worker_idle = true;
 static bool gpu_worker_running = false;
 static bool gpu_worker_stopping = false;
@@ -256,6 +286,8 @@ static uint32_t gpu_push_block_n  = 0;
 static void GPU_WriteGP0_Internal(uint32_t InData, uint32_t addr);
 static void GPU_WriteGP1_Internal(uint32_t V);
 static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr);
+static void GPU_Stage_Resolve(void);
+static bool GPU_Stage_CanRunInline(void);
 static void GPU_AdvanceDrawing(int32_t clocks, int32_t limit);
 
 static INLINE uint32_t GPU_Queue_Count(void)
@@ -339,7 +371,16 @@ static INLINE void GPU_SetFieldRamReadout(bool v)
    gpu_field_ram_readout_emu = v;
 
    if (gpu_worker_running)
-      GPU_Worker_Push(GPU_CMD_FIELD, (uint32_t)v, 0);
+   {
+      /* Ordered behind the GP0 stream, so retire the staging buffer first.
+       * If that leaves nothing outstanding the field can be applied here. */
+      GPU_Stage_Resolve();
+
+      if (GPU_Stage_CanRunInline())
+         GPU.field_ram_readout = v;
+      else
+         GPU_Worker_Push(GPU_CMD_FIELD, (uint32_t)v, 0);
+   }
    else
       GPU.field_ram_readout = v;
 }
@@ -2054,6 +2095,13 @@ done:
 
 void GPU_Worker_Sync(void)
 {
+   /* Staged words are the newest part of the command stream, so they must be
+    * applied - or at least published - before anything observes GPU state.
+    * This runs ahead of the early-out below so a stopped worker still leaves
+    * the buffer retired rather than stranded. */
+   if (gpu_stage_count)
+      GPU_Stage_Resolve();
+
    if (!__atomic_load_n(&gpu_worker_running, __ATOMIC_ACQUIRE) || !gpu_queue_lock)
       return;
 
@@ -2113,8 +2161,10 @@ void GPU_Worker_Sync(void)
 void GPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
                           uint32_t *pushes, uint32_t *queue_depth,
                           uint64_t *full_us, uint32_t *fulls,
-                          uint32_t *spins, uint64_t *busy_us)
+                          uint32_t *spins, uint64_t *busy_us,
+                          uint32_t *inlines)
 {
+   if (inlines)     *inlines     = gpu_stage_inline_n;
    if (blocked_us)  *blocked_us  = gpu_sync_block_us;
    if (blocks)      *blocks      = gpu_sync_block_n;
    if (spins)       *spins       = gpu_sync_spin_n;
@@ -2126,6 +2176,7 @@ void GPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
    gpu_sync_block_us = 0;
    gpu_sync_block_n  = 0;
    gpu_sync_spin_n   = 0;
+   gpu_stage_inline_n = 0;
    gpu_worker_busy_us = 0;
    gpu_push_n        = 0;
    gpu_push_block_us = 0;
@@ -2136,6 +2187,10 @@ void GPU_Worker_Init(void)
 {
    if (gpu_worker_running)
       return;
+
+   /* A teardown that raced a full ring can drop staged words; never carry one
+    * of those buffers into a new session. */
+   gpu_stage_count = 0;
 
    /* The software renderer's scanout runs on the emulation thread and reads
     * GPU.vram line by line from GPU_Update(), which would race the worker's
@@ -2347,9 +2402,6 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
    if (gpu_worker_stopping)
       return;
 
-   if (type == GPU_CMD_GP0)
-      gpu_push_n++;
-
    head = __atomic_load_n(&gpu_queue_head, __ATOMIC_RELAXED);
    gpu_queue[head].type = type;
    gpu_queue[head].data = data;
@@ -2366,6 +2418,66 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
       scond_broadcast(gpu_queue_not_empty);
       slock_unlock(gpu_queue_lock);
    }
+}
+
+/* True when everything older than the staging buffer has already been applied,
+ * which is what makes running the buffer on this thread order-preserving. */
+static bool GPU_Stage_CanRunInline(void)
+{
+   return GPU_Queue_Empty()
+      && __atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE);
+}
+
+static void GPU_Stage_Publish(void)
+{
+   uint32_t i;
+   uint32_t n = gpu_stage_count;
+
+   /* Cleared up front: GPU_Worker_Push() can block on a full ring, and nothing
+    * it reaches may observe a staging buffer that is already in flight. */
+   gpu_stage_count = 0;
+
+   for (i = 0; i < n; i++)
+      GPU_Worker_Push(GPU_CMD_GP0, gpu_stage[i].data, gpu_stage[i].addr);
+}
+
+/* Retire the staging buffer: inline when the worker has nothing outstanding,
+ * otherwise by publishing it so the ring keeps command order. */
+static void GPU_Stage_Resolve(void)
+{
+   uint32_t i;
+   uint32_t n = gpu_stage_count;
+
+   if (!n)
+      return;
+
+   if (gpu_worker_running && !GPU_Stage_CanRunInline())
+   {
+      GPU_Stage_Publish();
+      return;
+   }
+
+   gpu_stage_count     = 0;
+   gpu_stage_inline_n += n;
+
+   for (i = 0; i < n; i++)
+      GPU_WriteGP0_Internal(gpu_stage[i].data, gpu_stage[i].addr);
+}
+
+static INLINE void GPU_Stage_GP0(uint32_t V, uint32_t addr)
+{
+   /* Counted here rather than at the ring so the reported word rate stays
+    * total GP0 throughput; inline words never reach GPU_Worker_Push(). */
+   gpu_push_n++;
+
+   gpu_stage[gpu_stage_count].type = GPU_CMD_GP0;
+   gpu_stage[gpu_stage_count].data = V;
+   gpu_stage[gpu_stage_count].addr = addr;
+
+   /* A batch this long means the guest is streaming rather than polling, so
+    * hand it over and let the worker overlap whatever comes next. */
+   if (++gpu_stage_count >= GPU_STAGE_MAX)
+      GPU_Stage_Publish();
 }
 
 void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
@@ -2390,7 +2502,7 @@ void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
       {
          if ((V >> 24) == 0x1f)
             gpu_irq_command_possible = true;
-         GPU_Worker_Push(GPU_CMD_GP0, V, A);
+         GPU_Stage_GP0(V, A);
          if (gpu_irq_command_possible)
             GPU_Worker_Sync();
          return;
@@ -2405,7 +2517,7 @@ void GPU_WriteDMA(uint32_t V, uint32_t addr)
    {
       if ((V >> 24) == 0x1f)
          gpu_irq_command_possible = true;
-      GPU_Worker_Push(GPU_CMD_GP0, V, addr);
+      GPU_Stage_GP0(V, addr);
       if (gpu_irq_command_possible)
          GPU_Worker_Sync();
       return;
@@ -2692,8 +2804,11 @@ int32_t GPU_Update(const int32_t sys_timestamp)
          /* An idle queue has no writer: apply clocks here to avoid waking a
           * worker for every timer tick when there is no rendering to overlap.
           * Otherwise the clocks follow preceding GP0 writes in the stream. */
-         if (GPU_Queue_Empty()
-               && __atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE))
+         /* Clocks are ordered behind the GP0 stream: retire the staging
+          * buffer, then re-test whether anything is still outstanding. */
+         GPU_Stage_Resolve();
+
+         if (GPU_Stage_CanRunInline())
          {
             GPU_AdvanceDrawing(draw_clocks, draw_limit);
             GPU_ApplyIRQ();

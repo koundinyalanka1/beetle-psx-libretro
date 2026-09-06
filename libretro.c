@@ -6670,13 +6670,15 @@ void retro_run(void)
       if (++stat_frames >= 300)
       {
          uint64_t gpu_us = 0, spu_us = 0, gpu_full_us = 0, gpu_busy_us = 0;
+         uint64_t spu_busy_us = 0;
          uint32_t gpu_n = 0, spu_n = 0, gpu_push = 0, gpu_depth = 0;
          uint32_t spu_jobs = 0, gpu_fulls = 0, gpu_spins = 0;
+         uint32_t gpu_inline = 0;
 
          GPU_Worker_TakeStats(&gpu_us, &gpu_n, &gpu_push, &gpu_depth,
                               &gpu_full_us, &gpu_fulls, &gpu_spins,
-                              &gpu_busy_us);
-         SPU_Worker_TakeStats(&spu_us, &spu_n, &spu_jobs);
+                              &gpu_busy_us, &gpu_inline);
+         SPU_Worker_TakeStats(&spu_us, &spu_n, &spu_jobs, &spu_busy_us);
 
          /* queue-full time is called out separately: it means the two threads
           * are running in lockstep rather than overlapping, which is a
@@ -6684,14 +6686,15 @@ void retro_run(void)
          log_cb(RETRO_LOG_WARN,
                "Worker cost over %u frames: GPU busy %.2f ms/frame, sync "
                "%.2f ms/frame (%u blocked + %u spun), queue-full %.2f ms/frame "
-               "(%u stalls), %u words/frame, depth %u | SPU sync %.2f ms/frame "
-               "(%u waits, %u jobs/frame)\n",
+               "(%u stalls), %u words/frame (%u inline), depth %u | SPU busy "
+               "%.2f ms/frame, sync %.2f ms/frame (%u waits, %u jobs/frame)\n",
                stat_frames,
                (double)gpu_busy_us / 1000.0 / (double)stat_frames,
                (double)gpu_us / 1000.0 / (double)stat_frames,
                gpu_n, gpu_spins,
                (double)gpu_full_us / 1000.0 / (double)stat_frames, gpu_fulls,
-               gpu_push / stat_frames, gpu_depth,
+               gpu_push / stat_frames, gpu_inline / stat_frames, gpu_depth,
+               (double)spu_busy_us / 1000.0 / (double)stat_frames,
                (double)spu_us / 1000.0 / (double)stat_frames, spu_n,
                spu_jobs / stat_frames);
 
