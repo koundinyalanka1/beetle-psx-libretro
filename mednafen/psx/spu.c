@@ -99,9 +99,27 @@ int16_t IntermediateBuffer[4096][2];
 
 extern uint8_t spu_samples;
 
-/* Amortize worker wakeups without changing the CDC's sample clock. A partial
- * batch is submitted at every register/DMA/state/frame synchronization. */
-#define SPU_SYNTH_BATCH_SAMPLES 32
+/*
+ * Amortize worker wakeups without changing the CDC's sample clock. A partial
+ * batch is submitted at every register/DMA/state/frame synchronization.
+ *
+ * This doubles as the threshold that decides whether the worker is worth
+ * waking at all, the same role GPU_STAGE_MAX plays for GP0.  A guest that
+ * poking SPU registers more often than once per batch never lets the batch
+ * fill, so every sync finds a partial batch with an empty queue and
+ * SPU_Worker_Sync() synthesises it in place - no handoff, no futex round trip.
+ * A guest that leaves the SPU alone for longer fills batches and the worker
+ * runs ahead.
+ *
+ * So the size has to sit above the poke interval of the workloads where the
+ * worker loses.  Measured: the BIOS pokes ~16 times a frame (736/16 = ~47
+ * samples apart) and cost 0.93 ms/frame of sync to overlap 0.48 ms/frame of
+ * synthesis; 32 sat just under that interval, which was the worst possible
+ * place for it.  64 puts the BIOS wholly on the inline path while leaving the
+ * regimes that were winning (~117 and ~409 samples between pokes) on the
+ * worker.
+ */
+#define SPU_SYNTH_BATCH_SAMPLES 64
 
 typedef struct
 {
@@ -1875,6 +1893,29 @@ void SPU_Worker_Sync(void)
 {
    if (!spu_worker_running)
       return;
+
+   /*
+    * Nothing outstanding on the worker: synthesise the partial batch right
+    * here instead of handing over 32 samples and paying a futex round trip to
+    * get them back.  This is the SPU counterpart of GPU_Stage_Resolve(), and
+    * it matters for the same reason: the BIOS pokes SPU registers ~16 times a
+    * frame, every poke is a drain, and the measured cost was 0.93 ms/frame of
+    * sync to overlap 0.48 ms/frame of synthesis.
+    *
+    * Ordering is the same argument too - spu_pending is newer than anything
+    * already queued, so it may only run here when the queue is empty and the
+    * worker is parked.  Otherwise fall through and let the worker keep the
+    * command stream in order.
+    */
+   if (spu_pending.sample_clocks
+         && SPU_Queue_Empty()
+         && __atomic_load_n(&spu_worker_idle, __ATOMIC_ACQUIRE))
+   {
+      SPU_SynthesizeSamples_Internal(spu_pending.sample_clocks,
+                                     spu_pending.cd_audio);
+      spu_pending.sample_clocks = 0;
+      return;
+   }
 
    SPU_Worker_FlushPending();
    SPU_Worker_WaitQueued();
