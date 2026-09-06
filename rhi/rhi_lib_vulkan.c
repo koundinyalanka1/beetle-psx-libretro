@@ -76,6 +76,9 @@ extern int   psx_hdr_multipass;
  * (16F) scaled framebuffer, which is allocated before HDR negotiation
  * completes. Non-zero = a 30-bit/HDR format was requested. */
 extern int   psx_color_format;
+/* Frontend save directory (libretro.c); the persistent pipeline cache lives
+ * under it because it is the one directory the core already writes to. */
+extern char  retro_save_directory[4096];
 
 /* VOLK_GENERATE_PROTOTYPES_H */
 #if defined(VK_VERSION_1_0)
@@ -115,6 +118,7 @@ extern PFN_vkCreateFramebuffer vkCreateFramebuffer;
 extern PFN_vkCreateGraphicsPipelines vkCreateGraphicsPipelines;
 extern PFN_vkCreateImage vkCreateImage;
 extern PFN_vkCreateImageView vkCreateImageView;
+extern PFN_vkCreatePipelineCache vkCreatePipelineCache;
 extern PFN_vkCreatePipelineLayout vkCreatePipelineLayout;
 extern PFN_vkCreateRenderPass vkCreateRenderPass;
 extern PFN_vkCreateSampler vkCreateSampler;
@@ -131,6 +135,7 @@ extern PFN_vkDestroyFramebuffer vkDestroyFramebuffer;
 extern PFN_vkDestroyImage vkDestroyImage;
 extern PFN_vkDestroyImageView vkDestroyImageView;
 extern PFN_vkDestroyPipeline vkDestroyPipeline;
+extern PFN_vkDestroyPipelineCache vkDestroyPipelineCache;
 extern PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout;
 extern PFN_vkDestroyRenderPass vkDestroyRenderPass;
 extern PFN_vkDestroySampler vkDestroySampler;
@@ -150,6 +155,7 @@ extern PFN_vkGetBufferMemoryRequirements vkGetBufferMemoryRequirements;
 extern PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
 extern PFN_vkGetDeviceQueue vkGetDeviceQueue;
 extern PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements;
+extern PFN_vkGetPipelineCacheData vkGetPipelineCacheData;
 extern PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
 extern PFN_vkGetPhysicalDeviceFeatures vkGetPhysicalDeviceFeatures;
 extern PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties;
@@ -266,6 +272,7 @@ static void volkGenLoadDevice(void* context,
    vkCreateGraphicsPipelines = (PFN_vkCreateGraphicsPipelines)load(context, "vkCreateGraphicsPipelines");
    vkCreateImage = (PFN_vkCreateImage)load(context, "vkCreateImage");
    vkCreateImageView = (PFN_vkCreateImageView)load(context, "vkCreateImageView");
+   vkCreatePipelineCache = (PFN_vkCreatePipelineCache)load(context, "vkCreatePipelineCache");
    vkCreatePipelineLayout = (PFN_vkCreatePipelineLayout)load(context, "vkCreatePipelineLayout");
    vkCreateRenderPass = (PFN_vkCreateRenderPass)load(context, "vkCreateRenderPass");
    vkCreateSampler = (PFN_vkCreateSampler)load(context, "vkCreateSampler");
@@ -282,6 +289,7 @@ static void volkGenLoadDevice(void* context,
    vkDestroyImage = (PFN_vkDestroyImage)load(context, "vkDestroyImage");
    vkDestroyImageView = (PFN_vkDestroyImageView)load(context, "vkDestroyImageView");
    vkDestroyPipeline = (PFN_vkDestroyPipeline)load(context, "vkDestroyPipeline");
+   vkDestroyPipelineCache = (PFN_vkDestroyPipelineCache)load(context, "vkDestroyPipelineCache");
    vkDestroyPipelineLayout = (PFN_vkDestroyPipelineLayout)load(context, "vkDestroyPipelineLayout");
    vkDestroyRenderPass = (PFN_vkDestroyRenderPass)load(context, "vkDestroyRenderPass");
    vkDestroySampler = (PFN_vkDestroySampler)load(context, "vkDestroySampler");
@@ -295,6 +303,7 @@ static void volkGenLoadDevice(void* context,
    vkGetBufferMemoryRequirements = (PFN_vkGetBufferMemoryRequirements)load(context, "vkGetBufferMemoryRequirements");
    vkGetDeviceQueue = (PFN_vkGetDeviceQueue)load(context, "vkGetDeviceQueue");
    vkGetImageMemoryRequirements = (PFN_vkGetImageMemoryRequirements)load(context, "vkGetImageMemoryRequirements");
+   vkGetPipelineCacheData = (PFN_vkGetPipelineCacheData)load(context, "vkGetPipelineCacheData");
    vkInvalidateMappedMemoryRanges = (PFN_vkInvalidateMappedMemoryRanges)load(context, "vkInvalidateMappedMemoryRanges");
    vkMapMemory = (PFN_vkMapMemory)load(context, "vkMapMemory");
    vkQueueSubmit = (PFN_vkQueueSubmit)load(context, "vkQueueSubmit");
@@ -364,6 +373,7 @@ PFN_vkCreateFramebuffer vkCreateFramebuffer;
 PFN_vkCreateGraphicsPipelines vkCreateGraphicsPipelines;
 PFN_vkCreateImage vkCreateImage;
 PFN_vkCreateImageView vkCreateImageView;
+PFN_vkCreatePipelineCache vkCreatePipelineCache;
 PFN_vkCreatePipelineLayout vkCreatePipelineLayout;
 PFN_vkCreateRenderPass vkCreateRenderPass;
 PFN_vkCreateSampler vkCreateSampler;
@@ -380,6 +390,7 @@ PFN_vkDestroyFramebuffer vkDestroyFramebuffer;
 PFN_vkDestroyImage vkDestroyImage;
 PFN_vkDestroyImageView vkDestroyImageView;
 PFN_vkDestroyPipeline vkDestroyPipeline;
+PFN_vkDestroyPipelineCache vkDestroyPipelineCache;
 PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout;
 PFN_vkDestroyRenderPass vkDestroyRenderPass;
 PFN_vkDestroySampler vkDestroySampler;
@@ -416,6 +427,7 @@ PFN_vkGetBufferMemoryRequirements vkGetBufferMemoryRequirements;
 PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr;
 PFN_vkGetDeviceQueue vkGetDeviceQueue;
 PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements;
+PFN_vkGetPipelineCacheData vkGetPipelineCacheData;
 PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
 PFN_vkGetPhysicalDeviceFeatures vkGetPhysicalDeviceFeatures;
 PFN_vkGetPhysicalDeviceFormatProperties vkGetPhysicalDeviceFormatProperties;
@@ -459,6 +471,9 @@ PFN_vkGetPhysicalDeviceSurfaceSupportKHR vkGetPhysicalDeviceSurfaceSupportKHR;
 
 #include <rthreads/rthreads.h>
 #include <streams/file_stream.h>
+#include <encodings/crc32.h>
+#include <file/file_path.h>
+#include <compat/strl.h>
 
 /* C89-compatible compile-time assertion. C89 has no static_assert /
  * _Static_assert; emit a typedef whose array size is negative when the
@@ -4706,6 +4721,16 @@ static void cbh_move(struct CommandBufferHandle *dst,
          VkQueue graphics_queue;
          VkQueue compute_queue;
          VkQueue transfer_queue;
+         VkPipelineCache pipeline_cache;
+         /* Persistent pipeline cache bookkeeping: CRC/size of the blob last
+          * read from or written to disk (so an unchanged blob is not
+          * rewritten), the number of pipelines published since the last
+          * save, and the frames elapsed since the last publish (the save is
+          * debounced until compilation has gone quiet). */
+         uint32_t pipeline_cache_saved_crc;
+         size_t   pipeline_cache_saved_size;
+         unsigned pipeline_cache_dirty;
+         unsigned pipeline_cache_quiet_frames;
 
          uint64_t cookie;
 
@@ -4941,6 +4966,7 @@ static void *device_map_host_buffer(Device *self, const Buffer *buffer, MemoryAc
 static void device_unmap_host_buffer(Device *self, const Buffer *buffer, MemoryAccessFlags access) { deviceallocator_unmap_memory(&self->managers.memory, buffer_get_allocation(buffer), access); }
 static ImageView *device_get_transient_attachment(Device *self, unsigned width, unsigned height, VkFormat format, unsigned index, unsigned samples, unsigned layers) { return attachment_allocator_request_attachment(&self->transient_allocator, width, height, format, index, samples, layers); }
 static VkDevice device_get_device(Device *self) { return self->device; }
+static VkPipelineCache device_get_pipeline_cache(Device *self) { return self->pipeline_cache; }
 static const VkPhysicalDeviceProperties *device_get_gpu_properties(Device *self) { return &self->gpu_props; }
 static const Sampler *device_get_stock_sampler(Device *self, StockSampler sampler) { return smh_get(&self->samplers[(unsigned)(sampler)]); }
 static const ImplementationWorkarounds *device_get_workarounds(Device *self) { return &self->workarounds; }
@@ -6033,6 +6059,25 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
       BlitInfoVec_clear(&self->queue.unscaled_masked_blits);
    }
 
+   static void renderer_set_opaque_primitive_spec_constants(Renderer *self,
+         int trans_mode)
+   {
+      CommandBuffer *cmd = cbh_get(&self->cmd);
+      commandbuffer_set_specialization_constant(cmd, SpecConstIndex_TransMode, trans_mode);
+      commandbuffer_set_specialization_constant(cmd, SpecConstIndex_FilterMode, FilterMode_NearestNeighbor);
+      commandbuffer_set_specialization_constant(cmd, SpecConstIndex_BlendMode, BlendMode_BlendAdd);
+      commandbuffer_set_specialization_constant(cmd, SpecConstIndex_Scaling, self->scaling);
+      commandbuffer_set_specialization_constant(cmd, SpecConstIndex_Shift, 0);
+      commandbuffer_set_specialization_constant(cmd, SpecConstIndex_OffsetUV, 0);
+      commandbuffer_set_specialization_constant(cmd, SpecConstIndex_HotSource,
+            (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? psx_hdr_overbright_hot : 0);
+      commandbuffer_set_specialization_constant(cmd, SpecConstIndex_MaskTest, 0);
+      commandbuffer_set_specialization_constant(cmd, SpecConstIndex_PreciseColor,
+            (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? psx_pgxp_color : 0);
+      commandbuffer_set_specialization_constant(cmd, SpecConstIndex_PgxpFog,
+            (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? (psx_pgxp_color && psx_pgxp_fog) : 0);
+   }
+
    static void renderer_render_semi_transparent_opaque_texture_primitives(Renderer *self){
       BufferVertexVec *vertices = &self->queue.semi_transparent_opaque;
       PrimitiveInfoVec *scissors = &self->queue.semi_transparent_opaque_scissor;
@@ -6042,11 +6087,7 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
       commandbuffer_set_opaque_state(cbh_get(&self->cmd));
       commandbuffer_set_cull_mode(cbh_get(&self->cmd), VK_CULL_MODE_NONE);
       commandbuffer_set_depth_compare(cbh_get(&self->cmd), VK_COMPARE_OP_LESS);
-      commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_TransMode, TransMode_SemiTransOpaque);
-      commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_Scaling, self->scaling);
-      /* Same omission and same fix as the opaque textured drain below. */
-      commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_PgxpFog,
-            (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? (psx_pgxp_color && psx_pgxp_fog) : 0);
+      renderer_set_opaque_primitive_spec_constants(self, TransMode_SemiTransOpaque);
       commandbuffer_set_primitive_topology(cbh_get(&self->cmd), VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0);
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, color));
@@ -6068,17 +6109,8 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
       commandbuffer_set_opaque_state(cbh_get(&self->cmd));
       commandbuffer_set_cull_mode(cbh_get(&self->cmd), VK_CULL_MODE_NONE);
       commandbuffer_set_depth_compare(cbh_get(&self->cmd), VK_COMPARE_OP_LESS);
-      commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_TransMode, TransMode_Opaque);
-      commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_Scaling, self->scaling);
+      renderer_set_opaque_primitive_spec_constants(self, TransMode_Opaque);
       commandbuffer_set_primitive_topology(cbh_get(&self->cmd), VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
-      /* The linear-light depth-cue constant was set only in
-       * renderer_semi_transparent_set_state, so every opaque pipeline
-       * compiled with the fog mix off while the CPU side had already
-       * substituted pre-cue precise colours: the opaque world rendered
-       * with no fog at all under 30-bit HDR. Same expression as the
-       * semi-transparent site. */
-      commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_PgxpFog,
-            (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? (psx_pgxp_color && psx_pgxp_fog) : 0);
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0);
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, color));
       commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 2, 0, VK_FORMAT_R8G8B8A8_UINT, offsetof(BufferVertex, window));
@@ -9774,11 +9806,7 @@ static void renderer_render_opaque_primitives(Renderer *self){
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0);
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, color));
    commandbuffer_set_vertex_attrib(cbh_get(&self->cmd), 6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(BufferVertex, fog));
-   /* Same omission and same fix as the textured drains: without the
-    * constant the flat pipeline compiled with the fog mix off and drew
-    * the pre-cue colour raw. */
-   commandbuffer_set_specialization_constant(cbh_get(&self->cmd), SpecConstIndex_PgxpFog,
-         (self->scaled_fb_format == VK_FORMAT_R16G16B16A16_SFLOAT) ? (psx_pgxp_color && psx_pgxp_fog) : 0);
+   renderer_set_opaque_primitive_spec_constants(self, TransMode_Opaque);
    commandbuffer_set_primitive_topology(cbh_get(&self->cmd), VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
 
    renderer_dispatch(self, vertices, scissors, false);
@@ -12434,11 +12462,36 @@ static bool deviceallocator_allocate(struct DeviceAllocator *self, uint32_t size
       return ret ? ret->value : VK_NULL_HANDLE;
    }
 
+   static void device_pipeline_cache_mark_dirty(Device *self);
+
    static VkPipeline program_add_pipeline(struct Program *self,
          Hash hash,
          VkPipeline pipeline)
    {
-      return vk_pipeline_map_emplace_yield(&self->pipelines, hash, pipeline)->value;
+      IntrusivePODWrapperPipeline *entry;
+
+      if (pipeline == VK_NULL_HANDLE)
+         return VK_NULL_HANDLE;
+
+      /* A hash that is already published keeps its pipeline; the fresh
+       * handle would otherwise leak. */
+      entry = vk_pipeline_map_find(&self->pipelines, hash);
+      if (entry)
+      {
+         if (entry->value != pipeline)
+            vkDestroyPipeline(device_get_device(self->device), pipeline, NULL);
+         return entry->value;
+      }
+
+      entry = vk_pipeline_map_emplace_yield(&self->pipelines, hash, pipeline);
+      if (!entry)
+      {
+         vkDestroyPipeline(device_get_device(self->device), pipeline, NULL);
+         return VK_NULL_HANDLE;
+      }
+
+      device_pipeline_cache_mark_dirty(self->device);
+      return entry->value;
    }
 
    static void program_fini(struct Program *self)
@@ -14140,6 +14193,7 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
          Hash hash)
    {
       VkPipeline compute_pipeline;
+      VkResult res;
       const Shader *shader = program_get_shader(self->current_program, ShaderStage_Compute);
       VkComputePipelineCreateInfo info = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
       info.layout = pipeline_layout_get_layout(program_get_pipeline_layout(self->current_program));
@@ -14177,8 +14231,10 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
       }
 
 
-      LOGI("Creating compute pipeline.\n");
-      if (vkCreateComputePipelines(device_get_device(self->device), VK_NULL_HANDLE, 1, &info, NULL, &compute_pipeline) != VK_SUCCESS)
+      res = vkCreateComputePipelines(device_get_device(self->device),
+            device_get_pipeline_cache(self->device), 1, &info, NULL,
+            &compute_pipeline);
+      if (res != VK_SUCCESS)
          LOGE("Failed to create compute pipeline!\n");
 
       return program_add_pipeline(self->current_program, hash, compute_pipeline);
@@ -14352,8 +14408,8 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
       pipe.stageCount = num_stages;
 
 
-      LOGI("Creating graphics pipeline.\n");
-      res = vkCreateGraphicsPipelines(device_get_device(self->device), VK_NULL_HANDLE, 1, &pipe, NULL, &pipeline);
+      res = vkCreateGraphicsPipelines(device_get_device(self->device),
+            device_get_pipeline_cache(self->device), 1, &pipe, NULL, &pipeline);
       if (res != VK_SUCCESS)
          LOGE("Failed to create graphics pipeline!\n");
 
@@ -15642,6 +15698,307 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
       return self->per_frame.items[self->frame_context_index];
    }
 
+   /* Persistent Vulkan pipeline cache.
+    *
+    * The driver blob returned by vkGetPipelineCacheData is wrapped in a
+    * small header (magic, format version, payload size, CRC32) and written
+    * to <save>/Beetle PSX HW/vulkan_pipeline_cache_<vendor>_<device>_<uuid>.bin
+    * through the libretro VFS, via a sibling temporary and rename so a
+    * reader never sees a torn file. On the next device_set_context the file
+    * is validated (wrapper CRC, then the Vulkan header's vendor/device/
+    * pipelineCacheUUID against the current GPU) and handed to
+    * vkCreatePipelineCache as initial data. Anything that fails validation
+    * is ignored and overwritten by the next save.
+    *
+    * Saves are debounced: a publish marks the cache dirty and resets a quiet
+    * counter, and device_next_frame_context writes once the counter reaches
+    * PIPELINE_CACHE_FLUSH_FRAMES. Bursts of compiles therefore cost one
+    * write, and a session killed without a clean unload still keeps every
+    * pipeline compiled more than a few seconds before it died. device_deinit
+    * saves whatever is still dirty. A blob whose CRC matches the last one
+    * on disk is not rewritten. */
+#define PIPELINE_CACHE_FILE_MAGIC     "BPSXVKC1"
+#define PIPELINE_CACHE_FILE_VERSION   1u
+#define PIPELINE_CACHE_FILE_HEADER    24u
+#define PIPELINE_CACHE_MAX_DATA       (64u * 1024u * 1024u)
+#define PIPELINE_CACHE_FLUSH_FRAMES   180u
+
+   static uint32_t pipeline_cache_rd32(const uint8_t *d)
+   {
+      return (uint32_t)d[0] | ((uint32_t)d[1] << 8) |
+         ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
+   }
+
+   static void pipeline_cache_wr32(uint8_t *d, uint32_t v)
+   {
+      d[0] = (uint8_t)v;
+      d[1] = (uint8_t)(v >> 8);
+      d[2] = (uint8_t)(v >> 16);
+      d[3] = (uint8_t)(v >> 24);
+   }
+
+   static void pipeline_cache_hex(char *out, const uint8_t *in, size_t n)
+   {
+      static const char hex[] = "0123456789abcdef";
+      size_t i;
+      for (i = 0; i < n; i++)
+      {
+         out[2 * i]     = hex[in[i] >> 4];
+         out[2 * i + 1] = hex[in[i] & 15];
+      }
+      out[2 * n] = '\0';
+   }
+
+   /* Vulkan pipeline cache header (spec 9.6, version one layout, little
+    * endian): size, version, vendorID, deviceID, pipelineCacheUUID. A blob
+    * from another GPU or driver build is rejected here rather than left for
+    * the driver to discard. */
+   static bool device_pipeline_cache_blob_ok(const Device *self,
+         const uint8_t *d, size_t n)
+   {
+      if (n < 16 + VK_UUID_SIZE)
+         return false;
+      return pipeline_cache_rd32(d) >= 16 + VK_UUID_SIZE &&
+         pipeline_cache_rd32(d) <= n &&
+         pipeline_cache_rd32(d + 4) == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+         pipeline_cache_rd32(d + 8) == self->gpu_props.vendorID &&
+         pipeline_cache_rd32(d + 12) == self->gpu_props.deviceID &&
+         memcmp(d + 16, self->gpu_props.pipelineCacheUUID, VK_UUID_SIZE) == 0;
+   }
+
+   /* Returns a malloc'd path, or NULL when the save directory is unset or
+    * (when create is set) the subdirectory cannot be made. */
+   static char *device_pipeline_cache_path(const Device *self, bool create)
+   {
+      char *dir;
+      char *path;
+      char name[96];
+      uint8_t id[8];
+
+      if (retro_save_directory[0] == '\0')
+         return NULL;
+
+      dir = (char*)malloc(2 * PATH_MAX_LENGTH);
+      if (!dir)
+         return NULL;
+      path = dir + PATH_MAX_LENGTH;
+
+      fill_pathname_join_special(dir, retro_save_directory,
+            "Beetle PSX HW", PATH_MAX_LENGTH);
+      if (create && !path_mkdir(dir))
+      {
+         LOGE("[Vulkan pipeline cache] could not create %s\n", dir);
+         free(dir);
+         return NULL;
+      }
+
+      /* Big-endian so the name reads as the usual 0x000010de style. */
+      id[0] = (uint8_t)(self->gpu_props.vendorID >> 24);
+      id[1] = (uint8_t)(self->gpu_props.vendorID >> 16);
+      id[2] = (uint8_t)(self->gpu_props.vendorID >> 8);
+      id[3] = (uint8_t)(self->gpu_props.vendorID);
+      id[4] = (uint8_t)(self->gpu_props.deviceID >> 24);
+      id[5] = (uint8_t)(self->gpu_props.deviceID >> 16);
+      id[6] = (uint8_t)(self->gpu_props.deviceID >> 8);
+      id[7] = (uint8_t)(self->gpu_props.deviceID);
+      strlcpy(name, "vulkan_pipeline_cache_", sizeof(name));
+      pipeline_cache_hex(name + strlen(name), id, 8);
+      strlcat(name, "_", sizeof(name));
+      pipeline_cache_hex(name + strlen(name),
+            self->gpu_props.pipelineCacheUUID, VK_UUID_SIZE);
+      strlcat(name, ".bin", sizeof(name));
+
+      fill_pathname_join_special(path, dir, name, PATH_MAX_LENGTH);
+      memmove(dir, path, strlen(path) + 1);
+      return dir;
+   }
+
+   /* Reads and validates the on-disk cache. On success returns the driver
+    * blob (payload only, malloc'd) and its size. */
+   static uint8_t *device_pipeline_cache_read(Device *self, size_t *size)
+   {
+      char *path;
+      void *buf     = NULL;
+      int64_t len   = 0;
+      uint8_t *d;
+      uint32_t payload;
+      uint32_t crc;
+      const char *why = NULL;
+
+      *size = 0;
+      path  = device_pipeline_cache_path(self, false);
+      if (!path)
+         return NULL;
+      if (!path_is_valid(path))
+      {
+         free(path);
+         return NULL;
+      }
+      if (filestream_read_file(path, &buf, &len) != 1 || !buf)
+      {
+         LOGI("[Vulkan pipeline cache] could not read %s\n", path);
+         free(path);
+         free(buf);
+         return NULL;
+      }
+
+      d = (uint8_t*)buf;
+      if (len < (int64_t)(PIPELINE_CACHE_FILE_HEADER + 16 + VK_UUID_SIZE) ||
+          len > (int64_t)(PIPELINE_CACHE_FILE_HEADER + PIPELINE_CACHE_MAX_DATA))
+         why = "size out of range";
+      else if (memcmp(d, PIPELINE_CACHE_FILE_MAGIC, 8) != 0)
+         why = "bad magic";
+      else if (pipeline_cache_rd32(d + 8) != PIPELINE_CACHE_FILE_VERSION)
+         why = "wrapper version mismatch";
+      else
+      {
+         payload = pipeline_cache_rd32(d + 12);
+         crc     = pipeline_cache_rd32(d + 16);
+         if (payload != (uint32_t)(len - PIPELINE_CACHE_FILE_HEADER))
+            why = "payload size mismatch";
+         else if (encoding_crc32(0, d + PIPELINE_CACHE_FILE_HEADER, payload) != crc)
+            why = "CRC mismatch";
+         else if (!device_pipeline_cache_blob_ok(self,
+                  d + PIPELINE_CACHE_FILE_HEADER, payload))
+            why = "different GPU or driver";
+      }
+
+      if (why)
+      {
+         LOGI("[Vulkan pipeline cache] ignoring %s: %s\n", path, why);
+         free(path);
+         free(buf);
+         return NULL;
+      }
+
+      memmove(d, d + PIPELINE_CACHE_FILE_HEADER, payload);
+      *size = payload;
+      self->pipeline_cache_saved_crc  = crc;
+      self->pipeline_cache_saved_size = payload;
+      LOGI("[Vulkan pipeline cache] loaded %u bytes from %s\n",
+            (unsigned)payload, path);
+      free(path);
+      return d;
+   }
+
+   /* Creates self->pipeline_cache, seeded from disk when a compatible file
+    * exists. Falls back to an empty cache, then to no cache at all. */
+   static void device_pipeline_cache_create(Device *self)
+   {
+      VkPipelineCacheCreateInfo info = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+      VkResult res;
+      size_t size = 0;
+      uint8_t *data;
+
+      self->pipeline_cache            = VK_NULL_HANDLE;
+      self->pipeline_cache_saved_crc  = 0;
+      self->pipeline_cache_saved_size = 0;
+      self->pipeline_cache_dirty      = 0;
+      self->pipeline_cache_quiet_frames = 0;
+
+      data = device_pipeline_cache_read(self, &size);
+      if (data)
+      {
+         info.initialDataSize = size;
+         info.pInitialData    = data;
+         res = vkCreatePipelineCache(self->device, &info, NULL, &self->pipeline_cache);
+         free(data);
+         if (res == VK_SUCCESS)
+            return;
+         LOGE("[Vulkan pipeline cache] driver rejected on-disk data result=%d\n", (int)res);
+         self->pipeline_cache_saved_size = 0;
+         info.initialDataSize = 0;
+         info.pInitialData    = NULL;
+      }
+
+      res = vkCreatePipelineCache(self->device, &info, NULL, &self->pipeline_cache);
+      if (res != VK_SUCCESS)
+      {
+         self->pipeline_cache = VK_NULL_HANDLE;
+         LOGE("[Vulkan pipeline cache] create failed result=%d; continuing without driver cache\n",
+               (int)res);
+      }
+   }
+
+   static void device_pipeline_cache_mark_dirty(Device *self)
+   {
+      if (self->pipeline_cache_dirty != ~0u)
+         self->pipeline_cache_dirty++;
+      self->pipeline_cache_quiet_frames = 0;
+   }
+
+   /* Writes the current blob if it differs from what is on disk. Clears the
+    * dirty count either way so a persistently failing path (read-only save
+    * directory, full disk) is retried once per burst of compiles, not once
+    * per frame. */
+   static void device_pipeline_cache_save(Device *self)
+   {
+      size_t size = 0;
+      size_t got;
+      uint8_t *buf;
+      uint32_t crc;
+      char *path;
+      VkResult res;
+
+      if (self->pipeline_cache == VK_NULL_HANDLE || !self->pipeline_cache_dirty)
+         return;
+      self->pipeline_cache_dirty        = 0;
+      self->pipeline_cache_quiet_frames = 0;
+
+      res = vkGetPipelineCacheData(self->device, self->pipeline_cache, &size, NULL);
+      if (res != VK_SUCCESS || size == 0 || size > PIPELINE_CACHE_MAX_DATA)
+      {
+         if (res != VK_SUCCESS)
+            LOGE("[Vulkan pipeline cache] size query failed result=%d\n", (int)res);
+         return;
+      }
+
+      buf = (uint8_t*)malloc(PIPELINE_CACHE_FILE_HEADER + size);
+      if (!buf)
+         return;
+
+      got = size;
+      res = vkGetPipelineCacheData(self->device, self->pipeline_cache, &got,
+            buf + PIPELINE_CACHE_FILE_HEADER);
+      if (res != VK_SUCCESS || got == 0 || got > size ||
+          !device_pipeline_cache_blob_ok(self, buf + PIPELINE_CACHE_FILE_HEADER, got))
+      {
+         LOGE("[Vulkan pipeline cache] data query failed result=%d\n", (int)res);
+         free(buf);
+         return;
+      }
+
+      crc = encoding_crc32(0, buf + PIPELINE_CACHE_FILE_HEADER, got);
+      if (got == self->pipeline_cache_saved_size && crc == self->pipeline_cache_saved_crc)
+      {
+         free(buf);
+         return;
+      }
+
+      memcpy(buf, PIPELINE_CACHE_FILE_MAGIC, 8);
+      pipeline_cache_wr32(buf + 8, PIPELINE_CACHE_FILE_VERSION);
+      pipeline_cache_wr32(buf + 12, (uint32_t)got);
+      pipeline_cache_wr32(buf + 16, crc);
+      pipeline_cache_wr32(buf + 20, 0);
+
+      path = device_pipeline_cache_path(self, true);
+      if (path)
+      {
+         if (filestream_write_file_atomic(path, buf,
+                  (int64_t)(PIPELINE_CACHE_FILE_HEADER + got)))
+         {
+            self->pipeline_cache_saved_crc  = crc;
+            self->pipeline_cache_saved_size = got;
+            LOGI("[Vulkan pipeline cache] saved %u bytes to %s\n",
+                  (unsigned)got, path);
+         }
+         else
+            LOGE("[Vulkan pipeline cache] write failed: %s\n", path);
+         free(path);
+      }
+      free(buf);
+   }
+
    static void device_init(Device *self)
    {
       /* Device is malloc'd with uninitialised storage; in the C++ source it was
@@ -15656,6 +16013,11 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
       self->graphics_queue = VK_NULL_HANDLE;
       self->compute_queue  = VK_NULL_HANDLE;
       self->transfer_queue = VK_NULL_HANDLE;
+      self->pipeline_cache = VK_NULL_HANDLE;
+      self->pipeline_cache_saved_crc    = 0;
+      self->pipeline_cache_saved_size   = 0;
+      self->pipeline_cache_dirty        = 0;
+      self->pipeline_cache_quiet_frames = 0;
       self->cookie         = 0;
       self->frame_context_index         = 0;
       self->graphics_queue_family_index = 0;
@@ -15713,6 +16075,7 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
    static void device_deinit(Device *self)
    {
       device_wait_idle_nolock(self);
+      device_pipeline_cache_save(self);
 
       framebuffer_allocator_clear(&self->framebuffer_allocator);
       attachment_allocator_clear(&self->transient_allocator);
@@ -15734,6 +16097,11 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
       framebuffer_allocator_deinit(&self->framebuffer_allocator);
       attachment_allocator_deinit(&self->transient_allocator);
       program_map_deinit(&self->programs);
+      if (self->pipeline_cache != VK_NULL_HANDLE)
+      {
+         vkDestroyPipelineCache(self->device, self->pipeline_cache, NULL);
+         self->pipeline_cache = VK_NULL_HANDLE;
+      }
       shader_map_deinit(&self->shaders);
       render_pass_map_deinit(&self->render_passes);
       descriptor_set_allocator_map_deinit(&self->descriptor_set_allocators);
@@ -15985,6 +16353,11 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
       self->instance = context_get_instance(context);
       self->gpu = context_get_gpu(context);
       self->device = context_get_device(context);
+      self->mem_props = *context_get_mem_props(context);
+      self->gpu_props = *context_get_gpu_props(context);
+
+      /* Needs gpu_props: the on-disk blob is matched against the GPU. */
+      device_pipeline_cache_create(self);
 
       self->graphics_queue_family_index = context_get_graphics_queue_family(context);
       self->graphics_queue = context_get_graphics_queue(context);
@@ -15992,9 +16365,6 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
       self->compute_queue = context_get_compute_queue(context);
       self->transfer_queue_family_index = context_get_transfer_queue_family(context);
       self->transfer_queue = context_get_transfer_queue(context);
-
-      self->mem_props = *context_get_mem_props(context);
-      self->gpu_props = *context_get_gpu_props(context);
 
       device_init_workarounds(self);
 
@@ -16915,6 +17285,12 @@ static void device_next_frame_context(Device *self)
       self->frame_context_index = 0;
 
    per_frame_begin(device_frame(self));
+
+   /* Debounced pipeline cache flush: write once compilation has been quiet
+    * for PIPELINE_CACHE_FLUSH_FRAMES frames. */
+   if (self->pipeline_cache_dirty &&
+       ++self->pipeline_cache_quiet_frames >= PIPELINE_CACHE_FLUSH_FRAMES)
+      device_pipeline_cache_save(self);
 }
 
    static void per_frame_begin(struct PerFrame *self)
