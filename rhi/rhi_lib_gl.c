@@ -2520,19 +2520,6 @@ static TTRect gl_tt_texture_vram_rect(gl_renderer *r,
    return out;
 }
 
-static void gl_vram_sync_clear(gl_renderer *renderer)
-{
-   unsigned ty;
-   unsigned tx;
-
-   /* Synchronization makes pending writers current, but does not change
-    * where the pixels originated. Preserve GPU-written provenance. */
-   for (ty = 0; ty < GL_VRAM_SYNC_TILES_Y; ty++)
-      for (tx = 0; tx < GL_VRAM_SYNC_TILES_X; tx++)
-         memset(renderer->vram_sync.tiles[ty][tx].writers, 0,
-               sizeof(renderer->vram_sync.tiles[ty][tx].writers));
-}
-
 /* Return the bits covered by a native VRAM rectangle inside one 8x8 tile.
  * raw_tx/raw_ty may address a wrapped tile; the caller folds the resulting
  * tile index back into the 1024x512 VRAM array. */
@@ -7262,69 +7249,10 @@ void rhi_gl_finalize_frame(const void *fb, unsigned width,
       }
    }
 
-   /* Copy this frame's VRAM back into fb_texture so the next frame's
-    * textured draws can sample it: offscreen rendering, motion blur and
-    * every other framebuffer-as-texture effect depend on it.
-    *
-    * The source is fb_native when it is live - a 1:1 copy of a PS1-resolution
-    * rendering - and fb_out otherwise, in which case the shader point-samples
-    * one texel out of each upscale x upscale block. */
-   {
-      gl_framebuffer _fb;
-      bool mirror_native = renderer->native_target_enabled
-            && renderer->fb_native.id != 0;
-      gl_image_load_vertex slice[4] =
-      {
-         {   {   0,   0   }   },
-         {   {1023,   0   }   },
-         {   {   0, 511   }   },
-         {   {1023, 511   }   },
-      };
-
-      /* Texture unit 1 still holds fb_out from the output draw above. */
-      if (mirror_native)
-      {
-         glActiveTexture(GL_TEXTURE1);
-         glBindTexture(GL_TEXTURE_2D, renderer->fb_native.id);
-         glActiveTexture(GL_TEXTURE0);
-      }
-
-      if (renderer->image_load_buffer)
-      {
-         gl_draw_buffer_push_slice(renderer->image_load_buffer, &slice, 4,
-               sizeof(gl_image_load_vertex));
-
-         if (renderer->image_load_buffer->program)
-         {
-            glUseProgram(renderer->image_load_buffer->program->id);
-            glUniform1i(gl_uniform_map_get(&renderer->image_load_buffer->program->uniforms, "fb_texture"), 1);
-         }
-      }
-
-      /* GL_SCISSOR_TEST and GL_BLEND were disabled at the top of
-       * the finalize block (a few hundred lines up) for the
-       * frontend output draw, and nothing in the output draw or
-       * gl_draw_buffer_draw modifies either, so they are still off
-       * here.  Two reflexive disables removed. */
-
-      gl_framebuffer_init(&_fb, &renderer->fb_texture);
-
-      if (renderer->image_load_buffer->program)
-      {
-         glUseProgram(renderer->image_load_buffer->program->id);
-         glUniform1ui(gl_uniform_map_get(&renderer->image_load_buffer->program->uniforms, "internal_upscaling"),
-               mirror_native ? 1u : renderer->internal_upscaling);
-      }
-
-      if (!gl_draw_buffer_is_empty(renderer->image_load_buffer))
-         gl_draw_buffer_draw(renderer->image_load_buffer, GL_TRIANGLE_STRIP);
-
-      glDeleteFramebuffers(1, &_fb.id);
-   }
-
-   /* The unconditional full-VRAM fb_out -> fb_texture copy above makes
-    * every tile current for the start of the next frame. */
-   gl_vram_sync_clear(renderer);
+   /* Preserve dirty regions across frames. A later textured primitive resolves
+    * only the regions it samples (including its CLUT) through the existing
+    * GPU dependency path. Scanout reads fb_out directly, so presenting does
+    * not require copying all VRAM or clearing the CPU dependency table. */
 
    gl_stats_report(renderer);
 
@@ -8824,20 +8752,11 @@ cleanup:
  *                 draws (you can't sample-and-render the same texture in
  *                 portable GL).
  *
- * They're loosely synchronised by an unconditional fb_out -> fb_texture
- * blit at end-of-frame (see the bottom of rhi_gl_finalize_frame). That
- * is sufficient for fb_out mutations whose effect only needs to be
- * visible to the *next* frame's textured draws. It is NOT sufficient
- * when the same frame later samples the mutated region as a texture -
- * fb_texture stays stale until end-of-frame, so the textured draw reads
- * pre-mutation pixels.
- *
- * This helper closes the gap on demand. Call it from any rhi_gl_*
- * entry point that mutates a region of fb_out and wants subsequent
- * same-frame textured draws to see the new pixels. The blit goes
- * through GL_NEAREST (matching the historical 1x-degrade behaviour
- * the SW path would have produced) and downsamples from upscaled
- * fb_out to native fb_texture in one call.
+ * Pending primitive writes remain dirty across frame boundaries. Before a
+ * textured draw samples a dirty region, gl_vram_sync_primitive flushes its
+ * producers and resolves that region on the GPU. Fills, copies and uploads
+ * maintain the same dependency tracking. Presentation samples fb_out directly
+ * and does not need to materialize the texture mirror.
  *
  * Gating (the same conditions the long-standing rhi_gl_copy_rect
  * mirror has used since the FF7-swirl fix):

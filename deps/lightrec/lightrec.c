@@ -135,10 +135,13 @@ static void __segfault_cb(struct lightrec_state *state, u32 addr,
 			  const struct block *block)
 {
 	lightrec_set_exit_flags(state, LIGHTREC_EXIT_SEGFAULT);
-	pr_err("Segmentation fault in recompiled code: invalid "
+	/* This is a completed guest access, not a host signal. The embedding
+	 * core handles stalled execution separately; do not flood its logging
+	 * callback on every iteration of an unmapped guest-memory probe. */
+	pr_debug("Unmapped guest "
 	       "load/store at address "PC_FMT"\n", addr);
 	if (block)
-		pr_err("Was executing block "PC_FMT"\n", block->pc);
+		pr_debug("Was executing block "PC_FMT"\n", block->pc);
 }
 
 static void lightrec_swl(struct lightrec_state *state,

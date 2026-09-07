@@ -23,3 +23,22 @@ make -C tools/multicore check BUILD_DIR=/tmp/beetle-multicore-tsan \
 These tests establish deterministic behavior for synthetic SPU workloads.
 Full BIOS/game boot, frontend callbacks, and achievement runtime integration
 still require testing the built core in a frontend.
+
+The GPU test generator also covers mask handling, wrapped/overlapping copies,
+and texture/CLUT dependencies across frame boundaries (including VRAM edges).
+It can generate a minimal test-only BIOS that jumps to the core's EXE loader:
+
+```
+python3 tools/multicore/make_gpu_test.py /tmp/gpu-test.exe --bios-dir /tmp/gpu-bios
+GLHOST_SYSTEM_DIR=/tmp/gpu-bios GLHOST_SAVE_DIR=/tmp/gpu-save \
+  GLHOST_TEST_REPORT=1 \
+  GLHOST_VARS='beetle_psx_hw_renderer_software_fb=disabled;beetle_psx_hw_cpu_dynarec=disabled' \
+  tools/glhost/glhost /path/to/core /tmp/gpu-test.exe - 40 /tmp/gpu-output
+```
+
+Repeat at 2x resolution, with `GLHOST_RECREATE_AT=3`, and with the software
+framebuffer enabled. The report must pass all 19 cases (701 words).
+Use `--unmapped-probes 1024` to exercise Lightrec's completed unmapped loads;
+test both `execute` and `run_interpreter` and check that no "until reset"
+fallback is logged. Software cores use the `beetle_psx_cpu_dynarec` option key.
+These BIOS files are only for this test, not game compatibility testing.

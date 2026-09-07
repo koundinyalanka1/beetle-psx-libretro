@@ -61,6 +61,7 @@ uint8_t next_interpreter;
 /* Do not retry a failing recompiler every frame or on unrelated option
  * updates. CPU_Power starts a fresh session. */
 static bool lightrec_failed;
+static unsigned lightrec_guest_warnings;
 static struct lightrec_registers *lightrec_regs;
 #endif
 
@@ -397,6 +398,7 @@ void CPU_Power(PS_CPU *self)
 #ifdef HAVE_LIGHTREC
    next_interpreter = 0;
    lightrec_failed = false;
+   lightrec_guest_warnings = 0;
    prev_dynarec     = psx_dynarec;
    prev_invalidate  = psx_dynarec_invalidate;
    prev_spgp_opt = psx_dynarec_spgp_opt;
@@ -3718,9 +3720,8 @@ static int32_t lightrec_plugin_execute(PS_CPU *self, int32_t timestamp)
    uint32_t      flags;
    /* Previous fault site, to tell a fault that made progress from one that
     * did not; see the LIGHTREC_EXIT_SEGFAULT handling below. */
-   uint32_t      fault_pc = ~0u;
    int32_t       fault_ts = -1;
-   unsigned      fault_n  = 0;
+   unsigned      fault_stall = 0;
 
    (void)self;
    (void)new_PC_mask;
@@ -3773,48 +3774,36 @@ static int32_t lightrec_plugin_execute(PS_CPU *self, int32_t timestamp)
       }
       else if (flags & LIGHTREC_EXIT_SEGFAULT)
       {
-         /*
-          * One flag, two very different events.
-          *
-          * lightrec_rw() raises it for a guest load/store to an address in no
-          * memory map, *after* resolving it the way the hardware does - the
-          * load returned 0, the store was dropped - and games rely on that:
-          * they dereference a pointer before initialising it (lightrec.c
-          * names Sled Storm).  PC and the cycle count both advance.
-          *
-          * The other four sites - a block that cannot be precompiled, a block
-          * missing from the LUT, a PC outside its block - raise it having done
-          * nothing at all.  Re-entering repeats the same failure forever,
-          * which is an unrecoverable retro_run and an ANR rather than a crash.
-          *
-          * Progress is what separates them, so use that rather than retiring
-          * the recompiler on the first unmapped access a game happens to make.
-          */
-         if (PC == fault_pc && timestamp == fault_ts)
+         /* Lightrec sets this flag both after completing an unmapped
+          * load/store (returning zero / dropping the store) and when it
+          * cannot decode or find an instruction block. Allow completed
+          * accesses to continue, however often they occur. Retire only
+          * after repeated exits with no cycle progress, even if PCs differ.
+          * This uses emulated cycles, with no host clock reads. */
+         if (timestamp == fault_ts)
          {
-            lightrec_failed = true;
-            log_cb(RETRO_LOG_WARN,
-                  "Lightrec cannot advance past PC 0x%08x (cycle 0x%08x); "
-                  "using Beetle interpreter until reset\n", PC, timestamp);
-         }
-         else
-         {
-            fault_pc = PC;
-            fault_ts = timestamp;
-
-            /* Bounded so a fault that keeps moving - several undecodable
-             * blocks in turn - still terminates instead of spinning. */
-            if (++fault_n >= 64)
+            if (++fault_stall >= 2)
             {
                lightrec_failed = true;
                log_cb(RETRO_LOG_WARN,
-                     "Lightrec faulted %u times in one slice (last PC 0x%08x); "
-                     "using Beetle interpreter until reset\n", fault_n, PC);
+                     "Lightrec cannot advance past PC 0x%08x (cycle 0x%08x); "
+                     "using Beetle interpreter until reset\n", PC, timestamp);
             }
-            else if (fault_n <= 4)
+         }
+         else
+         {
+            fault_stall = 0;
+            fault_ts    = timestamp;
+
+            /* Limit frontend log callbacks over the session, not per frame. */
+            if (lightrec_guest_warnings < 4)
+            {
+               lightrec_guest_warnings++;
                log_cb(RETRO_LOG_WARN,
                      "Guest access to unmapped address at PC 0x%08x, "
-                     "cycle 0x%08x\n", PC, timestamp);
+                     "cycle 0x%08x%s\n", PC, timestamp,
+                     lightrec_guest_warnings == 4 ? " (further occurrences silenced)" : "");
+            }
          }
       }
 

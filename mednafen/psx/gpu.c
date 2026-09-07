@@ -21,6 +21,7 @@
 #include "timer.h"
 #include "FastFIFO.h"
 
+#include <stdlib.h>
 #include <retro_miscellaneous.h>
 #include <rthreads/rthreads.h>
 #include <features/features_cpu.h>
@@ -206,6 +207,8 @@ static uint32_t gpu_stage_inline_n = 0;
  * also what says whether the software framebuffer (which rasterises every
  * primitive on the CPU on top of the hardware renderer) is worth its keep. */
 static uint64_t gpu_inline_us = 0;
+/* BEETLE_PSX_GPU_TIME=1 turns on per-word timing of GP0 execution. */
+static bool gpu_time_words = false;
 /*
  * VRAM read-back accounting.  These two decide whether the software
  * framebuffer is worth keeping.
@@ -1573,6 +1576,11 @@ bool GPU_Init(bool pal_clock_and_tv,
 {
    int x, y, v;
 
+   {
+      const char *e = getenv("BEETLE_PSX_GPU_TIME");
+      gpu_time_words = e && *e && *e != '0';
+   }
+
    /* Defensive: this reallocates GPU.vram and resets state the worker reads.
     * The lifecycle should already have stopped it (retro_unload_game and
     * GPU_Destroy both do), so this is a no-op - but it is the difference
@@ -2778,6 +2786,40 @@ static void GPU_Stage_Resolve(void)
    }
 }
 
+/*
+ * GP0 accounting for the non-threaded path.
+ *
+ * gpu_push_n and gpu_inline_us used to be maintained only by GPU_Stage_GP0(),
+ * which runs solely with the worker on.  With the worker off - the shipping
+ * configuration, since it measured as dead weight on every device tried - each
+ * GP0 word bypassed both, so the periodic report read "0 words/frame (0
+ * inline, 0.00 ms/frame)" while the guest was visibly drawing and the cost of
+ * executing GP0 stayed folded into the CPU bucket, indistinguishable from
+ * lightrec.  That is the number needed to decide whether GPU command execution
+ * is worth attacking at all, so it cannot be the one that is missing.
+ *
+ * The word count is a bare increment and always on.  Timing costs two clock
+ * reads per word, which at a few thousand words a frame is not free, so it is
+ * opt-in via BEETLE_PSX_GPU_TIME=1 - the same pattern as BEETLE_GL_STATS.
+ */
+static INLINE void GPU_ExecGP0_Inline(uint32_t V, uint32_t addr)
+{
+   gpu_push_n++;
+   gpu_stage_inline_n++;
+
+   if (!gpu_time_words)
+   {
+      GPU_WriteGP0_Internal(V, addr);
+      return;
+   }
+
+   {
+      retro_time_t t0 = cpu_features_get_time_usec();
+      GPU_WriteGP0_Internal(V, addr);
+      gpu_inline_us += (uint64_t)(cpu_features_get_time_usec() - t0);
+   }
+}
+
 static INLINE void GPU_Stage_GP0(uint32_t V, uint32_t addr)
 {
    /* Counted here rather than at the ring so the reported word rate stays
@@ -2821,7 +2863,7 @@ void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
             GPU_Worker_Sync();
          return;
       }
-      GPU_WriteGP0_Internal(V, A);
+      GPU_ExecGP0_Inline(V, A);
    }
 }
 
@@ -2836,7 +2878,7 @@ void GPU_WriteDMA(uint32_t V, uint32_t addr)
          GPU_Worker_Sync();
       return;
    }
-   GPU_WriteGP0_Internal(V, addr);
+   GPU_ExecGP0_Inline(V, addr);
 }
 
 static INLINE uint32_t GPU_ReadData(void)

@@ -138,7 +138,7 @@ def cmd_colour(op, c):
     return (op << 24) | (b << 16) | (g << 8) | r
 
 
-def build():
+def build(unmapped_probes=0):
     a = Asm(LOAD_ADDR)
     cases = []
 
@@ -173,6 +173,18 @@ def build():
     a.sw(ZERO, 4, S2)
     for off in (8, 12, 16, 20, 24, 28, 32, 36):
         a.sw(ZERO, off, S2)
+
+    if unmapped_probes:
+        # Exercise the phone/TV's unmapped-load failure without corrupting
+        # guest control flow. More than 64 completed probes must not retire
+        # Lightrec, and all following GPU checks must still complete.
+        a.li(T6, 0x5FFFFCFC)
+        a.li(T7, unmapped_probes)
+        a.label("unmapped_probe")
+        a.lw(T5, 0, T6)
+        a.addiu(T7, T7, -1)
+        a.bne(T7, ZERO, "unmapped_probe")
+        a.nop()
 
     # ---- GPU init
     gp1(0x00000000)                 # reset
@@ -303,6 +315,41 @@ def build():
     gp0((1 << 16) | 16)
     check(32, 470, 16, 1, two(bgr555(7, 15, 23)), "fill_truncation")
 
+    # Leave GPU-written texture pixels and a CLUT dirty across several frames.
+    # Presentation must not discard their dependency records. The final VRAM
+    # row/column also catches an inclusive/exclusive full-mirror off-by-one.
+    gp0(0xE1000000)
+    rect(16, 272, 8, 1, C1)
+    rect(0, 480, 16, 1, C2)
+    rect(1022, 511, 2, 1, C3)
+    upload(640, 256, 2, 1, 0x11111111)
+    a.li(T7, 800000)
+    a.label("wait_frames")
+    a.addiu(T7, T7, -1)
+    a.bne(T7, ZERO, "wait_frames")
+    a.nop()
+
+    gp0(0xE1000110)                 # 15bpp page (0,256)
+    gp0(0x65000000)
+    gp0((320 << 16) | 400)
+    gp0((16 << 8) | 16)
+    gp0((1 << 16) | 8)
+    check(400, 320, 8, 1, two(bgr555(*C1)), "texture_across_frames")
+
+    gp0(0xE100001A)                 # 4bpp page (640,256)
+    gp0(0x65000000)
+    gp0((322 << 16) | 400)
+    gp0((480 << 6) << 16)           # palette (0,480), UV (0,0)
+    gp0((1 << 16) | 8)
+    check(400, 322, 8, 1, two(bgr555(*C2)), "clut_across_frames")
+
+    gp0(0xE100011F)                 # 15bpp page (960,256)
+    gp0(0x65000000)
+    gp0((324 << 16) | 400)
+    gp0((255 << 8) | 62)
+    gp0((1 << 16) | 2)
+    check(400, 324, 2, 1, two(bgr555(*C3)), "vram_edge_across_frames")
+
     # ---- report
     a.li(T0, len(cases))
     a.sw(T0, 8, S2)
@@ -384,7 +431,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out", nargs="?", default="gpu_test.exe")
     parser.add_argument("--bios-dir", type=Path, help="write a minimal test-only reset BIOS here")
+    parser.add_argument("--unmapped-probes", type=int, default=0,
+                        help="issue completed unmapped loads before the GPU checks")
     args = parser.parse_args()
+    if not 0 <= args.unmapped_probes <= 0x7fffffff:
+        parser.error("unmapped-probes must be between 0 and 2147483647")
     out = args.out
     if args.bios_dir:
         args.bios_dir.mkdir(parents=True, exist_ok=True)
@@ -393,7 +444,7 @@ def main():
         struct.pack_into("<IIII", bios, 0, 0x3C08BF00, 0x35081000, 0x01000008, 0)
         for name in ("scph5500.bin", "scph5501.bin", "scph5502.bin"):
             (args.bios_dir / name).write_bytes(bios)
-    text, cases = build()
+    text, cases = build(args.unmapped_probes)
 
     # Pad the text to the 2048-byte granularity a PS-X EXE header declares.
     if len(text) % 2048:
