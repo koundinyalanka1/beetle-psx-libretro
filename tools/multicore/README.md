@@ -6,8 +6,8 @@ The SPU test compares serialized SPU state, generated audio, CD consumption,
 and timestamped interrupt traces with threading enabled and disabled. It covers
 DMA, register reads/writes, IRQ mode changes, state restore, worker restarts,
 sample update sizes, and partial batches. It also checks that CDC and CPU IRQ
-callbacks only run on the emulation thread, and that 735 samples require 23
-worker jobs when there are no intervening synchronization points.
+callbacks only run on the emulation thread, and that 735 samples use eleven
+full worker batches plus a partial batch (which can run inline).
 
 The worker test covers a full FIFO, ordering, draining during destruction,
 multiple callers dispatching to a shared pool, and creation failures. Both

@@ -58,6 +58,9 @@ extern uint8_t psx_mmap;
 extern uint8_t *lightrec_codebuffer;
 static struct lightrec_state *lightrec_state;
 uint8_t next_interpreter;
+/* Do not retry a failing recompiler every frame or on unrelated option
+ * updates. CPU_Power starts a fresh session. */
+static bool lightrec_failed;
 static struct lightrec_registers *lightrec_regs;
 #endif
 
@@ -279,7 +282,7 @@ void CPU_AssertIRQ_method(PS_CPU *self, unsigned which, bool asserted)
    assert(which <= 5);
 
 #ifdef HAVE_LIGHTREC
-   if(psx_dynarec != DYNAREC_DISABLED)
+   if(lightrec_state && psx_dynarec != DYNAREC_DISABLED)
    {
       lightrec_regs->cp0[CP0REG_CAUSE] &= ~(1 << (10 + which));
 
@@ -322,6 +325,11 @@ void CPU_Power(PS_CPU *self)
    unsigned i;
 
    (void)self;
+
+#ifdef HAVE_LIGHTREC
+   /* Release the old GTE bank before GTE_Power initializes the new one. */
+   lightrec_plugin_shutdown();
+#endif
 
    /* Compile-time check that the ICache union's two arms cover the
     * same byte range. This used to be a runtime assert spelled
@@ -388,6 +396,7 @@ void CPU_Power(PS_CPU *self)
 
 #ifdef HAVE_LIGHTREC
    next_interpreter = 0;
+   lightrec_failed = false;
    prev_dynarec     = psx_dynarec;
    prev_invalidate  = psx_dynarec_invalidate;
    prev_spgp_opt = psx_dynarec_spgp_opt;
@@ -440,7 +449,7 @@ int CPU_StateAction(PS_CPU *self, StateMem *sm, const unsigned load, const bool 
    if (load)
    {
 #ifdef HAVE_LIGHTREC
-      if (psx_dynarec != DYNAREC_DISABLED)
+      if (psx_dynarec != DYNAREC_DISABLED && !lightrec_failed)
       {
          if (lightrec_state)
          {
@@ -2896,15 +2905,11 @@ int32_t CPU_Run(PS_CPU *self, int32_t timestamp_in)
        * cleans entire state if already running. */
       if (psx_dynarec == DYNAREC_DISABLED)
       {
-         /* Switching to (or already on) the interpreter. Only copy the GTE
-          * register bank back out of lightrec if lightrec was actually
-          * running - otherwise lightrec_regs is NULL (it's only set up by
-          * lightrec_plugin_init), and an option toggle while the interpreter
-          * has been the backend since boot would dereference NULL here (#968). */
-         if (lightrec_state)
-            GTE_SwitchRegisters(false,lightrec_regs->cp2d);
+         /* Retire the old register bank too, so a later re-enable cannot
+          * overwrite GTE work performed by the Beetle interpreter. */
+         lightrec_plugin_shutdown();
       }
-      else
+      else if (!lightrec_failed)
          lightrec_plugin_init(self);
       prev_dynarec    = psx_dynarec;
       pgxpMode        = PGXP_GetModes();
@@ -2915,7 +2920,7 @@ int32_t CPU_Run(PS_CPU *self, int32_t timestamp_in)
    if (next_interpreter > 0)
       next_interpreter--;
 
-   if (psx_dynarec != DYNAREC_DISABLED)
+   if (psx_dynarec != DYNAREC_DISABLED && lightrec_state)
       return lightrec_plugin_execute(self, timestamp_in);
 #endif
    return CPU_RunReal(self, timestamp_in);
@@ -3598,6 +3603,8 @@ static int lightrec_plugin_init(PS_CPU *self)
    {
       GTE_SwitchRegisters(false,lightrec_regs->cp2d);
       lightrec_destroy(lightrec_state);
+      lightrec_state = NULL;
+      lightrec_regs = NULL;
    }
    else
    {
@@ -3667,6 +3674,15 @@ static int lightrec_plugin_init(PS_CPU *self)
    lightrec_state = lightrec_init(name,
          lightrec_map, ARRAY_SIZE(lightrec_map), cop_ops);
 
+   if (!lightrec_state)
+   {
+      lightrec_regs = NULL;
+      lightrec_failed = true;
+      log_cb(RETRO_LOG_WARN,
+            "Lightrec initialization failed; using Beetle interpreter until reset\n");
+      return -1;
+   }
+
    lightrec_regs = lightrec_get_registers(lightrec_state);
 
    uint32_t flags = (psx_dynarec_invalidate?LIGHTREC_OPT_INV_DMA_ONLY:0) |
@@ -3700,9 +3716,17 @@ static int32_t lightrec_plugin_execute(PS_CPU *self, int32_t timestamp)
    uint32_t LDWhich;
    uint32_t LDValue;
    uint32_t      flags;
+   /* Previous fault site, to tell a fault that made progress from one that
+    * did not; see the LIGHTREC_EXIT_SEGFAULT handling below. */
+   uint32_t      fault_pc = ~0u;
+   int32_t       fault_ts = -1;
+   unsigned      fault_n  = 0;
 
    (void)self;
    (void)new_PC_mask;
+
+   gte_ts_done += timestamp;
+   muldiv_ts_done += timestamp;
 
    BACKING_TO_ACTIVE;
 
@@ -3739,15 +3763,62 @@ static int32_t lightrec_plugin_execute(PS_CPU *self, int32_t timestamp)
 
       flags = lightrec_exit_flags(lightrec_state);
 
-      if (flags & (LIGHTREC_EXIT_SEGFAULT|LIGHTREC_EXIT_NOMEM)) {
-         if (flags & LIGHTREC_EXIT_NOMEM)
-            log_cb(RETRO_LOG_ERROR, "Out of memory at cycle 0x%08x\n", timestamp);
-         else
-            log_cb(RETRO_LOG_ERROR, "Segfault at cycle 0x%08x\n", timestamp);
-
-         exit(1);
+      /* An allocation failure will not cure itself, so retire immediately. */
+      if (flags & LIGHTREC_EXIT_NOMEM)
+      {
+         lightrec_failed = true;
+         log_cb(RETRO_LOG_WARN,
+               "Lightrec allocation failure at PC 0x%08x, cycle 0x%08x; "
+               "using Beetle interpreter until reset\n", PC, timestamp);
       }
-      else if (flags & LIGHTREC_EXIT_SYSCALL)
+      else if (flags & LIGHTREC_EXIT_SEGFAULT)
+      {
+         /*
+          * One flag, two very different events.
+          *
+          * lightrec_rw() raises it for a guest load/store to an address in no
+          * memory map, *after* resolving it the way the hardware does - the
+          * load returned 0, the store was dropped - and games rely on that:
+          * they dereference a pointer before initialising it (lightrec.c
+          * names Sled Storm).  PC and the cycle count both advance.
+          *
+          * The other four sites - a block that cannot be precompiled, a block
+          * missing from the LUT, a PC outside its block - raise it having done
+          * nothing at all.  Re-entering repeats the same failure forever,
+          * which is an unrecoverable retro_run and an ANR rather than a crash.
+          *
+          * Progress is what separates them, so use that rather than retiring
+          * the recompiler on the first unmapped access a game happens to make.
+          */
+         if (PC == fault_pc && timestamp == fault_ts)
+         {
+            lightrec_failed = true;
+            log_cb(RETRO_LOG_WARN,
+                  "Lightrec cannot advance past PC 0x%08x (cycle 0x%08x); "
+                  "using Beetle interpreter until reset\n", PC, timestamp);
+         }
+         else
+         {
+            fault_pc = PC;
+            fault_ts = timestamp;
+
+            /* Bounded so a fault that keeps moving - several undecodable
+             * blocks in turn - still terminates instead of spinning. */
+            if (++fault_n >= 64)
+            {
+               lightrec_failed = true;
+               log_cb(RETRO_LOG_WARN,
+                     "Lightrec faulted %u times in one slice (last PC 0x%08x); "
+                     "using Beetle interpreter until reset\n", fault_n, PC);
+            }
+            else if (fault_n <= 4)
+               log_cb(RETRO_LOG_WARN,
+                     "Guest access to unmapped address at PC 0x%08x, "
+                     "cycle 0x%08x\n", PC, timestamp);
+         }
+      }
+
+      if (flags & LIGHTREC_EXIT_SYSCALL)
       {
          /* CPU_Exception works on Beetle's COP0 copy; synchronize
           * around it. Exceptions are rare next to loop iterations. */
@@ -3768,6 +3839,8 @@ static int32_t lightrec_plugin_execute(PS_CPU *self, int32_t timestamp)
          PC = CPU_Exception(EXCEPTION_INT, PC, PC, 0);
          memcpy(lightrec_regs->cp0,&CP0,32*sizeof(uint32_t));
       }
+      if (lightrec_failed)
+         break;
    } while (MDFN_LIKELY(PSX_EventHandler(timestamp)));
 
    /* Write the COP0 file back once on exit, so savestates and engine
@@ -3787,8 +3860,34 @@ static int32_t lightrec_plugin_execute(PS_CPU *self, int32_t timestamp)
     * to the stale BACKED_new_PC (0xBFC00004 = BIOS reset path),
     * rebooting the machine instead of resuming. */
    new_PC = PC + 4;
+   /* Lightrec has retired load and branch delays at the block boundary. */
+   LDWhich = 0x22;
+   LDValue = 0;
+   BDBT = 0;
 
    ACTIVE_TO_BACKING;
+
+   /* Keep the same relative timing representation as CPU_RunReal between
+    * frames and before handing control back to that engine. */
+   if (gte_ts_done > 0)
+      gte_ts_done -= timestamp;
+   if (muldiv_ts_done > 0)
+      muldiv_ts_done -= timestamp;
+
+   if (lightrec_failed)
+   {
+      unsigned i;
+      lightrec_plugin_shutdown();
+      CPU_RecalcIPCache();
+      LDAbsorb = 0;
+      ReadAbsorbWhich = 0;
+      memset(ReadAbsorb, 0, sizeof(ReadAbsorb));
+      /* The interpreter's instruction cache may predate writes made while
+       * Lightrec was active. Refill it from current guest memory. */
+      for (i = 0; i < 1024; i++)
+         ICache[i].TV |= 2;
+      return CPU_RunReal(self, timestamp);
+   }
 
    return timestamp;
 }
@@ -3802,7 +3901,13 @@ void CPU_LightrecClear_method(PS_CPU *self, uint32_t addr, uint32_t size)
 
 static void lightrec_plugin_shutdown(void)
 {
-   lightrec_destroy(lightrec_state);
+   if (lightrec_state)
+   {
+      GTE_SwitchRegisters(false, lightrec_regs->cp2d);
+      lightrec_destroy(lightrec_state);
+   }
+   lightrec_state = NULL;
+   lightrec_regs = NULL;
 }
 
 #endif

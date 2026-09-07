@@ -3017,7 +3017,7 @@ static void ih_steal(struct ImageHandle *dst, struct ImageHandle *src) { dst->da
       VkFence fence;
       HandleCounter reference_count;
    };
-   static void fenceholder_wait(struct FenceHolder *self);
+   static bool fenceholder_wait(struct FenceHolder *self);
    static void fenceholder_release_reference(struct FenceHolder *self);
 
    /* Fence handle: a plain struct (Fence wrapping FenceHolder *) to a plain
@@ -5708,7 +5708,7 @@ static void owned_u32_deinit(struct OwnedU32Buf *b)
    b->n = 0;
 }
 
-static void owned_u32_assign(struct OwnedU32Buf *b,
+static bool owned_u32_assign(struct OwnedU32Buf *b,
       const uint32_t *src,
       size_t count)
 {
@@ -5717,9 +5717,12 @@ static void owned_u32_assign(struct OwnedU32Buf *b,
    if (count)
    {
       b->items = (uint32_t *)malloc(count * sizeof(uint32_t));
+      if (!b->items)
+         return false;
       memcpy(b->items, src, count * sizeof(uint32_t));
       b->n = count;
    }
+   return true;
 }
 
 /* Steal src into dst (dst's prior contents freed); src left empty. */
@@ -5820,6 +5823,7 @@ static bool owned_u32_empty(const struct OwnedU32Buf *b) { return b->n == 0; }
           * device supports it for every scaled-fb usage (probed at init), so
           * Gouraud/texture/blend precision survives to the 10-bit output. */
          VkFormat scaled_fb_format;
+         bool analog_supported;
          bool scaled_uv_offset;
          bool valid;
          FilterMode primitive_filter_mode;
@@ -6567,6 +6571,7 @@ static void renderer_init(Renderer *self,
 {
    ImageCreateInfo info;
    VkImageFormatProperties props;
+   VkImageFormatProperties depth_props;
    ImageCreateInfo dither_info;
    /* The Renderer is malloc'd with uninitialised storage. In the pre-C++->C
     * source it was new'd, so every member was zero/default-initialised before
@@ -6578,8 +6583,10 @@ static void renderer_init(Renderer *self,
     * assignments and embedded *_init() calls below then set the live values. */
    memset(self, 0, sizeof(*self));
    self->device = device_;
-   self->scaling = scaling_;
-   self->msaa = msaa_;
+   /* Both values become image dimensions / Vulkan enum bits below. A frontend
+    * may supply stale or malformed option values rather than a menu entry. */
+   self->scaling = scaling_ && scaling_ <= 16 && !(scaling_ & (scaling_ - 1)) ? scaling_ : 1;
+   self->msaa = msaa_ && msaa_ <= 16 && !(msaa_ & (msaa_ - 1)) ? msaa_ : 1;
    self->hdr_scanout_format = VK_FORMAT_UNDEFINED;
    self->analog_phase       = 0.0;
    self->scaled_uv_offset = false;
@@ -6616,6 +6623,18 @@ static void renderer_init(Renderer *self,
    self->scanout_ring_index           = 0;
    fbatlas_init(&self->atlas);
    self->tracker = NULL; /* created below via texture_tracker_new once the GPU backend is up */
+   self->analog_supported = device_image_format_is_supported(self->device,
+         VK_FORMAT_R16G16B16A16_SFLOAT,
+         VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+         VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT, VK_IMAGE_TILING_OPTIMAL);
+   if (!device_get_image_format_properties(self->device,
+         device_get_default_depth_format(self->device), VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+         0, &depth_props))
+   {
+      LOGE("[Vulkan]: Device cannot allocate the depth attachment.\n");
+      return;
+   }
    /* Sanity check settings, 16x IR with 16x MSAA will exhaust most GPUs VRAM alone. */
    if (self->scaling == 16 && self->msaa > 1)
    {
@@ -6634,12 +6653,20 @@ static void renderer_init(Renderer *self,
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
             VK_IMAGE_USAGE_STORAGE_BIT |
             VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
-            VK_IMAGE_USAGE_SAMPLED_BIT,
-            0,
+            VK_IMAGE_USAGE_SAMPLED_BIT |
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
             &props))
    {
       unsigned max_scaling = min_(props.maxExtent.width / FB_WIDTH, props.maxExtent.height / FB_HEIGHT);
       unsigned new_scale = self->scaling;
+      max_scaling = min_(max_scaling, min_(depth_props.maxExtent.width / FB_WIDTH,
+               depth_props.maxExtent.height / FB_HEIGHT));
+      if (max_scaling == 0)
+      {
+         LOGE("[Vulkan]: Device cannot allocate the native PS1 framebuffer.\n");
+         return;
+      }
       while (new_scale > max_scaling)
          new_scale >>= 1;
 
@@ -6679,8 +6706,12 @@ static void renderer_init(Renderer *self,
       state ? owned_u32_data(&state->vram) : NULL, 0, 0,
    };
    ih_move(&self->framebuffer, device_create_image(self->device, &info, state ? &initial_vram : NULL));
+   if (!ih_is_valid(&self->framebuffer))
+      return;
    image_set_layout(ih_get(&self->framebuffer), Layout_General);
    ih_move(&self->framebuffer_ssaa, device_create_image(self->device, &info, NULL));
+   if (!ih_is_valid(&self->framebuffer_ssaa))
+      return;
    image_set_layout(ih_get(&self->framebuffer_ssaa), Layout_General);
 
    info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -6688,6 +6719,8 @@ static void renderer_init(Renderer *self,
    info.format = VK_FORMAT_R8_UNORM;
    info.levels = 1;
    ih_move(&self->bias_framebuffer, device_create_image(self->device, &info, NULL));
+   if (!ih_is_valid(&self->bias_framebuffer))
+      return;
 
    info.width *= self->scaling;
    info.height *= self->scaling;
@@ -6710,6 +6743,8 @@ static void renderer_init(Renderer *self,
                 VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
    info.initial_layout = VK_IMAGE_LAYOUT_GENERAL;
    ih_move(&self->scaled_framebuffer, device_create_image(self->device, &info, NULL));
+   if (!ih_is_valid(&self->scaled_framebuffer))
+      return;
    image_set_layout(ih_get(&self->scaled_framebuffer), Layout_General);
 
    {
@@ -6738,28 +6773,30 @@ static void renderer_init(Renderer *self,
                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                VK_IMAGE_USAGE_STORAGE_BIT |
                VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
-               VK_IMAGE_USAGE_SAMPLED_BIT,
-               0,
+               VK_IMAGE_USAGE_SAMPLED_BIT |
+               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+               VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
                &props))
       {
          LOGI("[Vulkan]: Cannot use multisampling with self self->device.\n");
          self->msaa = 1;
       }
-      else if ((self->msaa & props.sampleCounts) == 0)
+      else if ((self->msaa & props.sampleCounts & depth_props.sampleCounts) == 0)
       {
          unsigned new_msaa = self->msaa >> 1;
          while (new_msaa)
          {
-            if (new_msaa & props.sampleCounts)
+            if (new_msaa & props.sampleCounts & depth_props.sampleCounts)
             {
                LOGI("[Vulkan]: MSAA sample count of %u is not supported, falling back to %u.\n",
                      self->msaa, new_msaa);
                self->msaa = new_msaa;
                break;
             }
+            new_msaa >>= 1;
          }
 
-         if (self->msaa == 0)
+         if (new_msaa == 0)
             self->msaa = 1;
       }
    }
@@ -6769,6 +6806,8 @@ static void renderer_init(Renderer *self,
       info.levels = 1;
       info.samples = (VkSampleCountFlagBits)(self->msaa);
       ih_move(&self->scaled_framebuffer_msaa, device_create_image(self->device, &info, NULL));
+      if (!ih_is_valid(&self->scaled_framebuffer_msaa))
+         return;
       image_set_layout(ih_get(&self->scaled_framebuffer_msaa), Layout_General);
       /* General layout for MSAA is going to be brutal bandwidth-wise, but we
        * have no real choice. The expectation is that self will be used with a
@@ -6780,6 +6819,8 @@ static void renderer_init(Renderer *self,
       TTGpuBackend vt = vk_tt_make_backend(self);
       self->tracker = texture_tracker_new(&vt, NULL);
    }
+   if (!self->tracker)
+      return;
 
    renderer_init_pipelines(self);
 
@@ -6799,6 +6840,8 @@ static void renderer_init(Renderer *self,
 
    ImageInitialData dither_initial = { dither_lut_data };
    ih_move(&self->dither_lut, device_create_image(self->device, &dither_info, &dither_initial));
+   if (!ih_is_valid(&self->dither_lut))
+      return;
 
    { static const float quad_data[] = {
       -128, -128, +127, -128, -128, +127, +127, +127,
@@ -6809,6 +6852,8 @@ static void renderer_init(Renderer *self,
    buffer_create_info.size = sizeof(quad_data);
    buffer_create_info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
    self->quad = device_create_buffer(self->device, &buffer_create_info, quad_data);
+   if (!bh_is_valid(&self->quad))
+      return;
 
    renderer_flush(self);
    renderer_reset_scissor_queue(self);
@@ -6822,7 +6867,7 @@ static void renderer_init(Renderer *self,
    }
    self->valid = true;}
 
-static void renderer_save_vram_state(Renderer *self, SaveState *out){
+static bool renderer_save_vram_state(Renderer *self, SaveState *out){
    BufferHandle buffer;
    BufferCreateInfo buffer_create_info;
    Fence fence;
@@ -6831,6 +6876,8 @@ static void renderer_save_vram_state(Renderer *self, SaveState *out){
    buffer_create_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
    buffer = device_create_buffer(self->device, &buffer_create_info, NULL);
+   if (!bh_is_valid(&buffer))
+      return false;
    {
       TTRect _r = { 0, 0, FB_WIDTH, FB_HEIGHT };
       fbatlas_read_transfer(&self->atlas, Domain_Unscaled, &_r);
@@ -6848,16 +6895,39 @@ static void renderer_save_vram_state(Renderer *self, SaveState *out){
     * rewind / netplay, so the device-wide stall here is a heavy, needless
     * hit; a fence wait on the single framebuffer->host copy suffices. */
    fence = renderer_flush_and_signal(self);
-   fenceholder_wait(fence_get(&fence));
+   if (!fenceholder_wait(fence_get(&fence)))
+   {
+      fence_reset(&fence);
+      bh_reset(&buffer);
+      return false;
+   }
    { const uint32_t *src = (const uint32_t *)(
          device_map_host_buffer(self->device, bh_get(&buffer), MEMORY_ACCESS_READ_BIT));
    /* Deep-copy the mapped VRAM straight into the owning buffer (no
     * default zero-fill), then move it into the returned SaveState. */
    OwnedU32Buf vram;
+   TextureTrackerSaveState *tracker_state;
    owned_u32_init(&vram);
-   owned_u32_assign(&vram, src, FB_WIDTH * FB_HEIGHT);
+   if (!src || !owned_u32_assign(&vram, src, FB_WIDTH * FB_HEIGHT))
+   {
+      if (src)
+         device_unmap_host_buffer(self->device, bh_get(&buffer), MEMORY_ACCESS_READ_BIT);
+      fence_reset(&fence);
+      bh_reset(&buffer);
+      return false;
+   }
    device_unmap_host_buffer(self->device, bh_get(&buffer), MEMORY_ACCESS_READ_BIT);
-   savestate_init(out);
+   tracker_state = tts_new();
+   if (!tracker_state)
+   {
+      owned_u32_deinit(&vram);
+      fence_reset(&fence);
+      bh_reset(&buffer);
+      return false;
+   }
+   /* Keep the preceding snapshot intact until this readback has succeeded. */
+   savestate_destroy(out);
+   out->tracker_state = tracker_state;
    owned_u32_move(&out->vram, &vram);
    out->state = self->render_state;
    texture_tracker_save_state(self->tracker, out->tracker_state);
@@ -6871,6 +6941,7 @@ static void renderer_save_vram_state(Renderer *self, SaveState *out){
     * (renderer-rebuild) change. */
    fence_reset(&fence);
    bh_reset(&buffer);
+   return true;
 }
 
 static void renderer_init_primitive_pipelines(Renderer *self)
@@ -7129,7 +7200,7 @@ static TTRect renderer_compute_window_rect(Renderer *self,
    }
 }
 
-static void renderer_copy_vram_to_cpu_synchronous(Renderer *self,
+static bool renderer_copy_vram_to_cpu_synchronous(Renderer *self,
       const TTRect *rect,
       uint16_t *vram)
 {
@@ -7150,6 +7221,9 @@ static void renderer_copy_vram_to_cpu_synchronous(Renderer *self,
    int      nv = 1;
    uint32_t sum_w;
    uint32_t sum_h;
+
+   if (!vram || !rect->width || !rect->height)
+      return false;
 
    if (rect->width >= FB_WIDTH)
    {
@@ -7206,6 +7280,8 @@ static void renderer_copy_vram_to_cpu_synchronous(Renderer *self,
    buffer_create_info.size   = sum_w * sum_h * 4;
    buffer_create_info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
    buffer = device_create_buffer(self->device, &buffer_create_info, NULL);
+   if (!bh_is_valid(&buffer))
+      return false;
 
    /* One copy per tile into a single tightly packed host buffer.  Still a
     * single flush + single fence wait - no extra GPU round-trips. */
@@ -7232,12 +7308,23 @@ static void renderer_copy_vram_to_cpu_synchronous(Renderer *self,
                 VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
 
    fence = renderer_flush_and_signal(self);
-   fenceholder_wait(fence_get(&fence));
+   if (!fenceholder_wait(fence_get(&fence)))
+   {
+      fence_reset(&fence);
+      bh_reset(&buffer);
+      return false;
+   }
 
    {
       const uint32_t *mapped = (const uint32_t *)(device_map_host_buffer(self->device, bh_get(&buffer), MEMORY_ACCESS_READ_BIT));
       int             i, j;
       uint32_t        elemoff = 0;
+      if (!mapped)
+      {
+         fence_reset(&fence);
+         bh_reset(&buffer);
+         return false;
+      }
       for (j = 0; j < nv; j++)
       {
          for (i = 0; i < nh; i++)
@@ -7278,6 +7365,7 @@ static void renderer_copy_vram_to_cpu_synchronous(Renderer *self,
        * software-fb reads) leaked the staging VkBuffer and its memory. */
       bh_reset(&buffer);
    }
+   return true;
 }
 
 static void renderer_mipmap_framebuffer(Renderer *self)
@@ -7755,8 +7843,10 @@ static bool renderer_analog_active(Renderer *self)
                psx_video_cable == 3 ? "RF" : "RGB (SCART)",
                self->scaling,
                self->render_state.is_pal ? "PAL" : "NTSC");
+      if (psx_video_cable != RHI_CABLE_NONE && !self->analog_supported)
+         LOGI("[Vulkan]: Cable simulation requires filtered RGBA16F render targets; using direct scanout.\n");
    }
-   return psx_video_cable != RHI_CABLE_NONE;
+   return psx_video_cable != RHI_CABLE_NONE && self->analog_supported;
 }
 
 /* Base clocks per pixel. These are the GP1(08h) horizontal resolution dividers
@@ -11410,15 +11500,17 @@ static void fenceholder_fini(struct FenceHolder *self)
       FenceVec_push(&device_frame(self->device)->recycle_fences, &self->fence);
 }
 
-static void fenceholder_wait(struct FenceHolder *self)
+static bool fenceholder_wait(struct FenceHolder *self)
 {
-   /* A null fence means no work was ever submitted against it (e.g. a failed
-    * vkQueueSubmit handed back VK_NULL_HANDLE); there is nothing to wait for
-    * and waiting on a null handle is invalid, so treat it as already signalled. */
-   if (self->fence == VK_NULL_HANDLE)
-      return;
+   /* A missing submission is a failed readback, never completed GPU work. */
+   if (!self || self->fence == VK_NULL_HANDLE)
+      return false;
    if (vkWaitForFences(device_get_device(self->device), 1, &self->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+   {
       LOGE("Failed to wait for fence!\n");
+      return false;
+   }
+   return true;
 }
 
 static void fenceholder_release_reference(struct FenceHolder *self)
@@ -19102,7 +19194,7 @@ static void image_resource_holder_fini(struct ImageResourceHolder *self)
 static Context *context = NULL;
 static Device *device = NULL;
 static Renderer *renderer = NULL;
-static unsigned scaling = 4;
+static unsigned scaling = 1;
 /* Deferred geometry-change state. refresh_variables must not call
  * SET_SYSTEM_AV_INFO inline: the frontend handles it synchronously, tearing down
  * and rebuilding the device/renderer while a frame started by prepare_frame is
@@ -19112,6 +19204,7 @@ static unsigned scaling = 4;
  * SET_SYSTEM_AV_INFO from the top of retro_run, before prepare_frame begins a
  * frame, so the reinit happens cleanly between frames. */
 static bool geometry_change_pending = false;
+static bool renderer_change_pending = false;
 static struct retro_system_av_info pending_av_info;
 
 extern enum rhi_renderer_type rhi_type;
@@ -19394,8 +19487,11 @@ static void vk_context_reset(void)
    if (!environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, (void**)&vulkan) || !vulkan)
       return;
 
-   if (vulkan->interface_version != RETRO_HW_RENDER_INTERFACE_VULKAN_VERSION)
+   if (vulkan->interface_version != RETRO_HW_RENDER_INTERFACE_VULKAN_VERSION ||
+       !vulkan->get_sync_index || !vulkan->get_sync_index_mask ||
+       !vulkan->wait_sync_index || !vulkan->set_image)
    {
+      LOGE("[Vulkan]: Frontend supplied an incomplete Vulkan render interface.\n");
       vulkan = NULL;
       return;
    }
@@ -19421,8 +19517,11 @@ static void vk_context_reset(void)
     * owned by libretro_create_device, not by reset, so it is preserved. */
    if (renderer)
    {
-      savestate_destroy(&save_state);
-      renderer_save_vram_state(renderer, &save_state);
+      if (!GPU_SyncVRAM() || !renderer_save_vram_state(renderer, &save_state))
+      {
+         LOGE("[Vulkan]: Could not preserve VRAM; keeping the current renderer.\n");
+         return;
+      }
    }
    /* These owning handles refer to the old device. Release them before that
     * device's object pools are freed, including on a reset without destroy. */
@@ -19456,6 +19555,12 @@ static void vk_context_reset(void)
       return;
    }
    renderer_init(renderer, device, scaling, msaa, owned_u32_empty(&save_state.vram) ? NULL : &save_state);
+   if (!renderer_is_valid(renderer) && (scaling > 1 || msaa > 1))
+   {
+      LOGI("[Vulkan]: Renderer allocation failed; retrying at native resolution without MSAA.\n");
+      renderer_fini(renderer);
+      renderer_init(renderer, device, 1, 1, owned_u32_empty(&save_state.vram) ? NULL : &save_state);
+   }
    if (!renderer_is_valid(renderer))
    {
       renderer_fini(renderer);
@@ -19468,8 +19573,9 @@ static void vk_context_reset(void)
       return;
    }
 
+   renderer_change_pending = false;
    tt_log_startup("vk renderer init: scaling=%u msaa=%u has_software_fb=%d\n",
-         (unsigned)scaling, (unsigned)msaa, (int)has_software_fb);
+         (unsigned)renderer->scaling, (unsigned)renderer->msaa, (int)has_software_fb);
 
    /* Replay any rhi_vulkan_* state-sets / VRAM uploads that arrived
     * between rhi_vulkan_open's SET_HW_RENDER and this context_reset
@@ -19495,8 +19601,8 @@ static void vk_context_destroy(void)
 
    if (renderer)
    {
-      savestate_destroy(&save_state);
-      renderer_save_vram_state(renderer, &save_state);
+      if (!GPU_SyncVRAM() || !renderer_save_vram_state(renderer, &save_state))
+         LOGE("[Vulkan]: Could not capture VRAM before context destruction.\n");
    }
    scanouthandlevec_free_storage(&scanout_handles);
    swapchainimagevec_free_storage(&swapchain_images);
@@ -19648,19 +19754,26 @@ void rhi_vulkan_refresh_variables(void)
    struct retro_core_option_display option_display;
    unsigned old_scaling;
    struct retro_variable var = {0};
+   bool requested_software_fb = false;
 
    var.key = BEETLE_OPT(renderer_software_fb);
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-      if (!strcmp(var.value, "enabled"))
-         has_software_fb = true;
-      else
-         has_software_fb = false;
+      requested_software_fb = !strcmp(var.value, "enabled");
    }
-   else
-      /* If 'BEETLE_OPT(renderer_software_fb)' option is not found, then
-       * we are running in software mode */
-      has_software_fb = true;
+   /* A missing optional setting uses its declared default. Hardware rendering
+    * is already selected here; it does not imply a second CPU renderer. */
+   if (requested_software_fb != has_software_fb)
+   {
+      if (!renderer || GPU_SyncVRAM())
+      {
+         if (renderer)
+            GPU_InvalidateTextureCache();
+         has_software_fb = requested_software_fb;
+      }
+      else
+         LOGE("[Vulkan]: Could not synchronize VRAM for software framebuffer mode change.\n");
+   }
 
    old_scaling = scaling;
    old_msaa = msaa;
@@ -19675,13 +19788,8 @@ void rhi_vulkan_refresh_variables(void)
    var.key = BEETLE_OPT(internal_resolution);
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-      /* Same limitations as libretro.cpp */
-      scaling = var.value[0] - '0';
-      if (var.value[1] != 'x')
-      {
-         scaling  = (var.value[0] - '0') * 10;
-         scaling += var.value[1] - '0';
-      }
+      unsigned requested = (unsigned)strtoul(var.value, NULL, 10);
+      scaling = requested && requested <= 16 && !(requested & (requested - 1)) ? requested : 1;
    }
 
    var.key = BEETLE_OPT(scaled_uv_offset);
@@ -19736,7 +19844,8 @@ void rhi_vulkan_refresh_variables(void)
    var.key = BEETLE_OPT(msaa);
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-      msaa = strtoul(var.value, NULL, 0);
+      unsigned requested = (unsigned)strtoul(var.value, NULL, 10);
+      msaa = requested && requested <= 16 && !(requested & (requested - 1)) ? requested : 1;
    }
 
    var.key = BEETLE_OPT(mdec_yuv);
@@ -19988,11 +20097,13 @@ void rhi_vulkan_refresh_variables(void)
        * retro_run, which is a use-after-free. */
       rhi_vulkan_fill_av_info(&pending_av_info);
       geometry_change_pending = true;
+      if (old_scaling != scaling || old_msaa != msaa)
+         renderer_change_pending = true;
    }
    }
 }
 
-static void ensure_sync_index_resources(void)
+static bool ensure_sync_index_resources(void)
 {
    unsigned mask = vulkan->get_sync_index_mask(vulkan->handle);
    unsigned num_frames = 0;
@@ -20000,11 +20111,17 @@ static void ensure_sync_index_resources(void)
       if (mask & (1u << i))
          num_frames = i + 1; }
 
-   if (num_frames != swapchainimagevec_size(&swapchain_images))
+   if (num_frames == 0)
+      return false;
+
+   if (num_frames != swapchainimagevec_size(&swapchain_images) ||
+       num_frames != (unsigned)scanout_handles.count)
    {
       swapchainimagevec_resize(&swapchain_images, num_frames);
       scanouthandlevec_resize(&scanout_handles, num_frames);
    }
+   return num_frames == (unsigned)swapchainimagevec_size(&swapchain_images) &&
+          num_frames == (unsigned)scanout_handles.count;
 }
 
 /* Perform a renderer rebuild that rhi_vulkan_refresh_variables deferred (a
@@ -20026,11 +20143,41 @@ void rhi_vulkan_apply_pending_geometry(void)
       geometry_change_pending = false;
       environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
    }
+   /* A frontend may resize its swapchain without recreating the core context.
+    * Apply changed render settings here as well, before a new frame starts. */
+   if (renderer_change_pending && renderer && device)
+   {
+      unsigned previous_scaling = renderer->scaling;
+      unsigned previous_msaa = renderer->msaa;
+      if (!GPU_SyncVRAM() || !renderer_save_vram_state(renderer, &save_state))
+      {
+         LOGE("[Vulkan]: Could not preserve VRAM for renderer settings change.\n");
+         renderer_change_pending = false;
+         return;
+      }
+      inside_frame = false;
+      renderer_fini(renderer);
+      renderer_init(renderer, device, scaling, msaa, &save_state);
+      if (!renderer_is_valid(renderer))
+      {
+         LOGI("[Vulkan]: Renderer settings failed; restoring the previous settings.\n");
+         renderer_fini(renderer);
+         renderer_init(renderer, device, previous_scaling, previous_msaa, &save_state);
+      }
+      if (!renderer_is_valid(renderer))
+      {
+         renderer_fini(renderer);
+         free(renderer);
+         renderer = NULL;
+      }
+      renderer_change_pending = false;
+   }
 }
 
 void rhi_vulkan_prepare_frame(void)
 {
-   if (device == NULL)
+   inside_frame = false;
+   if (device == NULL || renderer == NULL || vulkan == NULL)
    {
       /* The HW context is down (between context_destroy and the next
        * context_reset). Do NOT flip rhi_type to RHI_SOFTWARE here: there is no
@@ -20046,16 +20193,12 @@ void rhi_vulkan_prepare_frame(void)
       return;
    }
 
-   inside_frame = true;
    device_flush_frame_nolock(device);
    vulkan->wait_sync_index(vulkan->handle);
-   ensure_sync_index_resources();
-   device_next_frame_context(device);
-
-   /* Defensive: if the renderer is somehow absent while the device is live,
-    * don't dereference it. */
-   if (renderer == NULL)
+   if (!ensure_sync_index_resources())
       return;
+   device_next_frame_context(device);
+   inside_frame = true;
 
    renderer->scaled_uv_offset = scaled_uv_offset;
    renderer->primitive_filter_mode = (FilterMode)(filter_mode);
@@ -20078,7 +20221,7 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
 {
    unsigned index;
    ImageHandle scanout;
-   if (device == NULL)
+   if (device == NULL || renderer == NULL || vulkan == NULL)
       return;
 
    /* prepare_frame sets inside_frame; if it is clear here, the context was
@@ -20176,7 +20319,6 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
    else
       renderer->render_state.scanout_mdec_filter = ScanoutFilter_None;
 
-   scanout = show_vram ? renderer_scanout_vram_to_texture(renderer, true) : renderer_scanout_to_texture(renderer);
    index = vulkan->get_sync_index(vulkan->handle);
 
    /* The swapchain may have been recreated since prepare_frame ran this
@@ -20188,12 +20330,19 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
     * indexing, then hard-guard the index: items[index] with index >= count is an
     * out-of-bounds access (the observed SIGSEGV in this function on scale-factor
     * change). */
-   ensure_sync_index_resources();
-   if ((int)index >= swapchainimagevec_size(&swapchain_images))
+   if (!ensure_sync_index_resources() ||
+       index >= (unsigned)swapchainimagevec_size(&swapchain_images) ||
+       index >= (unsigned)scanout_handles.count || index >= 32 ||
+       !(vulkan->get_sync_index_mask(vulkan->handle) & (1u << index)))
    {
-      /* scanout is a borrowed handle (renderer_scanout_to_texture returns
-       * self->last_scanout without adding a reference), so it must not be
-       * released here -- match the normal path, which never resets it. */
+      renderer_flush(renderer);
+      inside_frame = false;
+      return;
+   }
+   scanout = show_vram ? renderer_scanout_vram_to_texture(renderer, true) : renderer_scanout_to_texture(renderer);
+   if (!ih_is_valid(&scanout))
+   {
+      renderer_flush(renderer);
       inside_frame = false;
       return;
    }
@@ -20697,9 +20846,8 @@ bool rhi_vulkan_read_vram(uint16_t x, uint16_t y,
       return false;
    {
       TTRect _r = { x, y, w, h };
-      renderer_copy_vram_to_cpu_synchronous(renderer, &_r, vram);
+      return renderer_copy_vram_to_cpu_synchronous(renderer, &_r, vram);
    }
-   return true;
 }
 
 void rhi_vulkan_fill_rect(uint32_t color,

@@ -282,7 +282,11 @@ int32_t  GPU_GetScanlineNum(void);
 /* Used by rhi_lib_gl.c to access the VRAM contents and
  * to drive state restore points. */
 uint16_t *GPU_get_vram(void);
-void     GPU_RestoreStateP1(bool load);
+bool     GPU_RestoreStateP1(bool load);
+/* Emulation/context thread only, while the hardware renderer is still live. */
+bool     GPU_SyncVRAM(void);
+/* Invalidate software texture data when switching from hardware-only mode. */
+void     GPU_InvalidateTextureCache(void);
 void     GPU_RestoreStateP2(bool load);
 void     GPU_RestoreStateP3(void);
 

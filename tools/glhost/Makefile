@@ -5,6 +5,8 @@ GLES ?= 0
 ifeq ($(GLES),1)
 CFLAGS += -DGLHOST_GLES
 LDLIBS = -lEGL -lGLESv3 -ldl $(LDFLAGS_EXTRA)
+else ifeq ($(shell uname -s),Darwin)
+LDLIBS = -framework OpenGL $(LDFLAGS_EXTRA)
 else
 LDLIBS = -lEGL -lGL -ldl $(LDFLAGS_EXTRA)
 endif

@@ -3,6 +3,7 @@
 static const char *image_load_fragment = GLSL_FRAGMENT(
       uniform sampler2D fb_texture;
       uniform uint internal_upscaling;
+      uniform uint stencil_mask_only;
       in vec2 frag_fb_coord;
       out vec4 frag_color;
 
@@ -14,5 +15,7 @@ static const char *image_load_fragment = GLSL_FRAGMENT(
       void main() {
       // GLES 5551 note: color reinterpretation can be done here
       frag_color = vram_get_pixel(int(frag_fb_coord.x), int(frag_fb_coord.y));
+      if (stencil_mask_only != 0u && frag_color.a < 0.5)
+         discard;
       }
 );

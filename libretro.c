@@ -4613,7 +4613,16 @@ static void check_variables(bool startup)
          psx_dynarec = DYNAREC_DISABLED;
    }
    else
+#if defined(__ANDROID__) && defined(__arm__)
+      psx_dynarec = DYNAREC_DISABLED;
+#else
       psx_dynarec = DYNAREC_EXECUTE;
+#endif
+
+   /* The AArch32 SIGILL that made this unusable was an ARM/Thumb
+    * interworking fault in the emitter, fixed by selecting A32 in
+    * jit_arm.c's cpu detection. Disabling the recompiler here instead cost
+    * 42.6 ms/frame on a BRAVIA BF1 - unplayable - so the dynarec stays on. */
 
    var.key = BEETLE_OPT(dynarec_invalidate);
 

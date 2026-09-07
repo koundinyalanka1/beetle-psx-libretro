@@ -257,6 +257,9 @@ static void DrawSprite_##SUFFIX(PS_GPU *gpu, int32_t x_arg, int32_t y_arg, int32
                suck_time += (((x_bound + 1) & ~1) - (x_start & ~1)) >> 1; \
             gpu->DrawTimeAvail -= suck_time; \
          } \
+         /* Hardware mode retains row timing but never visits pixels. */ \
+         if (!rhi_intf_has_software_renderer()) \
+            continue; \
          x = x_start; \
          /* Native-res flat-fill fast path.  Textured sprites and any \
           * upscale stay scalar; the run is within [ClipX0,ClipX1] so \
@@ -536,8 +539,6 @@ static void Command_DrawSprite_##SUFFIX(PS_GPU *gpu, const uint32_t *cb) \
    x = sign_x_to_s32(11, x + gpu->OffsX); \
    y = sign_x_to_s32(11, y + gpu->OffsY); \
    GPU_SPR_RHI_PUSH_HOOK(gpu, x, y, w, h, u, v, color, clut, T_LIT, TM_LIT, MO_LIT, BM_VAL, ME_LIT); \
-   if (!rhi_intf_has_software_renderer()) \
-      return; \
    SPR_DISPATCH_DRAW(TM_LIT, BM_TAG, MO_LIT, ME_LIT, T_LIT) \
 }
 

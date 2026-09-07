@@ -25,6 +25,7 @@ static const char *vram_copy_fragment = GLSL_FRAGMENT(
       uniform int copy_dst_offset;
       uniform uint copy_mask_test;
       uniform uint copy_set_mask;
+      uniform uint stencil_mask_only;
       out vec4 frag_color;
 
       void main() {
@@ -37,6 +38,9 @@ static const char *vram_copy_fragment = GLSL_FRAGMENT(
 
       if (copy_set_mask != 0u)
          texel.a = 1.0;
+
+      if (stencil_mask_only != 0u && texel.a < 0.5)
+         discard;
 
       frag_color = texel;
       }

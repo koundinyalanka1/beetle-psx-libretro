@@ -851,6 +851,7 @@ struct gl_primitive_batch {
    /* GL_TRIANGLES or GL_LINES */
    GLenum draw_mode;
    bool opaque;
+   bool textured;
    /* Drives the stencil write value for this batch.  Note that
     * vertex_add_blended_pass() forces this true for the second pass of a
     * textured semi-transparent primitive, so it is NOT a faithful copy of
@@ -3264,11 +3265,13 @@ static void gl_stats_free(gl_renderer *renderer)
  *
  * None of it matters with the software framebuffer on: the CPU rasteriser
  * maintains GPU.vram and nothing consults the GPU copy. */
-static bool gl_native_target_wanted(uint32_t upscaling, GLenum fb_out_storage)
+static bool gl_native_target_wanted(uint32_t upscaling, GLenum fb_out_storage,
+      uint8_t filter)
 {
    if (has_software_fb)
       return false;
-   return upscaling > 1 || fb_out_storage != (GLenum)GL_RGB5_A1;
+   return upscaling > 1 || fb_out_storage != (GLenum)GL_RGB5_A1
+         || filter != FILTER_MODE_NEAREST || psx_pgxp_color;
 }
 
 static void gl_native_target_free(gl_renderer *renderer)
@@ -3347,7 +3350,7 @@ static void gl_native_target_init(gl_renderer *renderer, bool enabled)
  * or state the caller established - the framebuffer binding, the viewport and
  * the scissor - so a second call rasterises the identical primitives into a
  * differently sized target with no further setup. */
-static void gl_renderer_issue_batches(gl_renderer *renderer)
+static void gl_renderer_issue_batches(gl_renderer *renderer, bool native)
 {
    {
       size_t bi;
@@ -3380,7 +3383,7 @@ static void gl_renderer_issue_batches(gl_renderer *renderer)
           * additive draws on the fp16 target only, matching the Vulkan
           * renderer (primitive.frag gates hot on BLEND_ADD). */
          glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "hdr_hot"),
-               (renderer->fb_out_fp16 &&
+               (!native && renderer->fb_out_fp16 &&
                 ((psx_hdr_overbright_hot && !it->opaque &&
                   it->transparency_mode == SEMI_TRANSPARENCY_MODE_ADD)
                  /* Precise colour: the over-white lives in the vertex
@@ -3390,7 +3393,7 @@ static void gl_renderer_issue_batches(gl_renderer *renderer)
                   * requantize to the architectural bytes. */
                  || psx_pgxp_color)) ? 1u : 0u);
          glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "pgxp_fog"),
-               (renderer->fb_out_fp16 && psx_pgxp_color && psx_pgxp_fog) ? 1u : 0u);
+               (!native && renderer->fb_out_fp16 && psx_pgxp_color && psx_pgxp_fog) ? 1u : 0u);
       }
       if (opaque)
          glDisable(GL_BLEND);
@@ -3438,7 +3441,7 @@ static void gl_renderer_issue_batches(gl_renderer *renderer)
          TTGpuImage *hd_owned = NULL;
          const struct gl_uniform_map *um = renderer->command_buffer->program
             ? &renderer->command_buffer->program->uniforms : NULL;
-         bool have_hd = renderer->tracker && !hd_handle_is_none(&it->hd);
+         bool have_hd = !native && renderer->tracker && !hd_handle_is_none(&it->hd);
          if (have_hd)
          {
             HdTexture hd = texture_tracker_get_hd_texture(renderer->tracker, it->hd);
@@ -3482,7 +3485,7 @@ static void gl_renderer_issue_batches(gl_renderer *renderer)
           * LEQUAL so the redraw passes against its own depth writes;
           * alpha (the mask bit) is preserved via ZERO/ONE ADD; stencil
           * writes are masked off so set_mask state cannot double-apply. */
-         if (renderer->fb_out_fp16 && !it->opaque &&
+         if (!native && renderer->fb_out_fp16 && !it->opaque &&
              it->transparency_mode == SEMI_TRANSPARENCY_MODE_SUBTRACT_SOURCE &&
              renderer->command_buffer->program)
          {
@@ -3494,6 +3497,26 @@ static void gl_renderer_issue_batches(gl_renderer *renderer)
                            (GLvoid*)(it->first * sizeof(GLushort)));
             glStencilMask(1);
             glUniform1ui(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "force_zero"), 0u);
+         }
+         /* Opaque textured commands can write either mask bit. The
+          * color pass cleared stencil for its accepted fragments; replay
+          * only alpha-one fragments at the depth actually written. This
+          * excludes earlier geometry hidden by a later primitive in the
+          * batch, as well as pixels rejected by the original mask test. */
+         if (it->opaque && it->textured && !it->set_mask && um)
+         {
+            glUniform1ui(gl_uniform_map_get(um, "stencil_mask_only"), 1u);
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+            glDepthMask(GL_FALSE);
+            glDepthFunc(GL_EQUAL);
+            glStencilFunc(GL_ALWAYS, 1, 1);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+            glDrawElements(it->draw_mode, it->count, GL_UNSIGNED_SHORT,
+                           (GLvoid*)(it->first * sizeof(GLushort)));
+            glDepthFunc(GL_LEQUAL);
+            glDepthMask(GL_TRUE);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glUniform1ui(gl_uniform_map_get(um, "stencil_mask_only"), 0u);
          }
       }
 
@@ -3590,6 +3613,7 @@ static void gl_renderer_draw(gl_renderer *renderer)
       for (pass = 0; pass < passes; pass++)
       {
          bool        native = (pass == 1);
+         bool        canonical = native || (!has_software_fb && !native_pass);
          gl_texture *color  = native ? &renderer->fb_native
                                      : &renderer->fb_out;
          gl_texture *depth  = native ? &renderer->fb_native_depth
@@ -3626,8 +3650,12 @@ static void gl_renderer_draw(gl_renderer *renderer)
          glStencilMask(1);
          glEnable(GL_STENCIL_TEST);
 
+         if (renderer->command_buffer->program)
+            glUniform1ui(gl_uniform_map_get(
+                  &renderer->command_buffer->program->uniforms,
+                  "native_pass"), canonical ? 1u : 0u);
          gl_stats_pass_begin(renderer, native ? 1u : 0u);
-         gl_renderer_issue_batches(renderer);
+         gl_renderer_issue_batches(renderer, canonical);
          gl_stats_pass_end(renderer, native ? 1u : 0u);
 
          glDisable(GL_STENCIL_TEST);
@@ -3662,6 +3690,65 @@ static void gl_renderer_draw(gl_renderer *renderer)
    renderer->force_mask = false;
 }
 
+/* Upload the same immutable vertex slice to both VRAM targets and rebuild
+ * stencil from the uploaded mask bits. CPU uploads do not evaluate the old
+ * mask when software_fb is off, so the destination stencil is authoritative. */
+static void gl_renderer_draw_image(gl_renderer *renderer, bool mask_test)
+{
+   gl_draw_buffer *db = renderer->image_load_buffer;
+   GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
+   GLboolean depth_enabled = glIsEnabled(GL_DEPTH_TEST);
+   unsigned passes = renderer->native_target_enabled && renderer->fb_native.id ? 2 : 1;
+   unsigned pass;
+   if (gl_draw_buffer_is_empty(db))
+      return;
+
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D, renderer->fb_texture.id);
+   glDisable(GL_SCISSOR_TEST);
+   glDisable(GL_DEPTH_TEST);
+   glDisable(GL_BLEND);
+   glEnable(GL_STENCIL_TEST);
+   glStencilMask(1);
+   glUseProgram(db->program->id);
+   glUniform1i(gl_uniform_map_get(&db->program->uniforms, "fb_texture"), 0);
+   glUniform1ui(gl_uniform_map_get(&db->program->uniforms, "internal_upscaling"), 1);
+   for (pass = 0; pass < passes; pass++)
+   {
+      gl_framebuffer fb;
+      gl_texture *color = pass ? &renderer->fb_native : &renderer->fb_out;
+      gl_texture *depth = pass ? &renderer->fb_native_depth : &renderer->fb_out_depth;
+      gl_framebuffer_init(&fb, color);
+      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+            GL_TEXTURE_2D, depth->id, 0);
+      glStencilFunc(mask_test ? GL_NOTEQUAL : GL_ALWAYS, 1, 1);
+      glStencilOp(GL_KEEP, GL_KEEP, GL_ZERO);
+      glUniform1ui(gl_uniform_map_get(&db->program->uniforms, "stencil_mask_only"), 0u);
+      if (pass == 0)
+         gl_draw_buffer_draw_begin(db, GL_TRIANGLE_STRIP);
+      else
+         gl_draw_buffer_draw_again(db, GL_TRIANGLE_STRIP);
+
+      /* Masked destinations that the color pass preserved already have
+       * stencil one. Setting those to one again is harmless. */
+      glUniform1ui(gl_uniform_map_get(&db->program->uniforms, "stencil_mask_only"), 1u);
+      glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+      glStencilFunc(GL_ALWAYS, 1, 1);
+      glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+      gl_draw_buffer_draw_again(db, GL_TRIANGLE_STRIP);
+      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+      glDeleteFramebuffers(1, &fb.id);
+   }
+   glUniform1ui(gl_uniform_map_get(&db->program->uniforms, "stencil_mask_only"), 0u);
+   gl_draw_buffer_draw_end(db);
+   glDisable(GL_STENCIL_TEST);
+   if (depth_enabled)
+      glEnable(GL_DEPTH_TEST);
+   if (scissor_enabled)
+      glEnable(GL_SCISSOR_TEST);
+   glViewport(0, 0, renderer->fb_out.width, renderer->fb_out.height);
+}
+
 static void gl_renderer_upload_textures(
       gl_renderer *renderer,
       uint16_t top_left[2],
@@ -3673,7 +3760,6 @@ static void gl_renderer_upload_textures(
    uint16_t y_start;
    uint16_t y_end;
    gl_image_load_vertex slice[4];
-   gl_framebuffer _fb;
 
    if (!renderer)
       return;
@@ -3730,45 +3816,11 @@ static void gl_renderer_upload_textures(
       }
    }
 
-   glDisable(GL_SCISSOR_TEST);
-   glDisable(GL_BLEND);
-
-   /* Bind the output framebuffer */
-   gl_framebuffer_init(&_fb, &renderer->fb_out);
-
-   if (!gl_draw_buffer_is_empty(renderer->image_load_buffer))
-   {
-      gl_draw_buffer_draw_begin(renderer->image_load_buffer,
-            GL_TRIANGLE_STRIP);
-
-      /* Seed the native mirror from the same upload.  This is the path that
-       * runs at renderer creation and whenever the upscale or colour depth
-       * changes, so without it fb_native would start blank and stay that way
-       * until every region had been drawn over again. */
-      if (renderer->native_target_enabled && renderer->fb_native.id)
-      {
-         gl_framebuffer nfb;
-
-         gl_framebuffer_init(&nfb, &renderer->fb_native);
-         gl_draw_buffer_draw_again(renderer->image_load_buffer,
-               GL_TRIANGLE_STRIP);
-         glDeleteFramebuffers(1, &nfb.id);
-
-         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, _fb.id);
-         glViewport(0, 0,
-               (GLsizei)renderer->fb_out.width,
-               (GLsizei)renderer->fb_out.height);
-      }
-
-      gl_draw_buffer_draw_end(renderer->image_load_buffer);
-   }
-
-   glEnable(GL_SCISSOR_TEST);
+   gl_renderer_draw_image(renderer, false);
 
 #ifdef DEBUG
    get_error("gl_renderer_upload_textures");
 #endif
-   glDeleteFramebuffers(1, &_fb.id);
 }
 
 static void get_variables(uint8_t *upscaling, bool *display_vram)
@@ -4096,7 +4148,7 @@ static bool gl_renderer_new(gl_renderer *renderer, gl_draw_config config)
          GL_DEPTH24_STENCIL8);
 
    gl_native_target_init(renderer,
-         gl_native_target_wanted(upscaling, texture_storage));
+         gl_native_target_wanted(upscaling, texture_storage, filter));
 
    renderer->filter_type = filter;
    renderer->command_buffer = command_buffer;
@@ -5354,20 +5406,36 @@ static bool retro_refresh_variables(gl_renderer *renderer)
    enum dither_mode dither_mode   = DITHER_NATIVE;
    bool rebuild_fb_out;
    bool reconfigure_frontend;
+   bool previous_software_fb = has_software_fb;
+   bool requested_software_fb = false;
 
    var.key = BEETLE_OPT(renderer_software_fb);
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
       if (!strcmp(var.value, "enabled"))
-         has_software_fb = true;
+         requested_software_fb = true;
       else
-         has_software_fb = false;
+         requested_software_fb = false;
    }
    else
       /* Matches the core option's own default and the initial read in
        * gl_renderer_new: the CPU rasteriser is a compatibility fallback now
        * that fb_native keeps native-resolution PS1 VRAM on the GPU. */
-      has_software_fb = false;
+      requested_software_fb = false;
+
+   /* Switching to the CPU rasterizer must first make its VRAM current.
+    * Capture while the old ownership mode is still installed. */
+   if (requested_software_fb != previous_software_fb)
+   {
+      if (!GPU_SyncVRAM())
+      {
+         log_cb(RETRO_LOG_ERROR,
+               "[GL] Cannot change Software Framebuffer: VRAM capture failed.\n");
+         return false;
+      }
+      GPU_InvalidateTextureCache();
+   }
+   has_software_fb = requested_software_fb;
 
    get_variables(&upscaling, &display_vram);
 
@@ -5469,7 +5537,10 @@ static bool retro_refresh_variables(gl_renderer *renderer)
 
    rebuild_fb_out =
       upscaling != renderer->internal_upscaling ||
-      depth != renderer->internal_color_depth;
+      depth != renderer->internal_color_depth ||
+      previous_software_fb != has_software_fb ||
+      renderer->native_target_enabled !=
+            gl_native_target_wanted(upscaling, renderer->fb_out_format, filter);
 
    if (rebuild_fb_out)
    {
@@ -5511,6 +5582,15 @@ static bool retro_refresh_variables(gl_renderer *renderer)
       if (!gl_draw_buffer_is_empty(renderer->command_buffer))
          gl_renderer_draw(renderer);
 
+      /* CPU VRAM is a readback cache in hardware mode. Capture it before
+       * deleting the authoritative image used to seed the replacement. */
+      if (previous_software_fb == has_software_fb && !GPU_SyncVRAM())
+      {
+         log_cb(RETRO_LOG_ERROR,
+               "[GL] Cannot resize VRAM targets: VRAM capture failed.\n");
+         return false;
+      }
+
       glDeleteTextures(1, &renderer->fb_out.id);
       renderer->fb_out.id     = 0;
       renderer->fb_out.width  = 0;
@@ -5536,7 +5616,7 @@ static bool retro_refresh_variables(gl_renderer *renderer)
        * dropping back to 1x at 16bpp makes fb_out native again and retires
        * it. */
       gl_native_target_init(renderer,
-            gl_native_target_wanted(upscaling, texture_storage));
+            gl_native_target_wanted(upscaling, texture_storage, filter));
 
       /* From here on the new geometry is what the draw paths must scale to.
        * The assignment further down is then a no-op. */
@@ -5797,6 +5877,10 @@ static void vertex_preprocessing(
        || renderer->set_mask != set_mask
        || renderer->force_mask != set_mask
        || renderer->mask_test != mask_test
+       || renderer->batches.items[renderer->batches.count - 1].textured != is_textured
+       /* A texture may change stencil per pixel. Finish its mask replay
+        * before another mask-tested primitive consults the destination. */
+       || (mask_test && is_textured && !set_mask)
        || hd_handle_ne(&hd, &renderer->hd_handle))
    {
       struct gl_primitive_batch batch;
@@ -5807,6 +5891,7 @@ static void vertex_preprocessing(
          last->count = renderer->vertex_index_pos - last->first;
       }
       batch.opaque = is_opaque;
+      batch.textured = is_textured;
       batch.draw_mode = mode;
       batch.transparency_mode = stm;
       batch.set_mask = set_mask;
@@ -5838,6 +5923,7 @@ static void vertex_add_blended_pass(
       last->count = renderer->vertex_index_pos - last->first;
 
       batch.opaque = false;
+      batch.textured = last->textured;
       batch.draw_mode = last->draw_mode;
       batch.transparency_mode = last->transparency_mode;
       batch.set_mask = true;
@@ -6445,6 +6531,12 @@ static void gl_context_reset(void)
     * mirroring vk_context_reset. */
    if (static_renderer.state_data)
    {
+      if (!GPU_SyncVRAM())
+      {
+         log_cb(RETRO_LOG_ERROR,
+               "[GL] Cannot reset live context: VRAM capture failed.\n");
+         return;
+      }
       gl_renderer_free(static_renderer.state_data);
       free(static_renderer.state_data);
       static_renderer.state_data = NULL;
@@ -6547,9 +6639,9 @@ static void gl_context_destroy(void)
        * context_destroy while the context is still current, so the read is
        * legal at this point; if the journal owner check refuses it,
        * rhi_gl_read_vram returns false and we are no worse off than before. */
-      if (!rhi_gl_has_software_renderer())
-         (void)rhi_gl_read_vram(0, 0, VRAM_WIDTH_PIXELS, VRAM_HEIGHT,
-               GPU_get_vram());
+      if (!GPU_SyncVRAM())
+         log_cb(RETRO_LOG_ERROR,
+               "[GL] VRAM capture failed before context destruction.\n");
 
       gl_renderer_free(static_renderer.state_data);
       free(static_renderer.state_data);
@@ -7946,7 +8038,6 @@ void rhi_gl_load_image(
       bool mask_test, bool set_mask)
 {
    gl_renderer *renderer;
-   gl_framebuffer _fb;
    uint16_t top_left[2];
    uint16_t dimensions[2];
    uint16_t x_start;
@@ -7954,7 +8045,6 @@ void rhi_gl_load_image(
    uint16_t y_start;
    uint16_t y_end;
    gl_image_load_vertex slice[4];
-   GLboolean scissor_was_enabled;
 
    if (static_renderer.state == GL_STATE_INVALID)
       return;
@@ -8080,67 +8170,24 @@ void rhi_gl_load_image(
       }
    }
 
-   /* Save and restore rather than unconditionally re-enabling: this
-    * entry point is also reachable outside a prepare_frame /
-    * finalize_frame pair (the deferred-upload drain in
-    * gl_context_reset, and GPU_RestoreStateP3()'s full-VRAM replay on
-    * savestate load), where scissor is off on entry and forcing it
-    * back on hands the frontend a dirty context. Matches
-    * gl_tt_page_clear, gl_tt_page_blit, rhi_gl_read_vram and
-    * gl_mirror_fb_out_to_fb_texture. GL_BLEND is deliberately left
-    * off: it is per-draw state owned by the command buffer, not a
-    * frame-wide invariant like scissor. */
-   scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
-   if (scissor_was_enabled)
-      glDisable(GL_SCISSOR_TEST);
-   glDisable(GL_BLEND);
+   gl_renderer_draw_image(renderer, mask_test);
 
-   /* Bind the output framebuffer */
-   gl_framebuffer_init(&_fb, &renderer->fb_out);
-
-   if (!gl_draw_buffer_is_empty(renderer->image_load_buffer))
-   {
-      gl_draw_buffer_draw_begin(renderer->image_load_buffer,
-            GL_TRIANGLE_STRIP);
-
-      /* A CPU-to-VRAM transfer is guest-visible VRAM state, so it has to
-       * land in the native mirror too, or the next read-back would report
-       * whatever fb_native held before the upload.  The quad is the same:
-       * the vertex shader works in PS1 coordinates and internal_upscaling
-       * was already pinned to 1 above because fb_texture, the source, is
-       * always native. */
-      if (renderer->native_target_enabled && renderer->fb_native.id)
-      {
-         gl_framebuffer nfb;
-
-         gl_framebuffer_init(&nfb, &renderer->fb_native);
-         gl_draw_buffer_draw_again(renderer->image_load_buffer,
-               GL_TRIANGLE_STRIP);
-         glDeleteFramebuffers(1, &nfb.id);
-
-         /* Put the binding and viewport back where the fb_out draw left
-          * them; the delete below assumes _fb is still the bound target. */
-         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, _fb.id);
-         glViewport(0, 0,
-               (GLsizei)renderer->fb_out.width,
-               (GLsizei)renderer->fb_out.height);
-      }
-
-      gl_draw_buffer_draw_end(renderer->image_load_buffer);
-   }
-
-   if (scissor_was_enabled)
-      glEnable(GL_SCISSOR_TEST);
+   /* The transfer source in fb_texture contains incoming words. Restore
+    * protected destination pixels from canonical GPU VRAM before any later
+    * primitive uses the region as a texture or CLUT. */
+#ifdef GL_READ_FRAMEBUFFER
+   if (mask_test && !has_software_fb)
+      gl_vram_sync_mirror_rect(renderer, x, y, w, h);
+#endif
 
    /* The CPU upload is applied to fb_texture, fb_out and fb_native. */
    gl_vram_sync_clean_rect(renderer, x, y, w, h);
-   gl_vram_sync_update_gpu_written_rect(renderer, x, y, w, h, false);
+   gl_vram_sync_update_gpu_written_rect(renderer, x, y, w, h, mask_test && !has_software_fb);
 
 #ifdef DEBUG
    get_error("rhi_gl_load_image");
 #endif
 
-   glDeleteFramebuffers(1, &_fb.id);
 
    /* Diagnostic restore roundtrip: after a full-VRAM upload (the
     * savestate-restore path), read the framebuffer straight back and
@@ -9017,9 +9064,9 @@ void rhi_gl_fill_rect(
          if (is_native)
             gl_apply_scissor_scale(renderer, 1);
 
-         glClearColor(   (float) col[0] / 255.0,
-               (float) col[1] / 255.0,
-               (float) col[2] / 255.0,
+         glClearColor(   (float) (col[0] >> 3) / 31.0,
+               (float) (col[1] >> 3) / 31.0,
+               (float) (col[2] >> 3) / 31.0,
                /* TODO - XXX Not entirely sure what happens to
                   the mask bit in fill_rect commands */
                0.0);
@@ -9171,32 +9218,80 @@ static bool gl_vram_copy_program_ready(gl_renderer *renderer)
    return true;
 }
 
-/* GP0(80h) VRAM-to-VRAM copy, applied to one surface.
- *
- * Three things the copy this replaces did not do:
- *
- *  - Overlapping rectangles.  glCopyImageSubData is explicitly undefined when
- *    the source and destination regions of the same image overlap, and the
- *    glCopyTexSubImage2D fallback reads and writes one texture through a
- *    single binding, which is no better defined.  Games do overlap them -
- *    scrolling a region over itself is the ordinary way to do it - so the
- *    result was whatever the driver felt like.  Stage through a scratch
- *    texture whenever the rectangles meet.
- *
- *  - The mask bit.  The command honours both mask settings: with mask_test,
- *    a destination pixel whose bit 15 is set is preserved; with set_mask,
- *    every written pixel gets bit 15 forced on.  An image copy cannot consult
- *    the destination at all, so a mask-tested copy is issued as a quad
- *    through vram_copy_fragment instead, which is also where the Vulkan
- *    backend's blit_vram shader draws the line.
- *
- *  - fb_native.  A copy moves guest-visible VRAM, so it has to happen on the
- *    native mirror too or the next read-back reports pre-copy pixels.
- *
- * A rectangle that runs off the edge of VRAM still is not split into its
- * wrapped parts - that limitation is unchanged - but it is now routed through
- * staging rather than copied in place, so it can no longer be undefined on
- * top of being clipped. */
+/* Stage before writing, including both sides of a horizontal VRAM seam.
+ * The caller uses one rectangle for disjoint copies and one 128-word row
+ * chunk for overlapping/wrapped copies, matching the emulated GPU buffer. */
+static void gl_copy_rect_chunk(gl_renderer *renderer,
+      gl_texture *color, gl_texture *depth, uint32_t upscale,
+      uint16_t src_x, uint16_t src_y,
+      uint16_t dst_x, uint16_t dst_y,
+      uint16_t w, uint16_t h, bool mask_test, bool set_mask)
+{
+   bool native = color == &renderer->fb_native;
+   unsigned slot = native ? 1u : 0u;
+   GLenum fmt = native ? (GLenum)GL_RGB5_A1 : renderer->fb_out_format;
+   gl_texture *scratch = &renderer->fb_copy_scratch[slot];
+   gl_draw_buffer *db = renderer->vram_copy_buffer;
+   unsigned first = w < VRAM_WIDTH_PIXELS - src_x ? w : VRAM_WIDTH_PIXELS - src_x;
+   unsigned offset = 0;
+   gl_framebuffer fb;
+
+   if (!gl_copy_scratch_ensure(renderer, slot, w * upscale, h * upscale, fmt))
+      return;
+   gl_copy_blit(renderer, color->id, src_x * upscale, src_y * upscale,
+         scratch->id, 0, 0, first * upscale, h * upscale);
+   if (first < w)
+      gl_copy_blit(renderer, color->id, 0, src_y * upscale,
+            scratch->id, first * upscale, 0, (w - first) * upscale, h * upscale);
+
+   gl_framebuffer_init(&fb, color);
+   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+         GL_TEXTURE_2D, depth->id, 0);
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D, scratch->id);
+   glUseProgram(db->program->id);
+   glUniform1i(gl_uniform_map_get(&db->program->uniforms, "copy_source"), 0);
+   glUniform1ui(gl_uniform_map_get(&db->program->uniforms, "copy_mask_test"), 0u);
+   glUniform1ui(gl_uniform_map_get(&db->program->uniforms, "copy_set_mask"), set_mask ? 1u : 0u);
+
+   while (offset < w)
+   {
+      unsigned dx = (dst_x + offset) & (VRAM_WIDTH_PIXELS - 1);
+      unsigned width = w - offset;
+      gl_image_load_vertex quad[4];
+      if (width > VRAM_WIDTH_PIXELS - dx)
+         width = VRAM_WIDTH_PIXELS - dx;
+      quad[0].position[0] = dx;
+      quad[0].position[1] = dst_y;
+      quad[1].position[0] = dx + width;
+      quad[1].position[1] = dst_y;
+      quad[2].position[0] = dx;
+      quad[2].position[1] = dst_y + h;
+      quad[3].position[0] = dx + width;
+      quad[3].position[1] = dst_y + h;
+      gl_draw_buffer_push_slice(db, quad, 4, sizeof(gl_image_load_vertex));
+      glUniform2i(gl_uniform_map_get(&db->program->uniforms, "copy_offset"),
+            ((GLint)offset - (GLint)dx) * (GLint)upscale, -(GLint)dst_y * (GLint)upscale);
+      glUniform1ui(gl_uniform_map_get(&db->program->uniforms, "stencil_mask_only"), 0u);
+      glStencilFunc(mask_test ? GL_NOTEQUAL : GL_ALWAYS, 1, 1);
+      glStencilOp(GL_KEEP, GL_KEEP, GL_ZERO);
+      gl_draw_buffer_draw_begin(db, GL_TRIANGLE_STRIP);
+
+      /* Rebuild stencil from the source mask after the color transfer.
+       * Protected pixels already contain one and remain protected. */
+      glUniform1ui(gl_uniform_map_get(&db->program->uniforms, "stencil_mask_only"), 1u);
+      glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+      glStencilFunc(GL_ALWAYS, 1, 1);
+      glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+      gl_draw_buffer_draw_again(db, GL_TRIANGLE_STRIP);
+      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+      gl_draw_buffer_draw_end(db);
+      offset += width;
+   }
+   glUniform1ui(gl_uniform_map_get(&db->program->uniforms, "stencil_mask_only"), 0u);
+   glDeleteFramebuffers(1, &fb.id);
+}
+
 static void gl_copy_rect_surface(gl_renderer *renderer,
       gl_texture *color, gl_texture *depth, uint32_t upscale,
       uint16_t src_x, uint16_t src_y,
@@ -9204,207 +9299,46 @@ static void gl_copy_rect_surface(gl_renderer *renderer,
       uint16_t w, uint16_t h,
       bool mask_test, bool set_mask)
 {
-   GLint     sx  = (GLint)src_x * (GLint)upscale;
-   GLint     sy  = (GLint)src_y * (GLint)upscale;
-   GLint     dx  = (GLint)dst_x * (GLint)upscale;
-   GLint     dy  = (GLint)dst_y * (GLint)upscale;
-   GLsizei   cw  = (GLsizei)w * (GLsizei)upscale;
-   GLsizei   ch  = (GLsizei)h * (GLsizei)upscale;
-   bool      is_native = (color == &renderer->fb_native);
-   unsigned  slot      = is_native ? 1u : 0u;
-   GLenum    fmt       = is_native
-         ? (GLenum)GL_RGB5_A1 : renderer->fb_out_format;
-   gl_texture *scratch = &renderer->fb_copy_scratch[slot];
-   GLboolean scissor_was_enabled;
-   bool      wraps;
-   bool      overlap;
-   bool      staged;
-
-   if (!cw || !ch || !color->id)
+   bool wraps, overlap;
+   GLboolean scissor_enabled, depth_enabled;
+   unsigned row, column;
+   if (!w || !h || !color->id || !gl_caps.fp_glBlitFramebuffer ||
+       !gl_vram_copy_program_ready(renderer))
       return;
 
-   if (mask_test && !gl_vram_copy_program_ready(renderer))
-      mask_test = false;
+   wraps = (unsigned)src_x + w > VRAM_WIDTH_PIXELS || (unsigned)dst_x + w > VRAM_WIDTH_PIXELS ||
+           (unsigned)src_y + h > VRAM_HEIGHT || (unsigned)dst_y + h > VRAM_HEIGHT;
+   overlap = (unsigned)src_x < (unsigned)dst_x + w && (unsigned)dst_x < (unsigned)src_x + w &&
+             (unsigned)src_y < (unsigned)dst_y + h && (unsigned)dst_y < (unsigned)src_y + h;
+   scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
+   depth_enabled = glIsEnabled(GL_DEPTH_TEST);
+   glDisable(GL_SCISSOR_TEST);
+   glDisable(GL_DEPTH_TEST);
+   glDisable(GL_BLEND);
+   glEnable(GL_STENCIL_TEST);
+   glStencilMask(1);
 
-   wraps   = (unsigned)src_x + w > VRAM_WIDTH_PIXELS
-          || (unsigned)src_y + h > VRAM_HEIGHT
-          || (unsigned)dst_x + w > VRAM_WIDTH_PIXELS
-          || (unsigned)dst_y + h > VRAM_HEIGHT;
-   overlap = wraps
-          || ((unsigned)src_x < (unsigned)dst_x + w
-           && (unsigned)dst_x < (unsigned)src_x + w
-           && (unsigned)src_y < (unsigned)dst_y + h
-           && (unsigned)dst_y < (unsigned)src_y + h);
-   staged  = mask_test || overlap;
-
-   if (staged
-         && (!gl_caps.fp_glBlitFramebuffer
-            || !gl_copy_scratch_ensure(renderer, slot,
-                  mask_test ? cw * 2 : cw, ch, fmt)))
-   {
-      /* No way to stage: fall back to the in-place copy rather than dropping
-       * the command outright. */
-      staged    = false;
-      mask_test = false;
-   }
-
-   scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
-   if (scissor_was_enabled)
-      glDisable(GL_SCISSOR_TEST);
-
-   if (staged)
-   {
-      /* Source at the scratch origin; for a mask test the destination goes
-       * directly to its right, where the shader expects to find it. */
-      gl_copy_blit(renderer, color->id, sx, sy,
-            scratch->id, 0, 0, cw, ch);
-      if (mask_test)
-         gl_copy_blit(renderer, color->id, dx, dy,
-               scratch->id, cw, 0, cw, ch);
-   }
-
-   if (mask_test)
-   {
-      gl_framebuffer  fb;
-      gl_draw_buffer *db = renderer->vram_copy_buffer;
-      GLboolean depth_was_enabled = glIsEnabled(GL_DEPTH_TEST);
-      gl_image_load_vertex quad[4] =
-      {
-         {  { dst_x,             dst_y             }  },
-         {  { (uint16_t)(dst_x + w), dst_y         }  },
-         {  { dst_x,             (uint16_t)(dst_y + h) }  },
-         {  { (uint16_t)(dst_x + w), (uint16_t)(dst_y + h) }  },
-      };
-
-      gl_framebuffer_init(&fb, color);
-#ifdef HAVE_OPENGLES3
-      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,
-            GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, depth->id, 0);
-#else
-      glFramebufferTexture(GL_DRAW_FRAMEBUFFER,
-            GL_DEPTH_STENCIL_ATTACHMENT, depth->id, 0);
-#endif
-
-      glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_2D, scratch->id);
-
-      gl_draw_buffer_push_slice(db, quad, 4, sizeof(gl_image_load_vertex));
-
-      if (db->program)
-      {
-         const struct gl_uniform_map *um = &db->program->uniforms;
-         glUseProgram(db->program->id);
-         glUniform1i (gl_uniform_map_get(um, "copy_source"), 0);
-         glUniform2i (gl_uniform_map_get(um, "copy_offset"), -dx, -dy);
-         glUniform1i (gl_uniform_map_get(um, "copy_dst_offset"), (GLint)cw);
-         glUniform1ui(gl_uniform_map_get(um, "copy_mask_test"), 1u);
-         glUniform1ui(gl_uniform_map_get(um, "copy_set_mask"),
-               set_mask ? 1u : 0u);
-      }
-
-      glDisable(GL_BLEND);
-      if (depth_was_enabled)
-         glDisable(GL_DEPTH_TEST);
-      glDepthMask(GL_FALSE);
-
-      /* Keep the stencil plane in step with the alpha this draw writes, but
-       * only where the answer is unambiguous.  set_mask forces bit 15 on, so
-       * the stencil goes to 1 with it.  A plain copy carries each source
-       * pixel's own bit, which no fixed stencil op can express: alpha is
-       * updated and the stencil left alone, which is already what a CPU
-       * upload does. */
-      if (set_mask)
-      {
-         glEnable(GL_STENCIL_TEST);
-         glStencilMask(1);
-         glStencilFunc(GL_ALWAYS, 1, 1);
-         glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
-      }
-      else
-         glStencilMask(0);
-
-      if (!gl_draw_buffer_is_empty(db))
-         gl_draw_buffer_draw(db, GL_TRIANGLE_STRIP);
-
-      if (set_mask)
-         glDisable(GL_STENCIL_TEST);
-      glStencilMask(1);
-      glDepthMask(GL_TRUE);
-      if (depth_was_enabled)
-         glEnable(GL_DEPTH_TEST);
-
-      glDeleteFramebuffers(1, &fb.id);
-      /* Unit 0 belongs to fb_texture as far as every other draw is
-       * concerned. */
-      glBindTexture(GL_TEXTURE_2D, renderer->fb_texture.id);
-   }
-   else if (staged)
-   {
-      gl_copy_blit(renderer, scratch->id, 0, 0,
-            color->id, dx, dy, cw, ch);
-   }
-   else if (gl_caps.fp_glCopyImageSubData)
-   {
-      gl_caps.fp_glCopyImageSubData(
-            color->id, GL_TEXTURE_2D, 0, sx, sy, 0,
-            color->id, GL_TEXTURE_2D, 0, dx, dy, 0,
-            cw, ch, 1);
-   }
+   if (!wraps && !overlap)
+      gl_copy_rect_chunk(renderer, color, depth, upscale,
+            src_x, src_y, dst_x, dst_y, w, h, mask_test, set_mask);
    else
-   {
-      /* Portable fallback for profiles without copy_image: read-bind the
-       * texture to an FBO and copy through it.  Known to flicker on some
-       * high-res interlaced titles (Dead or Alive, Tekken 3). */
-      glBindFramebuffer(GL_READ_FRAMEBUFFER, renderer->copy_read_fbo);
-#ifdef HAVE_OPENGLES3
-      glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-            GL_TEXTURE_2D, color->id, 0);
-#else
-      glFramebufferTexture(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-            color->id, 0);
-#endif
-      glReadBuffer(GL_COLOR_ATTACHMENT0);
-      glBindTexture(GL_TEXTURE_2D, color->id);
-      glCopyTexSubImage2D(GL_TEXTURE_2D, 0, dx, dy, sx, sy, cw, ch);
-      glBindTexture(GL_TEXTURE_2D, renderer->fb_texture.id);
-   }
+      for (row = 0; row < h; row++)
+         for (column = 0; column < w; column += 128)
+         {
+            unsigned count = w - column < 128 ? w - column : 128;
+            gl_copy_rect_chunk(renderer, color, depth, upscale,
+                  (src_x + column) & (VRAM_WIDTH_PIXELS - 1), (src_y + row) & (VRAM_HEIGHT - 1),
+                  (dst_x + column) & (VRAM_WIDTH_PIXELS - 1), (dst_y + row) & (VRAM_HEIGHT - 1),
+                  count, 1, mask_test, set_mask);
+         }
 
-   if (set_mask && !mask_test)
-   {
-      /* MaskSetOR forces bit 15 on every pixel written.  The copy above
-       * carried the source's bit instead, so overwrite that one channel -
-       * and the stencil plane with it - over the destination rectangle.  A
-       * colour-masked scissored clear does it without a draw. */
-      gl_framebuffer fb;
-
-      gl_framebuffer_init(&fb, color);
-#ifdef HAVE_OPENGLES3
-      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,
-            GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, depth->id, 0);
-#else
-      glFramebufferTexture(GL_DRAW_FRAMEBUFFER,
-            GL_DEPTH_STENCIL_ATTACHMENT, depth->id, 0);
-#endif
-      glEnable(GL_SCISSOR_TEST);
-      glScissor(dx, dy, cw, ch);
-      glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
-      glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-      glStencilMask(1);
-      glClearStencil(1);
-      glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-      glDisable(GL_SCISSOR_TEST);
-      glDeleteFramebuffers(1, &fb.id);
-   }
-
+   glBindTexture(GL_TEXTURE_2D, renderer->fb_texture.id);
    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-
-   /* The MaskSetOR clear narrowed the scissor box to the destination
-    * rectangle; put the draw area back before handing control on. */
-   if (set_mask && !mask_test)
-      apply_scissor(renderer);
-   if (scissor_was_enabled)
+   glDisable(GL_STENCIL_TEST);
+   if (depth_enabled)
+      glEnable(GL_DEPTH_TEST);
+   if (scissor_enabled)
       glEnable(GL_SCISSOR_TEST);
 }
 
@@ -9427,7 +9361,7 @@ void rhi_gl_copy_rect(
       return;
    }
 
-   if (src_x == dst_x && src_y == dst_y)
+   if (src_x == dst_x && src_y == dst_y && !set_mask)
      return;
 
    renderer->set_mask          = set_mask;
@@ -9472,7 +9406,8 @@ void rhi_gl_copy_rect(
     * rationale - this used to be ~60 lines of inline FBO dance
     * here, extracted so rhi_gl_fill_rect can share it. */
 #ifdef GL_READ_FRAMEBUFFER
-   gl_mirror_fb_out_to_fb_texture(renderer, dst_x, dst_y, w, h, false);
+   if (!has_software_fb)
+      gl_vram_sync_mirror_rect(renderer, dst_x, dst_y, w, h);
 #endif
 
 #ifdef GL_READ_FRAMEBUFFER

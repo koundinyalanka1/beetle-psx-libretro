@@ -18,6 +18,10 @@
 
 static const char * command_fragment_name_ = GLSL_FRAGMENT(
 uniform sampler2D fb_texture;
+// Guest VRAM is rendered without display-only texture/color enhancements.
+uniform uint native_pass;
+// Replay only mask-set fragments into stencil with color writes disabled.
+uniform uint stencil_mask_only;
 
 // Scaling to apply to the dither pattern
 uniform uint dither_scaling;
@@ -1041,7 +1045,7 @@ void main() {
       else
       {
          vec4 texel;
-         bool hd_on = hd_enabled != 0U;
+         bool hd_on = hd_enabled != 0U && native_pass == 0u;
          vec4 texel0 = sample_texel(vec2(frag_texture_coord.x,
                   frag_texture_coord.y));
 				  
@@ -1097,6 +1101,11 @@ STRINGIZE(
                opacity = hd_color.a;
             }
          }
+         if (native_pass != 0u) {
+            texel0 = sample_texel(frag_texture_coord);
+            texel = texel0;
+            opacity = float(!is_transparent(texel0));
+         }
 
 	 // texel color 0x0000 is always fully transparent (even for opaque
          // draw commands)
@@ -1126,8 +1135,8 @@ STRINGIZE(
          if (frag_texture_blend_mode == BLEND_MODE_RAW_TEXTURE) {
             color = vec4(texel.rgb, mask_bit);
          } else /* BLEND_MODE_TEXTURE_BLEND */ {
-            if (fixed_point_modulation != 0u &&
-                frag_framebuffer_feedback != 0u)
+            if (native_pass != 0u || (fixed_point_modulation != 0u &&
+                frag_framebuffer_feedback != 0u))
             {
                uint mod_x =
                   (uint(gl_FragCoord.x) / dither_scaling) & 3u;
@@ -1186,12 +1195,17 @@ STRINGIZE(
        * truncates instead; make that conversion explicit. This also keeps
        * filtered framebuffer feedback moving toward zero without reducing
        * the sampling precision used to produce output_rgb. */
-      if (native_rgb5 != 0u)
+      if (native_pass != 0u)
+         output_rgb = min(floor(clamp(output_rgb, vec3(0.), vec3(1.)) *
+                      255. / 8.), vec3(31.)) / 31.;
+      else if (native_rgb5 != 0u)
          output_rgb = floor(clamp(output_rgb, vec3(0.), vec3(1.)) * 31.) /
                       31.;
 
       frag_color = vec4(output_rgb, color.a);
    }
+   if (stencil_mask_only != 0u && frag_color.a < 0.5)
+      discard;
 }
 );
 

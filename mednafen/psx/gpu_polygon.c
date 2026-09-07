@@ -864,7 +864,7 @@ static INLINE void PCT_UVBatch(int n, float bias,
 #endif
 
 #define DEFINE_DrawSpan(SUFFIX, GOURAUD_LIT, TEXTURED_LIT, BM_VAL, BM_TAG, TM_LIT, MO_LIT, ME_LIT) \
-static INLINE void DrawSpan_##SUFFIX(PS_GPU *gpu, int y, const int32_t x_start, const int32_t x_bound, i_group ig, const i_deltas *idl, const bool pct) \
+static INLINE void DrawSpan_##SUFFIX(PS_GPU *gpu, int y, const int32_t x_start, const int32_t x_bound, i_group ig, const i_deltas *idl, const bool pct, const bool rasterize) \
 { \
    int32_t clipx0; \
    int32_t clipx1; \
@@ -932,6 +932,9 @@ static INLINE void DrawSpan_##SUFFIX(PS_GPU *gpu, int y, const int32_t x_start, 
       else \
          gpu->DrawTimeAvail -= w >> gpu->upscale_shift; \
    } \
+   /* Edge/span accounting is still required when VRAM lives on the GPU. */ \
+   if (!rasterize) \
+      return; \
    /* Native-res, non-textured fast path: vectorise the contiguous run \
     * (the span lies within [ClipX0,ClipX1] in [0,1023], so it never \
     * crosses the x==1024 VRAM wrap).  Advances x/w and steps the affine \
@@ -1153,7 +1156,8 @@ static INLINE void DrawTriangle_##SUFFIX(PS_GPU *gpu, tri_vertex *vertices, cons
    int64_t bound_coord_us; \
    int64_t bound_coord_ls; \
    bool right_facing; \
-   bool pct_local = pct; \
+   const bool rasterize = rhi_intf_has_software_renderer(); \
+   bool pct_local = pct && rasterize; \
    i_group ig; \
    unsigned vo = 0; \
    unsigned vp = 0; \
@@ -1326,7 +1330,7 @@ static INLINE void DrawTriangle_##SUFFIX(PS_GPU *gpu, tri_vertex *vertices, cons
                gpu->DrawTimeAvail -= 2; \
                continue; \
             } \
-            DrawSpan_g##GOURAUD_LIT##_t##TEXTURED_LIT##_##BM_TAG##_TM##TM_LIT##_MO##MO_LIT##_ME##ME_LIT(gpu, yi, GetPolyXFP_Int(lc), GetPolyXFP_Int(rc), ig, &idl, pct_local); \
+            DrawSpan_g##GOURAUD_LIT##_t##TEXTURED_LIT##_##BM_TAG##_TM##TM_LIT##_MO##MO_LIT##_ME##ME_LIT(gpu, yi, GetPolyXFP_Int(lc), GetPolyXFP_Int(rc), ig, &idl, pct_local, rasterize); \
          } \
       } \
       else \
@@ -1341,7 +1345,7 @@ static INLINE void DrawTriangle_##SUFFIX(PS_GPU *gpu, tri_vertex *vertices, cons
                gpu->DrawTimeAvail -= 2; \
                goto skipit_##SUFFIX; \
             } \
-            DrawSpan_g##GOURAUD_LIT##_t##TEXTURED_LIT##_##BM_TAG##_TM##TM_LIT##_MO##MO_LIT##_ME##ME_LIT(gpu, yi, GetPolyXFP_Int(lc), GetPolyXFP_Int(rc), ig, &idl, pct_local); \
+            DrawSpan_g##GOURAUD_LIT##_t##TEXTURED_LIT##_##BM_TAG##_TM##TM_LIT##_MO##MO_LIT##_ME##ME_LIT(gpu, yi, GetPolyXFP_Int(lc), GetPolyXFP_Int(rc), ig, &idl, pct_local, rasterize); \
             skipit_##SUFFIX: ; \
             yi++; \
             lc += ls; \
@@ -1836,7 +1840,6 @@ static void Command_DrawPolygon_##SUFFIX(PS_GPU *gpu, const uint32_t *cb) \
             } \
          } \
       } \
-      if (rhi_intf_has_software_renderer()) \
       { \
          /* Perspective-correct texturing for the SW rasteriser. \
           * Eligible when this primitive came in through the PGXP \

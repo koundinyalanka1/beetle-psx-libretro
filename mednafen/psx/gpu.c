@@ -47,9 +47,7 @@
 #include "../state_helpers.h"
 #include "../../rhi/rhi_intf.h"
 #include "../../rhi/tt_trace.h"
-#ifdef PSX_MEASURE_MODULATE
 #include "../../include/debug.h"   /* log_cb */
-#endif
 
 #include "../pgxp/pgxp_main.h"
 #include "../pgxp/pgxp_gpu.h"
@@ -617,6 +615,12 @@ static INLINE void InvalidateCache(PS_GPU *gpu)
    InvalidateTexCache(gpu);
 }
 
+void GPU_InvalidateTextureCache(void)
+{
+   GPU_Worker_Sync();
+   InvalidateCache(&GPU);
+}
+
 /* Set a pixel in VRAM, upscaling it if necessary. Static because the
  * only callers are in this translation unit (gpu.cpp textually
  * #includes gpu_polygon.cpp / gpu_sprite.cpp / gpu_line.cpp, and the
@@ -1031,6 +1035,77 @@ static void Command_FBWrite(PS_GPU* g, const uint32_t *cb)
       GPU_MarkDisplayDirty();
 }
 
+/* Pixels received so far already exist in PS1 VRAM, even if the guest
+ * aborts its upload or saves halfway through a row. Commit them before a
+ * hardware snapshot overwrites the CPU buffer used to stage the payload.
+ * The two rectangles cover only received pixels, including VRAM wrapping. */
+static void GPU_FBWrite_FlushPartial(void)
+{
+   uint16_t rows, columns;
+   if (GPU.InCmd != INCMD_FBWRITE)
+      return;
+
+   rows = GPU.FBRW_CurY - GPU.FBRW_Y;
+   columns = GPU.FBRW_CurX - GPU.FBRW_X;
+   if (rows)
+      rhi_intf_load_image(GPU.FBRW_X, GPU.FBRW_Y, GPU.FBRW_W, rows,
+            GPU.vram, GPU.MaskEvalAND != 0, GPU.MaskSetOR != 0);
+   if (columns)
+      rhi_intf_load_image(GPU.FBRW_X, GPU.FBRW_CurY, columns, 1,
+            GPU.vram, GPU.MaskEvalAND != 0, GPU.MaskSetOR != 0);
+}
+
+/* RHI readbacks always use native 1024-word rows. Hardware rendering normally
+ * keeps the CPU mirror at 1x, but renderer transitions may still expose an
+ * upscaled mirror. Seed scratch with its current contents so a coherence
+ * tracker which skips clean tiles cannot return uninitialized pixels. */
+static bool GPU_ReadVRAMRect(uint16_t x, uint16_t y,
+      uint16_t w, uint16_t h, bool odd_read_word)
+{
+   uint16_t *native = GPU.vram;
+   bool ok;
+   unsigned row, col;
+
+   if (!native)
+      return false;
+   if (GPU.upscale_shift)
+   {
+      native = (uint16_t *)malloc(1024 * 512 * sizeof(uint16_t));
+      if (!native)
+         return false;
+      for (row = 0; row < 512; row++)
+         for (col = 0; col < 1024; col++)
+            native[row * 1024 + col] = texel_fetch(&GPU, col, row);
+   }
+
+   ok = rhi_intf_read_vram(x, y, w, h, native);
+   /* GPU_ReadData still reads the next column for the upper half of the
+    * final word when the requested pixel count is odd. Snapshot that pixel
+    * too, before the worker can submit any following drawing commands. */
+   if (ok && odd_read_word && (w & h & 1))
+      ok = rhi_intf_read_vram((x + w) & 1023, (y + h - 1) & 511,
+            1, 1, native);
+
+   if (GPU.upscale_shift)
+   {
+      if (ok)
+         for (row = 0; row < 512; row++)
+            for (col = 0; col < 1024; col++)
+               texel_put(col, row, native[row * 1024 + col]);
+      free(native);
+   }
+   return ok;
+}
+
+bool GPU_SyncVRAM(void)
+{
+   GPU_Worker_Sync();
+   GPU_FBWrite_FlushPartial();
+   if (rhi_intf_has_software_renderer())
+      return GPU.vram != NULL;
+   return GPU_ReadVRAMRect(0, 0, 1024, 512, false);
+}
+
 /* FBRead: PS1 GPU in SCPH-5501 gives odd, inconsistent results when
  * raw_height == 0, or raw_height != 0x200 && (raw_height & 0x1FF) == 0
  */
@@ -1066,7 +1141,7 @@ static void Command_FBRead(PS_GPU* g, const uint32_t *cb)
 
    gpu_fbread_n++;
 
-   if (!rhi_intf_has_software_renderer())
+   if (g->InCmd == INCMD_FBREAD && !rhi_intf_has_software_renderer())
    {
       /* The pixels are on the GPU.  On the worker we must not fetch them
        * ourselves - OpenGL is thread-affine and even Vulkan would be turning
@@ -1086,15 +1161,13 @@ static void Command_FBRead(PS_GPU* g, const uint32_t *cb)
       }
       else
       {
-         /* Running inline on the emulation thread: just do it.  Return value
-          * is intentionally discarded - on renderer failure the call is a
-          * no-op and g->vram keeps its prior contents. */
+         /* Running inline on the emulation thread: the context is current. */
          retro_time_t rb_t0 = cpu_features_get_time_usec();
 
-         (void)rhi_intf_read_vram(
+         if (!GPU_ReadVRAMRect(
                  g->FBRW_X, g->FBRW_Y,
-                 g->FBRW_W, g->FBRW_H,
-                 g->vram);
+                 g->FBRW_W, g->FBRW_H, true) && log_cb)
+            log_cb(RETRO_LOG_ERROR, "[GPU] VRAM readback failed.\n");
 
          gpu_readback_us += (uint64_t)(cpu_features_get_time_usec() - rb_t0);
          gpu_fbread_barriers++;
@@ -2004,8 +2077,9 @@ static void GPU_FBRead_Service(void)
       return;
 
    t0 = cpu_features_get_time_usec();
-   (void)rhi_intf_read_vram(gpu_fbread_x, gpu_fbread_y,
-         gpu_fbread_w, gpu_fbread_h, GPU.vram);
+   if (!GPU_ReadVRAMRect(gpu_fbread_x, gpu_fbread_y,
+         gpu_fbread_w, gpu_fbread_h, true) && log_cb)
+      log_cb(RETRO_LOG_ERROR, "[GPU] Deferred VRAM readback failed.\n");
    gpu_readback_us += (uint64_t)(cpu_features_get_time_usec() - t0);
    gpu_fbread_barriers++;
 
@@ -2049,6 +2123,7 @@ static void GPU_WriteGP1_Internal(uint32_t V)
       default:
          break;
       case 0x00:  /* Reset GPU */
+         GPU_FBWrite_FlushPartial();
          GPU_SoftReset();
          rhi_intf_set_draw_area(GPU.ClipX0, GPU.ClipY0,
                                 GPU.ClipX1, GPU.ClipY1);
@@ -2060,6 +2135,7 @@ static void GPU_WriteGP1_Internal(uint32_t V)
          break;
 
       case 0x01:  /* Reset command buffer */
+         GPU_FBWrite_FlushPartial();
          if(GPU.DrawTimeAvail < 0)
             GPU.DrawTimeAvail = 0;
          FastFIFO_Flush(&GPU_BlitterFIFO);
@@ -3681,7 +3757,7 @@ void GPU_FlushDeferredScanout(void)
 }
 
 
-void GPU_RestoreStateP1(bool load)
+bool GPU_RestoreStateP1(bool load)
 {
    /* Reached from GPU_StateAction (already drained) but also straight from the
     * GL backend's context_reset, on the frontend's thread, with the worker
@@ -3689,18 +3765,8 @@ void GPU_RestoreStateP1(bool load)
     * into. */
    GPU_Worker_Sync();
 
-   if (!load && !rhi_intf_has_software_renderer())
-   {
-      /* Pure hardware renderer: the composited framebuffer lives only on the
-       * GPU. CPU-side GPU.vram is coherent solely where the game issued an
-       * FBRead (see Command_FBRead) or CPU-uploaded, so anything the GPU
-       * rendered but the game never read back is stale here. Without this,
-       * the savestate below (which reads GPU.vram) serializes that stale
-       * data as garbage, and it reloads corrupt in every colour mode. Sync
-       * the whole framebuffer back from the GPU before capture; the coherence
-       * tracker still skips the transfer for regions that are already clean. */
-      rhi_intf_read_vram(0, 0, 1024, 512, GPU.vram);
-   }
+   if (!load && !GPU_SyncVRAM())
+      return false;
 
    if (GPU.upscale_shift == 0)
    {
@@ -3709,15 +3775,14 @@ void GPU_RestoreStateP1(bool load)
    }
    else
    {
-      /* We have increased internal resolution, savestates are always */
-      /* made at 1x for compatibility. The 1MB scratch is exposed to */
-      /* MDFNSS_StateAction via SFARRAY16N below; if this allocation */
-      /* fails the SFARRAY16N would deref NULL, so we leave vram_new */
-      /* at NULL and the StateAction caller is responsible for noticing */
-      /* (an upcoming change will surface the failure to libretro). */
+      /* Savestates remain at 1x. Seed even on load: context restoration
+       * also calls P1(true)/P2(true), without a serialized state between
+       * them, and must retain the existing CPU mirror in that case. */
       vram_new = (uint16_t *)malloc(1024 * 512 * sizeof(uint16_t));
+      if (!vram_new)
+         return false;
 
-      if (vram_new && !load)
+      if (GPU.vram)
       {
          /* We must downscale the current VRAM contents back to 1x */
          for (unsigned y = 0; y < 512; y++)
@@ -3736,6 +3801,7 @@ void GPU_RestoreStateP1(bool load)
          TexCache_Data[i][j] = GPU.TexCache[i].Data[j];
 
    }
+   return vram_new != NULL;
 }
 
 void GPU_RestoreStateP2(bool load)
@@ -3827,7 +3893,8 @@ int GPU_StateAction(StateMem *sm, int load, int data_only)
 {
    GPU_Worker_Sync();
 
-   GPU_RestoreStateP1(load);
+   if (!GPU_RestoreStateP1(load))
+      return 0;
 
    SFORMAT StateRegs[] =
    {

@@ -26,6 +26,14 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <sys/stat.h>
+#if defined(__APPLE__) && !defined(GLHOST_GLES)
+#define GLHOST_CGL
+#define GL_SILENCE_DEPRECATION
+#include <OpenGL/OpenGL.h>
+#include <OpenGL/gl3.h>
+static void *glhost_get_proc(const char *name) { return dlsym(RTLD_DEFAULT, name); }
+#define eglGetProcAddress glhost_get_proc
+#else
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #ifdef GLHOST_GLES
@@ -33,7 +41,9 @@
 #else
 #include <GL/gl.h>
 #endif
+#endif
 #include "libretro.h"
+#include "../multicore/testrom_report.h"
 
 /* ---- core option overrides / harvested defaults ---- */
 static char *var_keys[512]; static char *var_vals[512]; static int n_vars;
@@ -45,9 +55,13 @@ static const char *find_var(const char *k)
 /* ---- state ---- */
 static void *core;
 static struct retro_hw_render_callback hw_render;
+#ifdef GLHOST_CGL
+static CGLContextObj cgl_ctx;
+#else
 static EGLDisplay egl_dpy;
 static EGLContext egl_ctx;
 static EGLSurface egl_surface = EGL_NO_SURFACE;
+#endif
 static GLuint fbo, fbo_tex, fbo_depth;
 static unsigned fbo_w = 4096, fbo_h = 4096;
 static unsigned last_w, last_h, frames_presented;
@@ -369,6 +383,28 @@ static int16_t input_state_cb(unsigned port, unsigned dev, unsigned idx, unsigne
 /* ---- EGL desktop GL or GLES3 pbuffer context ---- */
 static int egl_init(void)
 {
+#ifdef GLHOST_CGL
+   CGLPixelFormatAttribute attrs[] = {
+      kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core,
+      kCGLPFAColorSize, (CGLPixelFormatAttribute)24,
+      kCGLPFAAlphaSize, (CGLPixelFormatAttribute)8,
+      (CGLPixelFormatAttribute)0 };
+   CGLPixelFormatObj format;
+   GLint count;
+   CGLError error;
+   if (ctx_gl2 || ctx_rejcore)
+   { fprintf(stderr, "[glhost] CGL host supports core profile only\n"); return 0; }
+   error = CGLChoosePixelFormat(attrs, &format, &count);
+   if (error != kCGLNoError || !count)
+   { fprintf(stderr, "[glhost] CGLChoosePixelFormat: %s\n", CGLErrorString(error)); return 0; }
+   error = CGLCreateContext(format, NULL, &cgl_ctx);
+   CGLDestroyPixelFormat(format);
+   if (error == kCGLNoError) error = CGLSetCurrentContext(cgl_ctx);
+   if (error != kCGLNoError)
+   { fprintf(stderr, "[glhost] CGL context: %s\n", CGLErrorString(error)); return 0; }
+   fprintf(stderr, "[glhost] GL: %s | %s\n", glGetString(GL_RENDERER), glGetString(GL_VERSION));
+   return 1;
+#else
 #ifdef GLHOST_GLES
    static const EGLint cfg_attr[] = {
       EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
@@ -426,6 +462,7 @@ static int egl_init(void)
    fprintf(stderr, "[glhost] GL: %s | %s\n",
            (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
    return 1;
+#endif
 }
 
 static int fbo_init(void)
@@ -612,6 +649,11 @@ static void egl_shutdown(void)
    if (fbo_depth) glDeleteTextures(1, &fbo_depth);
    if (dirty_tex) glDeleteTextures(1, &dirty_tex);
    fbo = fbo_tex = fbo_depth = dirty_pbo = dirty_tex = 0;
+#ifdef GLHOST_CGL
+   CGLSetCurrentContext(NULL);
+   CGLDestroyContext(cgl_ctx);
+   cgl_ctx = NULL;
+#else
    eglMakeCurrent(egl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
    if (egl_surface != EGL_NO_SURFACE) eglDestroySurface(egl_dpy, egl_surface);
    if (egl_ctx != EGL_NO_CONTEXT) eglDestroyContext(egl_dpy, egl_ctx);
@@ -619,6 +661,7 @@ static void egl_shutdown(void)
    egl_surface = EGL_NO_SURFACE;
    egl_ctx = EGL_NO_CONTEXT;
    egl_dpy = EGL_NO_DISPLAY;
+#endif
 }
 
 int main(int argc, char **argv)
@@ -840,6 +883,11 @@ int main(int argc, char **argv)
    }
    fprintf(stderr, "[glhost] done: %d frames run, %u presented, last %ux%u\n",
            frames, frames_presented, last_w, last_h);
+
+   if (getenv("GLHOST_TEST_REPORT"))
+      test_failures += testrom_check_report(main_memory.ptr
+            ? (const unsigned char *)main_memory.ptr + main_memory.offset : NULL,
+            main_memory.len);
 
    ((fn_t)dlsym(core, "retro_unload_game"))();
    if (hw_render.context_destroy) hw_render.context_destroy();

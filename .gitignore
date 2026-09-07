@@ -32,6 +32,10 @@ tools/pgxp_color/transport
 # vkhost harness build output (tools/vkhost)
 tools/vkhost/vkhost
 
+# GL validation harness build output
+tools/glhost/glhost
+tools/glhost/*.dSYM/
+
 # Python bytecode from the VCD authoring script (tools/vcd)
 __pycache__/
 *.pyc

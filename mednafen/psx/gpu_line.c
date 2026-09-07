@@ -147,6 +147,8 @@ static void DrawLine_##SUFFIX(PS_GPU *gpu, line_point *points) \
    if (points[0].x > points[1].x && k) \
       vertex_swap(line_point, points[1], points[0]); \
    gpu->DrawTimeAvail -= k * 2; \
+   if (!rhi_intf_has_software_renderer()) \
+      return; \
    line_points_to_fixed_point_step_g##GOURAUD_LIT(&points[0], &points[1], k, &step); \
    line_point_to_fixed_point_coord_g##GOURAUD_LIT(&points[0], &step, &cur_point); \
    for (i = 0; i <= k; i++)  /* <= is not a typo. */ \
@@ -303,8 +305,7 @@ static void Command_DrawLine_##SUFFIX(PS_GPU *gpu, const uint32_t *cb) \
    if (delta_y >= 512) \
       return; \
    GPU_LINE_RHI_PUSH_HOOK(gpu, points, BM_VAL, MASKEVAL_LIT); \
-   if (rhi_intf_has_software_renderer()) \
-      DrawLine_g##GOURAUD_LIT##_##BM_TAG##_ME##MASKEVAL_LIT(gpu, points); \
+   DrawLine_g##GOURAUD_LIT##_##BM_TAG##_ME##MASKEVAL_LIT(gpu, points); \
 }
 
 /* 40 Command_DrawLine specialisations: 2 polyline * 2 gouraud * 5 blend * 2 maskeval. */

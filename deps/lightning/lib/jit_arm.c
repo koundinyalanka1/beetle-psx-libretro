@@ -232,6 +232,25 @@ jit_get_cpu(void)
     /* armv6t2 todo (software float and thumb2) */
     if (!jit_cpu.vfp && jit_cpu.thumb)
 	jit_cpu.thumb = 0;
+#if defined(__ANDROID__)
+    /*
+     * Emit A32 rather than Thumb-2 on Android.
+     *
+     * /proc/cpuinfo on a 32-bit Android userland running on ARMv8 advertises
+     * both "thumb" and vfp, so the detection above selects Thumb-2, and the
+     * generated code then faults with SIGILL (ILL_ILLOPC) inside the Lightrec
+     * code buffer.  The tombstone shows the interworking failure directly:
+     * lr and ip are odd (Thumb-tagged) while pc is even, so a Thumb entry
+     * point was branched to in ARM state and the Thumb encodings decoded as
+     * A32.  Reproduced on a Sony BRAVIA BF1 (MediaTek mt5896, Android 12,
+     * armeabi-v7a); selecting A32 runs the same workload to completion.
+     *
+     * A32 is this backend's primary path - the field comment upstream calls
+     * Thumb generation a thumb2-only special case - so this costs nothing but
+     * the Thumb code-density advantage.
+     */
+    jit_cpu.thumb = 0;
+#endif
     /* FIXME need test environments for the below. For the moment just
      * be very conservative */
     /* force generation of code assuming jit and function libraries called

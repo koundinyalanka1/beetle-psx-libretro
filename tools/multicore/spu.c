@@ -199,11 +199,15 @@ int main(void)
    SPU_Power();
    spu_samples = 1;
    SPU_Worker_Init();
-   SPU_Worker_TakeStats(NULL, NULL, NULL);
+   SPU_Worker_TakeStats(NULL, NULL, NULL, NULL);
+   cd_sample_count = 0;
    advance(735);
    SPU_Worker_Sync();
-   SPU_Worker_TakeStats(NULL, NULL, &jobs);
-   assert(jobs == 23);
+   SPU_Worker_TakeStats(NULL, NULL, &jobs, NULL);
+   /* Eleven full 64-sample batches; the remaining 31 samples may run
+    * inline if the worker has already drained, or form one final job. */
+   assert(jobs == 11 || jobs == 12);
+   assert(cd_sample_count == 735);
    SPU_Kill();
    assert(!live_locks && !live_conds && !live_threads);
    puts("SPU: matching state/audio/IRQ traces, CDC thread ownership, batching, lifecycle and allocation failures passed");

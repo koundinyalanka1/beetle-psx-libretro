@@ -1,6 +1,6 @@
 LOCAL_PATH := $(call my-dir)
 
-CORE_DIR := $(LOCAL_PATH)/..
+CORE_DIR := $(abspath $(LOCAL_PATH)/..)
 
 DEBUG                    := 0
 NEED_CD                  := 1
@@ -27,12 +27,12 @@ ifneq (,$(findstring 64,$(TARGET_ARCH)))
 endif
 
 ifeq ($(HAVE_HW),1)
-  ifeq ($(IS_64BIT),1)
-    HAVE_OPENGL := 1
-    GLES        := 1
-    GLES3       := 1
-    GL_LIB      := -lGLESv3
-  endif
+  # GLES 3 capability is negotiated with the frontend at runtime; a
+  # 32-bit process can use it too (including Android TVs).
+  HAVE_OPENGL := 1
+  GLES        := 1
+  GLES3       := 1
+  GL_LIB      := -lGLESv3
 
   ifneq ($(TARGET_ARCH_ABI),armeabi)
     HAVE_VULKAN := 1
