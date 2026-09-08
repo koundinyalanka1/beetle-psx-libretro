@@ -212,6 +212,15 @@ endif
    SOURCES_C += $(CORE_DIR)/libretro.c \
                 $(CORE_DIR)/libretro_game_database.c
 
+   # worker_affinity.c needs cpu_set_t / CPU_* / sched_{get,set}affinity, which
+   # bionic and glibc both gate behind __USE_GNU (i.e. _GNU_SOURCE). The
+   # `#define _GNU_SOURCE` at the top of that file cannot work here: the
+   # HAVE_LIGHTREC branch above force-includes include/debug.h into every TU
+   # (-include), and that header pulls <stdio.h>, so <sys/cdefs.h> has already
+   # computed __USE_GNU before the .c file's first line is reached. It has to be
+   # on the command line.
+   FLAGS += -D_GNU_SOURCE
+
    SOURCES_C +=   $(MEDNAFEN_DIR)/mempatcher.c \
                   $(MEDNAFEN_DIR)/rthreads_pool.c \
                   $(MEDNAFEN_DIR)/rthreads_worker.c \
