@@ -29,6 +29,10 @@
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
+#include <limits.h>
+#include <locale.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <dlfcn.h>
 #include <vulkan/vulkan.h>
 #include "libretro.h"
@@ -64,6 +68,193 @@ static bool hash_frames;
 #define FNV64_PRIME UINT64_C(1099511628211)
 static uint64_t audio_hash = FNV64_OFFSET;
 static size_t audio_frames;
+static bool benchmark;
+static uint64_t total_audio_frames, measured_audio_frames;
+static bool measuring;
+static FILE *audio_file;
+static uint64_t wav_frames;
+static uint32_t audio_rate = 44100;
+static double reported_fps, reported_sample_rate;
+static uint64_t timing_changes;
+#define MAX_TIMING_SAMPLES 1000000u
+
+struct timing_stats
+{
+   uint64_t *values;
+   uint64_t total, min, max;
+   size_t count, capacity;
+};
+
+static void fatal(const char *message)
+{
+   fprintf(stderr, "[vkhost] %s\n", message);
+   exit(6);
+}
+
+static bool decimal_u32(const char *text, uint32_t limit, uint32_t *result)
+{
+   uint32_t value = 0;
+   const unsigned char *p = (const unsigned char *)text;
+   if (!p || !*p) return false;
+   for (; *p; p++)
+   {
+      uint32_t digit;
+      if (*p < '0' || *p > '9') return false;
+      digit = *p - '0';
+      if (digit > limit || value > (limit - digit) / 10) return false;
+      value = value * 10 + digit;
+   }
+   *result = value;
+   return true;
+}
+
+static uint64_t monotonic_ns(void)
+{
+   struct timespec now;
+   if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
+         (uint64_t)now.tv_sec > (UINT64_MAX - 999999999u) / 1000000000u ||
+         now.tv_nsec < 0 || now.tv_nsec >= 1000000000)
+      fatal("monotonic clock failed");
+   return (uint64_t)now.tv_sec * 1000000000u + (uint64_t)now.tv_nsec;
+}
+
+static uint64_t elapsed_ns(uint64_t begin, uint64_t end)
+{
+   if (end < begin) fatal("monotonic clock moved backwards");
+   return end - begin;
+}
+
+static void timing_init(struct timing_stats *stats, size_t capacity)
+{
+   if (!capacity || capacity > MAX_TIMING_SAMPLES ||
+         capacity > SIZE_MAX / sizeof(*stats->values))
+      fatal("benchmark requires 1..1000000 measured frames");
+   memset(stats, 0, sizeof(*stats));
+   stats->values = calloc(capacity, sizeof(*stats->values));
+   if (!stats->values) fatal("cannot allocate benchmark timings");
+   stats->capacity = capacity;
+   stats->min = UINT64_MAX;
+}
+
+static void timing_add(struct timing_stats *stats, uint64_t ns)
+{
+   if (stats->count >= stats->capacity || UINT64_MAX - stats->total < ns)
+      fatal("benchmark timing overflow");
+   stats->values[stats->count++] = ns;
+   stats->total += ns;
+   if (ns < stats->min) stats->min = ns;
+   if (ns > stats->max) stats->max = ns;
+}
+
+static int timing_compare(const void *a, const void *b)
+{
+   uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+   return (x > y) - (x < y);
+}
+
+static void timing_print(struct timing_stats *stats)
+{
+   size_t n = stats->count;
+   if (!n) fatal("benchmark has no timing samples");
+   qsort(stats->values, n, sizeof(*stats->values), timing_compare);
+   printf("{\"sample_count\":%zu,\"total\":%" PRIu64
+         ",\"mean\":%.3f,\"min\":%" PRIu64 ",\"max\":%" PRIu64
+         ",\"p50\":%" PRIu64 ",\"p95\":%" PRIu64 ",\"p99\":%" PRIu64 "}",
+         n, stats->total, (double)stats->total / n, stats->min, stats->max,
+         stats->values[(n * 50 + 99) / 100 - 1],
+         stats->values[(n * 95 + 99) / 100 - 1],
+         stats->values[(n * 99 + 99) / 100 - 1]);
+}
+
+static void put_le16(uint8_t *p, uint16_t value)
+{
+   p[0] = (uint8_t)value;
+   p[1] = (uint8_t)(value >> 8);
+}
+
+static void put_le32(uint8_t *p, uint32_t value)
+{
+   put_le16(p, (uint16_t)value);
+   put_le16(p + 2, (uint16_t)(value >> 16));
+}
+
+static void wav_header(void)
+{
+   uint8_t header[44] = {0};
+   uint32_t bytes;
+   if (wav_frames > (UINT32_MAX - 36u) / 4u)
+      fatal("WAV exceeds RIFF size limit");
+   bytes = (uint32_t)(wav_frames * 4u);
+   memcpy(header, "RIFF", 4);
+   put_le32(header + 4, bytes + 36u);
+   memcpy(header + 8, "WAVEfmt ", 8);
+   put_le32(header + 16, 16);
+   put_le16(header + 20, 1);
+   put_le16(header + 22, 2);
+   put_le32(header + 24, audio_rate);
+   put_le32(header + 28, audio_rate * 4u);
+   put_le16(header + 32, 4);
+   put_le16(header + 34, 16);
+   memcpy(header + 36, "data", 4);
+   put_le32(header + 40, bytes);
+   if (fseek(audio_file, 0, SEEK_SET) != 0 ||
+         fwrite(header, 1, sizeof(header), audio_file) != sizeof(header))
+      fatal("cannot write WAV header");
+}
+
+static void wav_set_rate(double rate)
+{
+   uint32_t value;
+   if (!(rate >= 1.0 && rate <= UINT32_MAX / 4u))
+      fatal("WAV sample rate is invalid");
+   value = (uint32_t)rate;
+   if ((double)value != rate) fatal("WAV requires an integer sample rate");
+   if (wav_frames && value != audio_rate)
+      fatal("WAV sample rate changed after capture started");
+   audio_rate = value;
+}
+
+static void note_timing(double fps, double sample_rate)
+{
+   if (benchmark && (!(fps > 0.0 && fps <= 1000.0) ||
+         !(sample_rate > 0.0 && sample_rate <= 1000000000.0)))
+      fatal("invalid core AV timing");
+   if (reported_fps > 0.0 &&
+         (fps != reported_fps || sample_rate != reported_sample_rate))
+      timing_changes++;
+   reported_fps = fps;
+   reported_sample_rate = sample_rate;
+   if (audio_file)
+      wav_set_rate(sample_rate);
+}
+
+static void wav_write(const int16_t *data, size_t frames)
+{
+   uint8_t buffer[4096];
+   size_t remaining = frames;
+   if (wav_frames > (UINT32_MAX - 36u) / 4u ||
+         frames > (UINT32_MAX - 36u) / 4u - wav_frames)
+      fatal("WAV exceeds RIFF size limit");
+   while (remaining)
+   {
+      size_t i, chunk = remaining > sizeof(buffer) / 4 ? sizeof(buffer) / 4 : remaining;
+      for (i = 0; i < chunk * 2; i++) put_le16(buffer + i * 2, (uint16_t)data[i]);
+      if (fwrite(buffer, 4, chunk, audio_file) != chunk)
+         fatal("cannot write WAV samples");
+      data += chunk * 2;
+      remaining -= chunk;
+   }
+   wav_frames += frames;
+}
+
+static void wav_close(void)
+{
+   if (!audio_file) return;
+   wav_header();
+   if (fflush(audio_file) != 0) fatal("cannot flush WAV output");
+   if (fclose(audio_file) != 0) fatal("cannot close WAV output");
+   audio_file = NULL;
+}
 
 static uint64_t hash_bytes(uint64_t hash, const void *data, size_t size)
 {
@@ -124,27 +315,156 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(
 static void log_cb(enum retro_log_level level, const char *fmt, ...)
 {
    va_list ap; (void)level;
+   if (benchmark) return;
    va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
 }
 
 /* ---- hw render interface the core consumes ---- */
+#define MAX_FRAME_SEMAPHORES 64u
+#define MAX_FRAME_COMMAND_BUFFERS 4096u
+static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static VkSemaphore frame_semaphores[MAX_FRAME_SEMAPHORES], signal_semaphore;
+static VkCommandBuffer frame_commands[MAX_FRAME_COMMAND_BUFFERS + 1];
+static uint32_t frame_semaphore_count, frame_command_count, image_queue_family;
+static bool image_pending;
+static VkImage pending_image;
+static VkImageLayout pending_layout;
+static VkImageSubresourceRange pending_range;
+static VkCommandPool ownership_pool;
+static VkCommandBuffer ownership_command;
+
+static void vk_check(VkResult result, const char *operation)
+{
+   if (result != VK_SUCCESS)
+   {
+      fprintf(stderr, "[vkhost] %s failed: VkResult %d\n", operation, (int)result);
+      exit(6);
+   }
+}
+
+static void vk_lock_queue(void *handle)
+{
+   (void)handle;
+   if (benchmark && pthread_mutex_lock(&queue_mutex) != 0) fatal("queue lock failed");
+}
+
+static void vk_unlock_queue(void *handle)
+{
+   (void)handle;
+   if (benchmark && pthread_mutex_unlock(&queue_mutex) != 0) fatal("queue unlock failed");
+}
+
+static void vk_wait_sync_index(void *handle)
+{
+   (void)handle;
+   if (!benchmark || !vkctx.device) return;
+   vk_lock_queue(NULL);
+   vk_check(vkQueueWaitIdle(vkctx.queue), "vkQueueWaitIdle");
+   vk_unlock_queue(NULL);
+}
+
 static void vk_set_image(void *handle, const struct retro_vulkan_image *image,
       uint32_t num_semaphores, const VkSemaphore *semaphores, uint32_t src_queue_family)
-{ (void)handle; (void)num_semaphores; (void)semaphores; (void)src_queue_family;
+{
+   (void)handle;
+   if (benchmark)
+   {
+      if (!image || num_semaphores > MAX_FRAME_SEMAPHORES ||
+            (num_semaphores && !semaphores) || image_pending)
+         fatal("invalid or overlapping Vulkan image handoff");
+      pending_image = image->create_info.image;
+      pending_layout = image->image_layout;
+      pending_range = image->create_info.subresourceRange;
+      image_queue_family = src_queue_family;
+      frame_semaphore_count = num_semaphores;
+      if (num_semaphores)
+         memcpy(frame_semaphores, semaphores, num_semaphores * sizeof(*semaphores));
+      image_pending = true;
+      return;
+   }
    if (!last_image || last_image->create_info.image != image->create_info.image ||
        last_image->create_info.format != image->create_info.format)
       fprintf(stderr, "[vkhost] set_image img=%p fmt=%d layout=%d extent-hint=%ux%u\n",
               (void*)image->create_info.image, (int)image->create_info.format,
               (int)image->image_layout, last_w, last_h);
-   last_image = image; }
+   last_image = image;
+}
 static uint32_t vk_get_sync_index(void *handle) { (void)handle; return 0; }
 static uint32_t vk_get_sync_index_mask(void *handle) { (void)handle; return 1; }
-static void vk_wait_sync_index(void *handle) { (void)handle; }
 static void vk_set_command_buffers(void *handle, uint32_t num, const VkCommandBuffer *cmd)
-{ (void)handle; (void)num; (void)cmd; }
-static void vk_lock_queue(void *handle) { (void)handle; }
-static void vk_unlock_queue(void *handle) { (void)handle; }
-static void vk_set_signal_semaphore(void *handle, VkSemaphore sem) { (void)handle; (void)sem; }
+{
+   (void)handle;
+   if (!benchmark) return;
+   if (num > MAX_FRAME_COMMAND_BUFFERS - frame_command_count || (num && !cmd))
+      fatal("invalid or oversized Vulkan command buffer handoff");
+   if (num) memcpy(frame_commands + frame_command_count, cmd, num * sizeof(*cmd));
+   frame_command_count += num;
+}
+static void vk_set_signal_semaphore(void *handle, VkSemaphore sem)
+{
+   (void)handle;
+   if (benchmark) signal_semaphore = sem;
+}
+
+static void benchmark_video(const void *data)
+{
+   VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+   VkPipelineStageFlags stages[MAX_FRAME_SEMAPHORES];
+   uint32_t i;
+   bool use_image = data == RETRO_HW_FRAME_BUFFER_VALID && image_pending;
+   if (!vkctx.device) return;
+   submit.waitSemaphoreCount = use_image && !frame_command_count ? frame_semaphore_count : 0;
+   submit.pWaitSemaphores = frame_semaphores;
+   for (i = 0; i < submit.waitSemaphoreCount; i++) stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+   submit.pWaitDstStageMask = stages;
+   if (submit.waitSemaphoreCount && image_queue_family != VK_QUEUE_FAMILY_IGNORED &&
+         image_queue_family != vkctx.queue_family_index)
+   {
+      VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+      VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+      vk_wait_sync_index(NULL);
+      if (!ownership_pool)
+      {
+         VkCommandPoolCreateInfo pool = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+         VkCommandBufferAllocateInfo alloc = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+         pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+         pool.queueFamilyIndex = vkctx.queue_family_index;
+         vk_check(vkCreateCommandPool(vkctx.device, &pool, NULL, &ownership_pool), "vkCreateCommandPool");
+         alloc.commandPool = ownership_pool;
+         alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+         alloc.commandBufferCount = 1;
+         vk_check(vkAllocateCommandBuffers(vkctx.device, &alloc, &ownership_command), "vkAllocateCommandBuffers");
+      }
+      vk_check(vkResetCommandBuffer(ownership_command, 0), "vkResetCommandBuffer");
+      vk_check(vkBeginCommandBuffer(ownership_command, &begin), "vkBeginCommandBuffer");
+      barrier.oldLayout = barrier.newLayout = pending_layout;
+      barrier.srcQueueFamilyIndex = image_queue_family;
+      barrier.dstQueueFamilyIndex = vkctx.queue_family_index;
+      barrier.image = pending_image;
+      barrier.subresourceRange = pending_range;
+      vkCmdPipelineBarrier(ownership_command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+      barrier.srcQueueFamilyIndex = vkctx.queue_family_index;
+      barrier.dstQueueFamilyIndex = image_queue_family;
+      vkCmdPipelineBarrier(ownership_command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+      vk_check(vkEndCommandBuffer(ownership_command), "vkEndCommandBuffer");
+      frame_commands[frame_command_count++] = ownership_command;
+   }
+   submit.commandBufferCount = frame_command_count;
+   submit.pCommandBuffers = frame_commands;
+   submit.signalSemaphoreCount = signal_semaphore != VK_NULL_HANDLE ? 1 : 0;
+   submit.pSignalSemaphores = &signal_semaphore;
+   if (submit.waitSemaphoreCount || submit.commandBufferCount || submit.signalSemaphoreCount)
+   {
+      vk_lock_queue(NULL);
+      vk_check(vkQueueSubmit(vkctx.queue, 1, &submit, VK_NULL_HANDLE), "vkQueueSubmit");
+      vk_unlock_queue(NULL);
+   }
+   frame_command_count = frame_semaphore_count = 0;
+   signal_semaphore = VK_NULL_HANDLE;
+   image_pending = false;
+}
 
 /* ---- environment ---- */
 static bool env_cb(unsigned cmd, void *data)
@@ -209,6 +529,12 @@ static bool env_cb(unsigned cmd, void *data)
          return true;
       }
       case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO:
+         if (audio_file || benchmark)
+         {
+            const struct retro_system_av_info *av = data;
+            note_timing(av->timing.fps, av->timing.sample_rate);
+         }
+         return true;
       case RETRO_ENVIRONMENT_SET_GEOMETRY:
          return true;
       case RETRO_ENVIRONMENT_GET_VARIABLE:
@@ -247,8 +573,10 @@ static bool env_cb(unsigned cmd, void *data)
 }
 
 static void video_cb(const void *data, unsigned width, unsigned height, size_t pitch)
-{ (void)pitch; if (data == RETRO_HW_FRAME_BUFFER_VALID) { frame_valid++;
-   if (last_w != width || last_h != height)
+{ (void)pitch;
+   if (benchmark) benchmark_video(data);
+   if (data == RETRO_HW_FRAME_BUFFER_VALID) { frame_valid++;
+   if (!benchmark && (last_w != width || last_h != height))
       fprintf(stderr, "[vkhost] geometry %ux%u\n", width, height);
    last_w = width; last_h = height; } }
 static void input_poll_cb(void) {}
@@ -277,7 +605,14 @@ static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, un
 }
 static size_t audio_batch_cb(const int16_t *data, size_t frames)
 {
-   if (hash_frames)
+   if (frames > SIZE_MAX / (2 * sizeof(*data)) || (frames && !data) ||
+         frames > UINT64_MAX - total_audio_frames ||
+         (measuring && frames > UINT64_MAX - measured_audio_frames))
+      fatal("audio sample count overflow or invalid buffer");
+   total_audio_frames += frames;
+   if (measuring) measured_audio_frames += frames;
+   if (audio_file) wav_write(data, frames);
+   if (hash_frames && !benchmark)
    {
       audio_hash = hash_bytes(audio_hash, data, frames * 2 * sizeof(*data));
       audio_frames += frames;
@@ -312,7 +647,7 @@ static bool create_instance(void)
    ci.pApplicationInfo = &app;
    /* VKHOST_NO_VALIDATION=1 drops the layer: needed under ThreadSanitizer,
     * where the layer's own rwlock teardown races and aborts the run. */
-   if (!getenv("VKHOST_NO_VALIDATION") &&
+   if (!benchmark && !getenv("VKHOST_NO_VALIDATION") &&
          vkEnumerateInstanceLayerProperties(&count, NULL) == VK_SUCCESS && count)
    {
       VkLayerProperties *props = calloc(count, sizeof(*props));
@@ -326,7 +661,7 @@ static bool create_instance(void)
    ci.enabledLayerCount = validation_active ? 1 : 0;
    ci.ppEnabledLayerNames = layers;
    count = 0;
-   if (vkEnumerateInstanceExtensionProperties(NULL, &count, NULL) == VK_SUCCESS && count)
+   if (!benchmark && vkEnumerateInstanceExtensionProperties(NULL, &count, NULL) == VK_SUCCESS && count)
    {
       VkExtensionProperties *props = calloc(count, sizeof(*props));
       if (props && vkEnumerateInstanceExtensionProperties(NULL, &count, props) == VK_SUCCESS)
@@ -545,24 +880,74 @@ int main(int argc, char **argv)
    int frames = 120;
    const char *outdir = "/tmp/vkhost_out";
    char cmdbuf[1024];
+   uint32_t warmup = 0;
+   uint64_t measured_start = 0, measured_end = 0;
+   int summary_fd = -1;
+   struct timing_stats core_times = {0}, frame_times = {0};
+   const char *audio_path = getenv("VKHOST_AUDIO_PATH");
+   const char *benchmark_env = getenv("VKHOST_BENCHMARK");
 
    if (argc < 3)
-   { fprintf(stderr, "usage: %s core content [state] [frames] [outdir]\n", argv[0]); return 2; }
+   {
+      fprintf(stderr, "usage: %s core content [state] [frames] [outdir]\n"
+            "VKHOST_BENCHMARK=1: no validation, hashing, readback, capture or output directories; JSON on stdout.\n"
+            "VKHOST_WARMUP_FRAMES=N: decimal warmup within total frames (default 0); 1..1000000 measured frames.\n"
+            "Benchmark frame times include single-index Vulkan queue completion, not presentation.\n"
+            "VKHOST_AUDIO_PATH=path: PCM16 stereo WAV at the core AV sample rate (not in benchmark mode).\n", argv[0]);
+      return 2;
+   }
+   if (benchmark_env && strcmp(benchmark_env, "0") && strcmp(benchmark_env, "1"))
+      fatal("VKHOST_BENCHMARK must be 0 or 1");
+   benchmark = benchmark_env && !strcmp(benchmark_env, "1");
    core_path = argv[1]; content = argv[2];
    if (argc > 3 && strcmp(argv[3], "-")) state_path = argv[3];
-   if (argc > 4) frames = atoi(argv[4]);
+   if (benchmark)
+   {
+      uint32_t count = 120;
+      const char *warmup_env = getenv("VKHOST_WARMUP_FRAMES");
+      const char *incompatible[] = { "VKHOST_AUDIO_PATH", "VKHOST_SAVE_STATE",
+         "VKHOST_ROUNDTRIP_FRAME", "VKHOST_RESET_FRAME", "VKHOST_RECREATE_FRAME",
+         "VKHOST_BENCH", "VKHOST_BENCH_SKIP", "VKHOST_CORE_DUMP" };
+      size_t i;
+      if (argc > 4 && (!decimal_u32(argv[4], INT_MAX, &count) || !count))
+         fatal("benchmark frames must be a positive decimal integer <= INT_MAX");
+      frames = (int)count;
+      if (warmup_env && !decimal_u32(warmup_env, INT_MAX, &warmup))
+         fatal("VKHOST_WARMUP_FRAMES must be a nonnegative decimal integer <= INT_MAX");
+      if (warmup >= count) fatal("warmup must be smaller than total frames");
+      for (i = 0; i < sizeof(incompatible) / sizeof(incompatible[0]); i++)
+         if (getenv(incompatible[i]))
+         {
+            fprintf(stderr, "[vkhost] %s is incompatible with VKHOST_BENCHMARK=1\n", incompatible[i]);
+            return 2;
+         }
+      timing_init(&core_times, count - warmup);
+      timing_init(&frame_times, count - warmup);
+      if (setenv("VK_LOADER_LAYERS_DISABLE", "*", 1) != 0 ||
+            unsetenv("VK_INSTANCE_LAYERS") != 0 || unsetenv("VK_LOADER_LAYERS_ENABLE") != 0)
+         fatal("cannot disable Vulkan loader layers");
+      fprintf(stderr, "[vkhost] benchmark: validation, hashes, readback, dumps and output directories disabled; warmup=%u; sync=queue_idle_per_frame\n", warmup);
+   }
+   else
+   {
+      if (getenv("VKHOST_WARMUP_FRAMES")) fatal("VKHOST_WARMUP_FRAMES requires VKHOST_BENCHMARK=1");
+      if (argc > 4) frames = atoi(argv[4]);
+   }
    if (argc > 5) outdir = argv[5];
-   snprintf(cmdbuf, sizeof(cmdbuf), "mkdir -p %s %s %s", outdir, sysdir, savedir);
-   system(cmdbuf);
+   if (!benchmark)
+   {
+      snprintf(cmdbuf, sizeof(cmdbuf), "mkdir -p %s %s %s", outdir, sysdir, savedir);
+      system(cmdbuf);
+   }
 
    /* defaults, overridable via VKHOST_VARS */
    /* Must be a value the option declares; an undeclared value leaves
     * the internal upscale on the CPU side, a state no frontend
     * produces (same defect the GL harness had). */
    add_var("beetle_psx_hw_renderer", "hardware_vk");
-   add_var("beetle_psx_hw_pgxp_mode", "memory only");
-   add_var("beetle_psx_hw_color_format", "30bit_hdr");
-   add_var("beetle_psx_hw_internal_resolution", "1x");
+   add_var("beetle_psx_hw_pgxp_mode", benchmark ? "disabled" : "memory only");
+   add_var("beetle_psx_hw_color_format", benchmark ? "24bit" : "30bit_hdr");
+   add_var("beetle_psx_hw_internal_resolution", benchmark ? "1x(native)" : "1x");
    add_var("beetle_psx_hw_filter", "nearest");
    {
       const char *e = getenv("VKHOST_VARS");
@@ -584,6 +969,12 @@ int main(int argc, char **argv)
       }
    }
 
+   if (benchmark)
+   {
+      summary_fd = dup(STDOUT_FILENO);
+      if (summary_fd < 0 || fflush(stdout) != 0 || dup2(STDERR_FILENO, STDOUT_FILENO) < 0)
+         fatal("cannot reserve stdout for benchmark JSON");
+   }
    core = dlopen(core_path, RTLD_NOW | RTLD_LOCAL);
    if (!core) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 2; }
 
@@ -597,6 +988,14 @@ int main(int argc, char **argv)
    { void (*f)(retro_audio_sample_t) = dlsym(core, "retro_set_audio_sample"); f(audio_cb); }
    { void (*f)(retro_audio_sample_batch_t) = dlsym(core, "retro_set_audio_sample_batch"); f(audio_batch_cb); }
 
+   if (audio_path)
+   {
+      if (!*audio_path) fatal("VKHOST_AUDIO_PATH must not be empty");
+      audio_file = fopen(audio_path, "wb");
+      if (!audio_file) fatal("cannot open WAV output");
+      wav_header();
+   }
+
    {
       struct retro_game_info info;
       bool (*retro_load_game_fn)(const struct retro_game_info *) = dlsym(core, "retro_load_game");
@@ -604,6 +1003,16 @@ int main(int argc, char **argv)
       info.path = content;
       if (!retro_load_game_fn(&info))
       { fprintf(stderr, "[vkhost] retro_load_game failed\n"); return 3; }
+   }
+
+   if (audio_file || benchmark)
+   {
+      struct retro_system_av_info av;
+      void (*get_av)(struct retro_system_av_info *) = dlsym(core, "retro_get_system_av_info");
+      if (!get_av) fatal("core lacks retro_get_system_av_info");
+      memset(&av, 0, sizeof(av));
+      get_av(&av);
+      note_timing(av.timing.fps, av.timing.sample_rate);
    }
 
    if (!negotiation && !hw_render.context_reset)
@@ -687,7 +1096,7 @@ run_frames_sw:
        * at any real frame rate), and the first VKHOST_BENCH_SKIP frames
        * run untimed so pipeline creation and first-use shader compilation
        * stay out of the measurement. */
-      int bench      = getenv("VKHOST_BENCH") != NULL;
+      int bench      = !benchmark && getenv("VKHOST_BENCH") != NULL;
       int bench_skip = 0;
       struct timespec t0, t1;
       void (*retro_run_fn)(void) = dlsym(core, "retro_run");
@@ -700,16 +1109,40 @@ run_frames_sw:
             bench_skip = frames / 4;
       }
 
+      if (benchmark) vk_wait_sync_index(NULL);
       for (i = 0; i < frames; i++)
       {
+         uint64_t frame_begin = 0, core_begin = 0;
          cur_frame = i;
+         if (benchmark)
+         {
+            measuring = (uint32_t)i >= warmup;
+            frame_begin = monotonic_ns();
+            if ((uint32_t)i == warmup) measured_start = frame_begin;
+         }
          if (bench && i == bench_skip)
          {
             if (vkctx.device)
                vkDeviceWaitIdle(vkctx.device);
             clock_gettime(CLOCK_MONOTONIC, &t0);
          }
+         if (benchmark) core_begin = monotonic_ns();
          retro_run_fn();
+         if (benchmark)
+         {
+            uint64_t core_end = monotonic_ns(), frame_end;
+            if (image_pending || frame_command_count || signal_semaphore)
+               fatal("core left a Vulkan handoff without video_refresh");
+            vk_wait_sync_index(NULL);
+            frame_end = monotonic_ns();
+            if (measuring)
+            {
+               timing_add(&core_times, elapsed_ns(core_begin, core_end));
+               timing_add(&frame_times, elapsed_ns(frame_begin, frame_end));
+               measured_end = frame_end;
+            }
+            continue;
+         }
          {
             /* VKHOST_SAVE_STATE=path:frame - checkpoint mid-run so long
              * cold-boot treks can be chained across invocations. */
@@ -766,9 +1199,42 @@ run_frames_sw:
       }
    }
 
+   measuring = false;
+   if (benchmark && ownership_pool)
+   {
+      vk_wait_sync_index(NULL);
+      vkDestroyCommandPool(vkctx.device, ownership_pool, NULL);
+      ownership_pool = VK_NULL_HANDLE;
+   }
    fprintf(stderr, "[vkhost] done: %d frames run, %u valid, %d validation errors, %d warnings\n",
            frames, frame_valid, validation_errors, validation_warnings);
    { void (*f)(void) = dlsym(core, "retro_unload_game"); if (f) f(); }
    { void (*f)(void) = dlsym(core, "retro_deinit"); if (f) f(); }
+   wav_close();
+   if (benchmark)
+   {
+      if (fflush(stdout) != 0 || dup2(summary_fd, STDOUT_FILENO) < 0 || close(summary_fd) != 0)
+         fatal("cannot restore benchmark JSON output");
+      if (!setlocale(LC_NUMERIC, "C")) fatal("cannot set JSON numeric locale");
+      printf("{\"benchmark\":true,\"frames\":%d,\"warmup_frames\":%u,\"measured_frames\":%zu,"
+            "\"sample_count\":%zu,\"valid_video_frames\":%u,\"audio_frames_total\":%" PRIu64
+            ",\"audio_frames_measured\":%" PRIu64 ",\"audio_channels\":2,"
+            "\"reported_fps\":%.9f,\"reported_sample_rate\":%.9f,\"timing_changes\":%" PRIu64 ","
+            "\"validation\":false,\"readback\":false,\"capture\":false,"
+            "\"sync\":\"%s\",\"percentiles\":\"nearest_rank\","
+            "\"total_core_wall_ns\":%" PRIu64 ",\"measured_wall_ns\":%" PRIu64 ",\"core_time_ns\":",
+            frames, warmup, core_times.count, core_times.count, frame_valid,
+            total_audio_frames, measured_audio_frames,
+            reported_fps, reported_sample_rate, timing_changes,
+            vkctx.device ? "queue_idle_per_frame" : "software",
+            core_times.total, elapsed_ns(measured_start, measured_end));
+      timing_print(&core_times);
+      printf(",\"frame_time_ns\":");
+      timing_print(&frame_times);
+      printf("}\n");
+      if (fflush(stdout) != 0 || ferror(stdout)) fatal("cannot write benchmark JSON");
+      free(core_times.values);
+      free(frame_times.values);
+   }
    return validation_errors ? 5 : 0;
 }

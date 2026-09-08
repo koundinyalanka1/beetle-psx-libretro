@@ -11,6 +11,7 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -149,6 +150,28 @@ __api struct lightrec_state *lightrec_init(char *argv0,
 					   const struct lightrec_ops *ops);
 
 __api void lightrec_destroy(struct lightrec_state *state);
+
+struct lightrec_profile {
+	u64 execute_calls;
+	u64 interpreter_calls;
+	u64 first_pass_blocks;
+	u64 interpreted_blocks;
+	u64 rw_calls;
+	u64 invalidate_calls;
+	u64 invalidate_all_calls;
+	u64 codecache_reclaims;
+	u64 compile_requests;
+	u64 compile_completions;
+	u64 compile_failures;
+	u64 compile_time_us;
+	u64 queue_depth;
+	u64 queue_max;
+	u64 compiler_workers;
+};
+
+__api void lightrec_set_profiling(struct lightrec_state *state, bool enabled);
+__api void lightrec_get_profile(struct lightrec_state *state,
+			       struct lightrec_profile *out, bool reset);
 
 __api u32 lightrec_execute(struct lightrec_state *state,
 			   u32 pc, u32 target_cycle);

@@ -70,6 +70,45 @@ extern bool psx_gte_overclock;
 /* One CPU_Run loop iteration = one event quantum.  Counted here (both engines)
  * and reported by retro_run's phase log; see the accounting note in libretro.c. */
 extern uint64_t psx_cpu_quanta;
+static bool cpu_profile_enabled;
+static cpu_profile_t cpu_profile;
+
+void CPU_SetProfiling(bool enabled)
+{
+   if (enabled == cpu_profile_enabled)
+      return;
+   cpu_profile_enabled = enabled;
+   memset(&cpu_profile, 0, sizeof(cpu_profile));
+#ifdef HAVE_LIGHTREC
+   if (lightrec_state)
+   {
+      struct lightrec_profile discarded;
+      lightrec_set_profiling(lightrec_state, enabled);
+      lightrec_get_profile(lightrec_state, &discarded, true);
+   }
+#endif
+}
+
+void CPU_GetProfile(cpu_profile_t *out, bool reset)
+{
+   if (out)
+      *out = cpu_profile;
+   if (reset)
+      memset(&cpu_profile, 0, sizeof(cpu_profile));
+}
+
+#ifdef HAVE_LIGHTREC
+bool CPU_GetLightrecProfile(struct lightrec_profile *out, bool reset)
+{
+   if (!out)
+      return false;
+   memset(out, 0, sizeof(*out));
+   if (!lightrec_state)
+      return false;
+   lightrec_get_profile(lightrec_state, out, reset);
+   return true;
+}
+#endif
 
 /* CP0 named-register indices.  Used inside the per-instruction switch
  * in lightrec's MTC0/CTC0 path; kept TU-local since nothing outside
@@ -2931,6 +2970,8 @@ int32_t CPU_Run(PS_CPU *self, int32_t timestamp_in)
    if (psx_dynarec != DYNAREC_DISABLED && lightrec_state)
       return lightrec_plugin_execute(self, timestamp_in);
 #endif
+   if (cpu_profile_enabled)
+      cpu_profile.interpreter_frames++;
    return CPU_RunReal(self, timestamp_in);
 }
 
@@ -3712,6 +3753,7 @@ static int lightrec_plugin_init(PS_CPU *self)
                                   (psx_dynarec_op_cycles == 1) ? 1 : 0);
 
    GTE_SwitchRegisters(true,lightrec_regs->cp2d);
+   lightrec_set_profiling(lightrec_state, cpu_profile_enabled);
 
    return 0;
 }
@@ -3756,6 +3798,7 @@ static int32_t lightrec_plugin_execute(PS_CPU *self, int32_t timestamp)
 
    do
    {
+      int32_t profile_start = timestamp;
       psx_cpu_quanta++;
 #ifdef LIGHTREC_DEBUG
       uint32_t oldpc = PC;
@@ -3770,6 +3813,20 @@ static int32_t lightrec_plugin_execute(PS_CPU *self, int32_t timestamp)
       timestamp = lightrec_current_cycle_count(lightrec_state);
 
       flags = lightrec_exit_flags(lightrec_state);
+      if (cpu_profile_enabled)
+      {
+         unsigned bit;
+         cpu_profile.jit_quanta++;
+         if (timestamp > profile_start)
+            cpu_profile.guest_cycles += (uint32_t)(timestamp - profile_start);
+         else
+            cpu_profile.zero_progress++;
+         if (!flags)
+            cpu_profile.exits[0]++;
+         for (bit = 0; bit < 8; bit++)
+            if (flags & (1u << bit))
+               cpu_profile.exits[bit + 1]++;
+      }
 
       /* An allocation failure will not cure itself, so retire immediately. */
       if (flags & LIGHTREC_EXIT_NOMEM)

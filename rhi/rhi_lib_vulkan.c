@@ -8,6 +8,8 @@
  * directly below the libretro plumbing's preamble. */
 
 #include "rhi_lib_vulkan.h"
+#include "beetle_psx_globals.h"
+#include <features/features_cpu.h>
 
 #include "rhi_intf.h" /* FPS and audio sample rate macros */
 #include "rhi_defer.h"
@@ -14323,9 +14325,17 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
       }
 
 
-      res = vkCreateComputePipelines(device_get_device(self->device),
-            device_get_pipeline_cache(self->device), 1, &info, NULL,
-            &compute_pipeline);
+      {
+         retro_time_t t0 = psx_time_events ? cpu_features_get_time_usec() : 0;
+         res = vkCreateComputePipelines(device_get_device(self->device),
+               device_get_pipeline_cache(self->device), 1, &info, NULL,
+               &compute_pipeline);
+         if (psx_time_events)
+         {
+            psx_renderer_profile.pipeline_us += cpu_features_get_time_usec() - t0;
+            psx_renderer_profile.pipeline_creates++;
+         }
+      }
       if (res != VK_SUCCESS)
          LOGE("Failed to create compute pipeline!\n");
 
@@ -14500,8 +14510,16 @@ static void fixup_src_stage(VkPipelineStageFlags *src_stages, bool fixup)
       pipe.stageCount = num_stages;
 
 
-      res = vkCreateGraphicsPipelines(device_get_device(self->device),
-            device_get_pipeline_cache(self->device), 1, &pipe, NULL, &pipeline);
+      {
+         retro_time_t t0 = psx_time_events ? cpu_features_get_time_usec() : 0;
+         res = vkCreateGraphicsPipelines(device_get_device(self->device),
+               device_get_pipeline_cache(self->device), 1, &pipe, NULL, &pipeline);
+         if (psx_time_events)
+         {
+            psx_renderer_profile.pipeline_us += cpu_features_get_time_usec() - t0;
+            psx_renderer_profile.pipeline_creates++;
+         }
+      }
       if (res != VK_SUCCESS)
          LOGE("Failed to create graphics pipeline!\n");
 
@@ -20194,10 +20212,20 @@ void rhi_vulkan_prepare_frame(void)
    }
 
    device_flush_frame_nolock(device);
-   vulkan->wait_sync_index(vulkan->handle);
+   {
+      retro_time_t t0 = psx_time_events ? cpu_features_get_time_usec() : 0;
+      vulkan->wait_sync_index(vulkan->handle);
+      if (psx_time_events)
+         psx_renderer_profile.sync_wait_us += cpu_features_get_time_usec() - t0;
+   }
    if (!ensure_sync_index_resources())
       return;
-   device_next_frame_context(device);
+   {
+      retro_time_t t0 = psx_time_events ? cpu_features_get_time_usec() : 0;
+      device_next_frame_context(device);
+      if (psx_time_events)
+         psx_renderer_profile.frame_context_us += cpu_features_get_time_usec() - t0;
+   }
    inside_frame = true;
 
    renderer->scaled_uv_offset = scaled_uv_offset;
@@ -20339,7 +20367,12 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
       inside_frame = false;
       return;
    }
-   scanout = show_vram ? renderer_scanout_vram_to_texture(renderer, true) : renderer_scanout_to_texture(renderer);
+   {
+      retro_time_t t0 = psx_time_events ? cpu_features_get_time_usec() : 0;
+      scanout = show_vram ? renderer_scanout_vram_to_texture(renderer, true) : renderer_scanout_to_texture(renderer);
+      if (psx_time_events)
+         psx_renderer_profile.scanout_us += cpu_features_get_time_usec() - t0;
+   }
    if (!ih_is_valid(&scanout))
    {
       renderer_flush(renderer);
@@ -20370,7 +20403,12 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
 
    vulkan->set_image(vulkan->handle, image, 0,
          NULL, VK_QUEUE_FAMILY_IGNORED);
-   renderer_flush(renderer);
+   {
+      retro_time_t t0 = psx_time_events ? cpu_features_get_time_usec() : 0;
+      renderer_flush(renderer);
+      if (psx_time_events)
+         psx_renderer_profile.finalize_flush_us += cpu_features_get_time_usec() - t0;
+   }
 
    /* VKHOST_CORE_DUMP: readback through the core's own machinery. */
    if (getenv("VKHOST_CORE_DUMP"))

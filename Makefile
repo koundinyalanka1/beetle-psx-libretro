@@ -21,7 +21,8 @@ BACKSLASH := \$(BACKSLASH)
 filter_out1 = $(filter-out $(firstword $1),$1)
 filter_out2 = $(call filter_out1,$(call filter_out1,$1))
 
-GIT_VERSION ?= " $(shell git rev-parse --short HEAD || echo unknown)"
+GIT_VERSION ?= " $(shell git describe --always --dirty --abbrev=8 --exclude='*' || echo unknown)"
+GIT_VERSION := $(GIT_VERSION)
 ifneq ($(GIT_VERSION)," unknown")
    FLAGS += -DGIT_VERSION=\"$(GIT_VERSION)\"
 endif
@@ -63,10 +64,25 @@ else ifneq (,$(findstring armv,$(platform)))
    endif
 endif
 
+ifneq (,$(filter android,$(platform))$(findstring unix,$(platform)))
+   ifeq ($(origin TARGET_TRIPLE),undefined)
+      TARGET_TRIPLE := $(shell $(CC) $(CFLAGS) -dumpmachine 2>/dev/null)
+   endif
+   ANDROID_TARGET_ABI := $(firstword $(TARGET_ARCH_ABI) $(ANDROID_ABI))
+   TARGET_IS_ANDROID := $(if $(filter android,$(platform))$(findstring android,$(TARGET_TRIPLE))$(filter armeabi armeabi-v7a arm64-v8a x86 x86_64,$(ANDROID_TARGET_ABI)),1,0)
+   ifeq ($(TARGET_IS_ANDROID),1)
+      ANDROID_TARGET_ARCH := $(if $(ANDROID_TARGET_ABI),$(ANDROID_TARGET_ABI),$(firstword $(subst -, ,$(TARGET_TRIPLE))))
+      IS_X86 ?= $(if $(filter i386 i486 i586 i686 x86 x86_64,$(ANDROID_TARGET_ARCH)),1,0)
+      IS_64BIT ?= $(if $(filter aarch64 arm64 arm64-v8a x86_64,$(ANDROID_TARGET_ARCH)),1,0)
+   endif
+endif
+
+ifneq ($(TARGET_IS_ANDROID),1)
 ifneq ($(platform), osx)
    ifeq ($(findstring Haiku,$(shell uname -s)),)
       PTHREAD_FLAGS = -lpthread
    endif
+endif
 endif
 
 NEED_CD = 1
@@ -104,11 +120,18 @@ ifneq ($(LIGHTREC_DEBUG), 0)
 endif
 
 # Android (pass CC/CXX from the NDK toolchain, or use jni/Android.mk).
-ifeq ($(platform), android)
-   TARGET := $(TARGET_NAME)_libretro_android.so
+ifeq ($(TARGET_IS_ANDROID),1)
+   ifeq ($(platform),android)
+      TARGET := $(TARGET_NAME)_libretro_android.so
+   else
+      TARGET := $(TARGET_NAME)_libretro.so
+   endif
    fpic := -fPIC
-   SHARED := -shared -Wl,--no-undefined -Wl,--version-script=link.T
+   SHARED := -shared -Wl,--no-undefined -Wl,--version-script=link.T -Wl,--build-id=sha1
    LDFLAGS += -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 -ldl -llog -landroid -lm
+   ifeq ($(LINK_STATIC_LIBCPLUSPLUS),1)
+      LDFLAGS += -static-libstdc++
+   endif
    FLAGS += -DANDROID -DHAVE_MMAP
    ifeq ($(HAVE_LIGHTREC), 1)
       FLAGS += -DHAVE_ASHMEM
@@ -155,7 +178,6 @@ else ifneq (,$(findstring unix,$(platform)))
          # what the platform=android branch above already does. libretro.c has
          # carried the matching #ifndef __ANDROID__ guard around shm_open for
          # as long as HAVE_SHM has existed here.
-         TARGET_TRIPLE := $(shell $(CC) -dumpmachine 2>/dev/null)
          ifneq (,$(findstring android,$(TARGET_TRIPLE)))
             FLAGS += -DHAVE_ASHMEM
          else
@@ -583,8 +605,9 @@ else
    FLAGS += $(MEDNAFEN_GCC_FLAGS)
 endif
 
-OBJECTS := $(SOURCES_CXX:.cpp=.o) $(SOURCES_C:.c=.o)
-DEPS    := $(SOURCES_CXX:.cpp=.d) $(SOURCES_C:.c=.d)
+OBJECT_PREFIX := $(if $(OBJECT_DIR),$(OBJECT_DIR)/)
+OBJECTS := $(addprefix $(OBJECT_PREFIX),$(SOURCES_CXX:.cpp=.o) $(SOURCES_C:.c=.o))
+DEPS    := $(OBJECTS:.o=.d)
 
 all: $(TARGET)
 
@@ -712,13 +735,15 @@ else
 	@$(LD) $(LINKOUT)$@ $^ $(LDFLAGS) $(GL_LIB) $(LIBS)
 endif
 
-%.o: %.cpp
+$(OBJECT_PREFIX)%.o: %.cpp
+	@mkdir -p "$(@D)"
 	@if [ $(SILENT) -ne 1 ]; then\
 		$(if $@, $(shell echo echo CXX $<),);\
 	fi
 	$(CXX) -c $(OBJOUT)$@ $< $(CXXFLAGS)
 
-%.o: %.c
+$(OBJECT_PREFIX)%.o: %.c
+	@mkdir -p "$(@D)"
 	@if [ $(SILENT) -ne 1 ]; then\
 		$(if $@, $(shell echo echo CC $<),);\
 	fi

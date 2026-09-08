@@ -3,6 +3,9 @@
  * Copyright (C) 2014-2021 Paul Cercueil <paul@crapouillou.net>
  */
 
+#include <features/features_cpu.h>
+#undef ARRAY_SIZE
+
 #include "arch.h"
 #include "blockcache.h"
 #include "debug.h"
@@ -305,6 +308,9 @@ u32 lightrec_rw(struct lightrec_state *state, union code op, u32 base,
 	u16 old_flags;
 	u32 addr;
 	void *host;
+
+	if (unlikely(state->profiling_enabled))
+		state->profile.rw_calls++;
 
 	addr = kunseg(base + (s16) op.i.imm);
 
@@ -1078,6 +1084,29 @@ static struct block * lightrec_get_block(struct lightrec_state *state, u32 pc)
 	return block;
 }
 
+static int lightrec_compile_block_profiled(struct lightrec_state *state,
+					  struct block *block)
+{
+	retro_time_t start, end;
+	int ret;
+
+	if (likely(!state->profiling_enabled))
+		return lightrec_compile_block(state->cstate, block);
+
+	state->profile.compile_requests++;
+	start = cpu_features_get_time_usec();
+	ret = lightrec_compile_block(state->cstate, block);
+	end = cpu_features_get_time_usec();
+	if (ret)
+		state->profile.compile_failures++;
+	else
+		state->profile.compile_completions++;
+	if (start > 0 && end >= start)
+		state->profile.compile_time_us += (u64) end - (u64) start;
+
+	return ret;
+}
+
 static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 {
 	struct block *block;
@@ -1111,7 +1140,7 @@ static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 			if (ENABLE_THREADED_COMPILER) {
 				lightrec_recompiler_add(state->rec, block);
 			} else {
-				err = lightrec_compile_block(state->cstate, block);
+				err = lightrec_compile_block_profiled(state, block);
 				if (err) {
 					state->exit_flags = LIGHTREC_EXIT_NOMEM;
 					return NULL;
@@ -1128,17 +1157,24 @@ static void * get_next_block_func(struct lightrec_state *state, u32 pc)
 			break;
 
 		if (unlikely(block_has_flag(block, BLOCK_NEVER_COMPILE))) {
+			if (unlikely(state->profiling_enabled))
+				state->profile.interpreted_blocks++;
 			pc = lightrec_emulate_block(state, block, pc);
 
 		} else if (!ENABLE_THREADED_COMPILER) {
 			/* Block wasn't compiled yet - run the interpreter */
 			if (block_has_flag(block, BLOCK_FULLY_TAGGED))
 				pr_debug("Block fully tagged, skipping first pass\n");
-			else if (ENABLE_FIRST_PASS && likely(!should_recompile))
+			else if (ENABLE_FIRST_PASS && likely(!should_recompile)) {
+				if (unlikely(state->profiling_enabled)) {
+					state->profile.first_pass_blocks++;
+					state->profile.interpreted_blocks++;
+				}
 				pc = lightrec_emulate_block(state, block, pc);
+			}
 
 			/* Then compile it using the profiled data */
-			err = lightrec_compile_block(state->cstate, block);
+			err = lightrec_compile_block_profiled(state, block);
 			if (err) {
 				state->exit_flags = LIGHTREC_EXIT_NOMEM;
 				return NULL;
@@ -1241,6 +1277,8 @@ static void * lightrec_emit_code(struct lightrec_state *state,
 			}
 
 			/* Remove outdated blocks, and try again */
+			if (unlikely(state->profiling_enabled))
+				state->profile.codecache_reclaims++;
 			lightrec_remove_outdated_blocks(state->block_cache, block);
 
 			pr_debug("Re-try to alloc %zu bytes...\n", code_size);
@@ -2200,6 +2238,9 @@ u32 lightrec_execute(struct lightrec_state *state, u32 pc, u32 target_cycle)
 	void *block_trace;
 	s32 cycles_delta;
 
+	if (unlikely(state->profiling_enabled))
+		state->profile.execute_calls++;
+
 	state->exit_flags = LIGHTREC_EXIT_NORMAL;
 
 	/* Handle the cycle counter overflowing */
@@ -2259,6 +2300,9 @@ u32 lightrec_run_interpreter(struct lightrec_state *state, u32 pc,
 {
 	struct block *block;
 
+	if (unlikely(state->profiling_enabled))
+		state->profile.interpreter_calls++;
+
 	state->exit_flags = LIGHTREC_EXIT_NORMAL;
 	state->target_cycle = target_cycle;
 
@@ -2267,6 +2311,8 @@ u32 lightrec_run_interpreter(struct lightrec_state *state, u32 pc,
 		if (!block)
 			break;
 
+		if (unlikely(state->profiling_enabled))
+			state->profile.interpreted_blocks++;
 		pc = lightrec_emulate_block(state, block, pc);
 
 		if (ENABLE_THREADED_COMPILER)
@@ -2507,6 +2553,9 @@ void lightrec_invalidate(struct lightrec_state *state, u32 addr, u32 len)
 	u32 kaddr = kunseg(addr & ~0x3);
 	enum psx_map idx = lightrec_get_map_idx(state, kaddr);
 
+	if (unlikely(state->profiling_enabled))
+		state->profile.invalidate_calls++;
+
 	switch (idx) {
 	case PSX_MAP_MIRROR1:
 	case PSX_MAP_MIRROR2:
@@ -2530,7 +2579,29 @@ void lightrec_invalidate(struct lightrec_state *state, u32 addr, u32 len)
 
 void lightrec_invalidate_all(struct lightrec_state *state)
 {
+	if (unlikely(state->profiling_enabled))
+		state->profile.invalidate_all_calls++;
 	memset(state->code_lut, 0, lut_elm_size(state) * CODE_LUT_SIZE);
+}
+
+void lightrec_set_profiling(struct lightrec_state *state, bool enabled)
+{
+	if (ENABLE_THREADED_COMPILER && state->rec)
+		lightrec_recompiler_set_profiling(state->rec, enabled);
+	state->profiling_enabled = enabled;
+}
+
+void lightrec_get_profile(struct lightrec_state *state,
+			 struct lightrec_profile *out, bool reset)
+{
+	if (!out)
+		return;
+
+	*out = state->profile;
+	if (ENABLE_THREADED_COMPILER && state->rec)
+		lightrec_recompiler_get_profile(state->rec, out, reset);
+	if (reset)
+		memset(&state->profile, 0, sizeof(state->profile));
 }
 
 void lightrec_set_unsafe_opt_flags(struct lightrec_state *state, u32 flags)

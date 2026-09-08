@@ -152,6 +152,21 @@ PS_CPU *CPU_New(void);
 void    CPU_Destroy(PS_CPU *self);
 
 void              CPU_SetFastMap(PS_CPU *self, void *region_mem, uint32_t region_address, uint32_t region_size);
+typedef struct
+{
+   uint64_t jit_quanta;
+   uint64_t guest_cycles;
+   uint64_t zero_progress;
+   uint64_t exits[9];
+   uint64_t interpreter_frames;
+} cpu_profile_t;
+
+void CPU_SetProfiling(bool enabled);
+void CPU_GetProfile(cpu_profile_t *out, bool reset);
+#ifdef HAVE_LIGHTREC
+bool CPU_GetLightrecProfile(struct lightrec_profile *out, bool reset);
+#endif
+
 int32_t CPU_Run        (PS_CPU *self, int32_t timestamp_in);
 void              CPU_Power      (PS_CPU *self);
 void              CPU_AssertIRQ_method(PS_CPU *self, unsigned which, bool asserted);

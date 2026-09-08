@@ -20,6 +20,14 @@
 #include "rhi/rhi_intf.h"
 #include "libretro_cbs.h"
 #include "beetle_psx_globals.h"
+#include "mednafen/performance.h"
+#include <inttypes.h>
+#ifdef __ANDROID__
+#include <android/ndk-version.h>
+#endif
+#if defined(__linux__)
+#include <time.h>
+#endif
 #include "libretro_game_database.h"
 #include "libretro_options.h"
 #include "input.h"
@@ -198,10 +206,18 @@ uint8_t spu_samples = 1;
 uint64_t psx_cpu_quanta      = 0;
 static uint64_t psx_event_us = 0;
 static uint64_t psx_event_n  = 0;
-static bool     psx_time_events = false;
+bool psx_time_events = false;
+uint64_t psx_gpu_updates;
+uint64_t psx_gpu_zero_updates;
+uint64_t psx_dma_updates;
+psx_renderer_profile_t psx_renderer_profile;
 static uint64_t psx_event_type_us[PSX_EVENT__COUNT];
 static uint32_t psx_event_type_n[PSX_EVENT__COUNT];
 static uint32_t psx_event_type_samples[PSX_EVENT__COUNT];
+static unsigned psx_event_depth;
+static bool perf_runtime_logged;
+static bool perf_previous_enabled;
+static void perf_reset(void);
 
 /* CPU overclock factor (or 0 if disabled) */
 int32_t psx_overclock_factor = 0;
@@ -1532,6 +1548,8 @@ bool MDFN_FASTCALL PSX_EventHandler(const int32_t timestamp)
     * handlers' own dispatches are counted too - they are event cost as much
     * as the loop's are, and leaving them out would understate the total. */
    retro_time_t ev_t0 = psx_time_events ? cpu_features_get_time_usec() : 0;
+   if (psx_time_events)
+      psx_event_depth++;
 
    while(timestamp >= e->event_time)   // If Running = 0, PSX_EventHandler() may be called even if there isn't an event per-se, so while() instead of do { ... } while
    {
@@ -1576,7 +1594,7 @@ bool MDFN_FASTCALL PSX_EventHandler(const int32_t timestamp)
       e = prev->next;
    }
 
-   if (psx_time_events)
+   if (psx_time_events && --psx_event_depth == 0)
       psx_event_us += (uint64_t)(cpu_features_get_time_usec() - ev_t0);
 
    return(Running);
@@ -4650,9 +4668,21 @@ static void check_variables(bool startup)
    }
    else
    {
+#if defined(BEETLE_PSX_PROFILE) && BEETLE_PSX_PROFILE
+      GPU_SetDiagnostics(1);
+      psx_time_events = true;
+#else
       GPU_SetDiagnostics(0);
       psx_time_events = false;
+#endif
    }
+   if (psx_time_events != perf_previous_enabled)
+   {
+      perf_reset();
+      perf_runtime_logged = false;
+      perf_previous_enabled = psx_time_events;
+   }
+   CPU_SetProfiling(psx_time_events);
 
    var.key = BEETLE_OPT(threaded_gpu);
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -6150,6 +6180,8 @@ bool retro_load_game(const struct retro_game_info *info)
    if (!MDFNI_LoadGame(retro_cd_path))
       return false;
 
+   perf_reset();
+   perf_runtime_logged = false;
    MDFN_LoadGameCheats();
    MDFNMP_InstallReadPatches();
 
@@ -6476,6 +6508,141 @@ static uint32_t phase_frames   = 0;
  * core cheaper" and "fix the dupe heuristic". */
 static uint32_t phase_skip_av  = 0;
 static uint32_t phase_dupe     = 0;
+static beetle_perf_histogram perf_frames;
+static uint64_t perf_prepare_us;
+static uint64_t perf_thread_us;
+static uint32_t perf_thread_samples;
+static uint64_t perf_audio_frames;
+static uint32_t perf_deadline_misses;
+
+static uint64_t perf_thread_time(void)
+{
+#if defined(__linux__) && defined(CLOCK_THREAD_CPUTIME_ID)
+   struct timespec ts;
+   if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0)
+      return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+#endif
+   return 0;
+}
+
+static void perf_reset(void)
+{
+   memset(&perf_frames, 0, sizeof(perf_frames));
+   memset(&psx_renderer_profile, 0, sizeof(psx_renderer_profile));
+   memset(psx_event_type_us, 0, sizeof(psx_event_type_us));
+   memset(psx_event_type_n, 0, sizeof(psx_event_type_n));
+   memset(psx_event_type_samples, 0, sizeof(psx_event_type_samples));
+   psx_cpu_quanta = psx_event_us = psx_event_n = 0;
+   psx_gpu_updates = psx_gpu_zero_updates = psx_dma_updates = 0;
+   phase_cpu_us = phase_final_us = phase_audio_us = phase_total_us = 0;
+   phase_frames = phase_skip_av = phase_dupe = 0;
+   perf_prepare_us = perf_thread_us = perf_audio_frames = 0;
+   perf_thread_samples = perf_deadline_misses = 0;
+   CPU_GetProfile(NULL, true);
+}
+
+static void perf_report_runtime(void)
+{
+   struct retro_system_info info;
+   struct retro_system_av_info av;
+   const char *abi = "other";
+   unsigned neon = 0;
+#if defined(__aarch64__)
+   abi = "aarch64";
+#elif defined(__arm__)
+   abi = "arm";
+#elif defined(__x86_64__) || defined(_M_X64)
+   abi = "x86_64";
+#elif defined(__i386__) || defined(_M_IX86)
+   abi = "x86";
+#endif
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+   neon = 1;
+#endif
+   retro_get_system_info(&info);
+   retro_get_system_av_info(&av);
+   log_cb(RETRO_LOG_WARN,
+         "core_profile_runtime_v1: version=%s abi=%s pointer_bits=%u neon=%u "
+         "renderer=%u fps=%.8f sample_rate=%.0f event_cycles=%d spu_samples=%u "
+         "gpu_worker=%u spu_worker=%u\n",
+         info.library_version, abi, (unsigned)(sizeof(void *) * 8), neon,
+         (unsigned)rhi_intf_is_type(), av.timing.fps, av.timing.sample_rate,
+         EventCycles, (unsigned)spu_samples,
+         (unsigned)GPU_Worker_Active(), (unsigned)SPU_Worker_Active());
+#ifdef __ANDROID__
+   log_cb(RETRO_LOG_WARN, "core_profile_build_v1: ndk=%d.%d.%d compiler=%s\n",
+         __NDK_MAJOR__, __NDK_MINOR__, __NDK_BUILD__, __VERSION__);
+#endif
+#ifdef HAVE_LIGHTREC
+   {
+      struct lightrec_profile jit;
+      bool active = CPU_GetLightrecProfile(&jit, false);
+      log_cb(RETRO_LOG_WARN,
+            "core_profile_engine_v1: lightrec_active=%u requested=%u mapping=%u "
+            "compiler_workers=%" PRIu64 " opcode_cycles=%u invalidate_dma_only=%u spgp=%u\n",
+            (unsigned)active, (unsigned)psx_dynarec, (unsigned)psx_mmap,
+            jit.compiler_workers, (unsigned)psx_dynarec_op_cycles,
+            (unsigned)psx_dynarec_invalidate, (unsigned)psx_dynarec_spgp_opt);
+   }
+#endif
+}
+
+static void perf_report(void)
+{
+   cpu_profile_t cpu;
+   unsigned event;
+   CPU_GetProfile(&cpu, false);
+   log_cb(RETRO_LOG_WARN,
+         "core_profile_v1: frames=%" PRIu64 " min_us=%" PRIu64 " max_us=%" PRIu64
+         " p50_upper_us=%" PRIu64 " p95_upper_us=%" PRIu64 " p99_upper_us=%" PRIu64
+         " deadline_misses=%u prepare_us=%" PRIu64 " emu_thread_cpu_us=%" PRIu64
+         " thread_samples=%u audio_frames=%" PRIu64 " gpu_updates=%" PRIu64
+         " gpu_zero_updates=%" PRIu64 " dma_updates=%" PRIu64 "\n",
+         perf_frames.count, perf_frames.min_us, perf_frames.max_us,
+         beetle_perf_percentile_upper(&perf_frames, 50),
+         beetle_perf_percentile_upper(&perf_frames, 95),
+         beetle_perf_percentile_upper(&perf_frames, 99),
+         perf_deadline_misses, perf_prepare_us, perf_thread_us,
+         perf_thread_samples, perf_audio_frames, psx_gpu_updates,
+         psx_gpu_zero_updates, psx_dma_updates);
+   log_cb(RETRO_LOG_WARN,
+         "core_profile_renderer_v1: sync_wait_us=%" PRIu64 " frame_context_us=%" PRIu64
+         " scanout_inclusive_us=%" PRIu64 " finalize_flush_us=%" PRIu64
+         " pipeline_create_us=%" PRIu64 " pipeline_creates=%" PRIu64 "\n",
+         psx_renderer_profile.sync_wait_us, psx_renderer_profile.frame_context_us,
+         psx_renderer_profile.scanout_us, psx_renderer_profile.finalize_flush_us,
+         psx_renderer_profile.pipeline_us, psx_renderer_profile.pipeline_creates);
+   for (event = PSX_EVENT_GPU; event <= PSX_EVENT_FIO; event++)
+      log_cb(RETRO_LOG_WARN,
+            "core_profile_event_v1: type=%u dispatches=%u timed_samples=%u inclusive_sample_us=%" PRIu64 "\n",
+            event, psx_event_type_n[event], psx_event_type_samples[event], psx_event_type_us[event]);
+   log_cb(RETRO_LOG_WARN,
+         "core_profile_cpu_v1: jit_quanta=%" PRIu64 " guest_cycles=%" PRIu64
+         " zero_progress=%" PRIu64 " interpreter_frames=%" PRIu64
+         " normal=%" PRIu64 " irq_check=%" PRIu64 " break=%" PRIu64
+         " syscall=%" PRIu64 " unmapped=%" PRIu64 " nomem=%" PRIu64
+         " unknown_op=%" PRIu64 " code_inv=%" PRIu64 " spgp_slow=%" PRIu64 "\n",
+         cpu.jit_quanta, cpu.guest_cycles, cpu.zero_progress, cpu.interpreter_frames,
+         cpu.exits[0], cpu.exits[1], cpu.exits[2], cpu.exits[3], cpu.exits[4],
+         cpu.exits[5], cpu.exits[6], cpu.exits[7], cpu.exits[8]);
+#ifdef HAVE_LIGHTREC
+   {
+      struct lightrec_profile jit;
+      bool active = CPU_GetLightrecProfile(&jit, true);
+      log_cb(RETRO_LOG_WARN,
+            "core_profile_jit_v1: active=%u execute_calls=%" PRIu64
+            " interpreter_calls=%" PRIu64 " first_pass_blocks=%" PRIu64
+            " interpreted_blocks=%" PRIu64 " generic_rw=%" PRIu64
+            " invalidate=%" PRIu64 " invalidate_all=%" PRIu64 " reclaims=%" PRIu64
+            " compile_requests=%" PRIu64 " compiled=%" PRIu64 " compile_failures=%" PRIu64
+            " compile_wall_us=%" PRIu64 " queue=%" PRIu64 " queue_max=%" PRIu64 " workers=%" PRIu64 "\n",
+            (unsigned)active, jit.execute_calls, jit.interpreter_calls, jit.first_pass_blocks,
+            jit.interpreted_blocks, jit.rw_calls, jit.invalidate_calls, jit.invalidate_all_calls,
+            jit.codecache_reclaims, jit.compile_requests, jit.compile_completions,
+            jit.compile_failures, jit.compile_time_us, jit.queue_depth, jit.queue_max, jit.compiler_workers);
+   }
+#endif
+}
 
 void retro_run(void)
 {
@@ -6498,6 +6665,7 @@ void retro_run(void)
       return;
 
    retro_time_t phase_t0 = cpu_features_get_time_usec();
+   uint64_t perf_thread_start = psx_time_events ? perf_thread_time() : 0;
 
    /* Ask once per frame and cache it, so every decision below agrees. */
    av_enable_poll();
@@ -6537,7 +6705,12 @@ void retro_run(void)
     * synchronous video-driver reinit runs between frames. */
    rhi_intf_apply_pending_geometry();
 
-   rhi_intf_prepare_frame();
+   {
+      retro_time_t t0 = psx_time_events ? cpu_features_get_time_usec() : 0;
+      rhi_intf_prepare_frame();
+      if (psx_time_events)
+         perf_prepare_us += (uint64_t)(cpu_features_get_time_usec() - t0);
+   }
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
    {
@@ -6866,6 +7039,8 @@ void retro_run(void)
    SPU_Worker_Sync();
 
    espec->SoundBufSize = IntermediateBufferPos;
+   if (psx_time_events)
+      perf_audio_frames += IntermediateBufferPos;
    IntermediateBufferPos = 0;
 
    PS_CDC_ResetTS(PSX_CDC);
@@ -7167,7 +7342,29 @@ void retro_run(void)
    if (led_state_cb)
       retro_led_interface();
 
-   phase_total_us += (uint64_t)(cpu_features_get_time_usec() - phase_t0);
+   {
+      uint64_t frame_us = (uint64_t)(cpu_features_get_time_usec() - phase_t0);
+      phase_total_us += frame_us;
+      if (psx_time_events)
+      {
+         struct retro_system_av_info av;
+         uint64_t thread_end = perf_thread_start ? perf_thread_time() : 0;
+         beetle_perf_add(&perf_frames, frame_us);
+         if (thread_end >= perf_thread_start && perf_thread_start)
+         {
+            perf_thread_us += thread_end - perf_thread_start;
+            perf_thread_samples++;
+         }
+         retro_get_system_av_info(&av);
+         if (av.timing.fps > 0.0 && frame_us * av.timing.fps > 1000000.0)
+            perf_deadline_misses++;
+      }
+   }
+   if (!perf_runtime_logged)
+   {
+      perf_report_runtime();
+      perf_runtime_logged = true;
+   }
    if (++phase_frames >= 300)
    {
       double f     = (double)phase_frames;
@@ -7211,21 +7408,9 @@ void retro_run(void)
                estimate[PSX_EVENT_GPU], estimate[PSX_EVENT_CDC],
                estimate[PSX_EVENT_TIMER], estimate[PSX_EVENT_DMA], estimate[PSX_EVENT_FIO]);
       }
-      memset(psx_event_type_us, 0, sizeof(psx_event_type_us));
-      memset(psx_event_type_n, 0, sizeof(psx_event_type_n));
-      memset(psx_event_type_samples, 0, sizeof(psx_event_type_samples));
-
-      psx_cpu_quanta = 0;
-      psx_event_us   = 0;
-      psx_event_n    = 0;
-
-      phase_skip_av  = 0;
-      phase_dupe     = 0;
-      phase_cpu_us   = 0;
-      phase_final_us = 0;
-      phase_audio_us = 0;
-      phase_total_us = 0;
-      phase_frames   = 0;
+      if (psx_time_events)
+         perf_report();
+      perf_reset();
    }
 }
 

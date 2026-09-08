@@ -8,6 +8,7 @@
 
 struct block;
 struct lightrec_state;
+struct lightrec_profile;
 struct recompiler;
 
 struct recompiler *lightrec_recompiler_init(struct lightrec_state *state);
@@ -20,6 +21,9 @@ void * lightrec_recompiler_run_first_pass(struct lightrec_state *state,
 
 void lightrec_recompiler_pause(struct recompiler *rec);
 void lightrec_recompiler_unpause(struct recompiler *rec);
+void lightrec_recompiler_set_profiling(struct recompiler *rec, _Bool enabled);
+void lightrec_recompiler_get_profile(struct recompiler *rec,
+				    struct lightrec_profile *out, _Bool reset);
 
 void lightrec_code_alloc_lock(struct lightrec_state *state);
 void lightrec_code_alloc_unlock(struct lightrec_state *state);

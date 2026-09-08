@@ -232,6 +232,9 @@ struct lightrec_state {
 	 * windows by the re-validation walk. */
 	u32 code_walk_map[0x200000 / 4 / 32];
 
+	struct lightrec_profile profile;
+	_Bool profiling_enabled;
+
 	void *code_lut[];
 };
 

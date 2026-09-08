@@ -248,7 +248,11 @@ struct retro_core_option_v2_definition option_defs_us[] = {
          { "all", "Timing and FIFO Validation" },
          { NULL, NULL },
       },
+#if defined(BEETLE_PSX_PROFILE) && BEETLE_PSX_PROFILE
+      "timing"
+#else
       "disabled"
+#endif
    },
 #ifndef EMSCRIPTEN
    {

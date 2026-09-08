@@ -25,6 +25,7 @@
 
 #include "psx_events.h"
 #include "../../osd_message.h"
+#include "../../beetle_psx_globals.h"
 #include "psx_mem.h"
 #include "irq.h"
 #include "cpu.h"
@@ -557,6 +558,8 @@ int32_t DMA_Update(const int32_t timestamp)
    int32_t clocks, i;
    /*   uint32_t dc = (DMAControl >> (ch * 4)) & 0xF; */
    clocks = timestamp - lastts;
+   if (psx_time_events)
+      psx_dma_updates++;
 
    overclock_cpu_to_device(&clocks);
 

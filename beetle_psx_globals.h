@@ -14,6 +14,23 @@
 extern "C" {
 #endif
 
+extern bool psx_time_events;
+extern uint64_t psx_gpu_updates;
+extern uint64_t psx_gpu_zero_updates;
+extern uint64_t psx_dma_updates;
+
+typedef struct
+{
+   uint64_t sync_wait_us;
+   uint64_t frame_context_us;
+   uint64_t scanout_us;
+   uint64_t finalize_flush_us;
+   uint64_t pipeline_us;
+   uint64_t pipeline_creates;
+} psx_renderer_profile_t;
+
+extern psx_renderer_profile_t psx_renderer_profile;
+
 extern bool content_is_pal;
 extern uint8_t widescreen_hack;
 extern uint8_t widescreen_hack_aspect_ratio_setting;

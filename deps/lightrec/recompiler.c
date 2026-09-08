@@ -23,12 +23,14 @@
 #include "lightrec-private.h"
 #include "memmanager.h"
 #include "reaper.h"
+#include "recompiler.h"
 #include "slist.h"
 
 #include <errno.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 
 struct block_rec {
 	struct block *block;
@@ -54,6 +56,9 @@ struct recompiler {
 	slock_t *alloc_mutex;
 
 	unsigned int nb_recs, nb_cpus;
+	struct lightrec_profile profile;
+	u64 profile_generation;
+	bool profiling_enabled;
 	struct recompiler_thd thds[];
 };
 
@@ -81,6 +86,73 @@ static struct block_rec * lightrec_get_best_elm(struct slist_elm *head)
 	return best;
 }
 
+static u64 lightrec_recompiler_queue_depth(struct recompiler *rec)
+{
+	struct slist_elm *elm;
+	u64 depth = 0;
+
+	for (elm = slist_first(&rec->slist); elm; elm = elm->next)
+		depth++;
+
+	return depth;
+}
+
+void lightrec_recompiler_set_profiling(struct recompiler *rec, bool enabled)
+{
+	slock_lock(rec->mutex);
+	if (rec->profiling_enabled != enabled) {
+		rec->profiling_enabled = enabled;
+		rec->profile_generation++;
+		if (enabled) {
+			rec->profile.queue_depth = lightrec_recompiler_queue_depth(rec);
+			if (rec->profile.queue_max < rec->profile.queue_depth)
+				rec->profile.queue_max = rec->profile.queue_depth;
+		}
+	}
+	slock_unlock(rec->mutex);
+}
+
+void lightrec_recompiler_get_profile(struct recompiler *rec,
+				    struct lightrec_profile *out, bool reset)
+{
+	u64 depth;
+
+	slock_lock(rec->mutex);
+	depth = rec->profiling_enabled ? rec->profile.queue_depth :
+		lightrec_recompiler_queue_depth(rec);
+	out->compile_requests = rec->profile.compile_requests;
+	out->compile_completions = rec->profile.compile_completions;
+	out->compile_failures = rec->profile.compile_failures;
+	out->compile_time_us = rec->profile.compile_time_us;
+	out->queue_depth = depth;
+	out->queue_max = rec->profile.queue_max;
+	out->compiler_workers = rec->nb_recs;
+	if (reset) {
+		memset(&rec->profile, 0, sizeof(rec->profile));
+		rec->profile.queue_depth = depth;
+		rec->profile.queue_max = rec->profiling_enabled ? depth : 0;
+	}
+	slock_unlock(rec->mutex);
+}
+
+static void lightrec_profile_compile_done(struct recompiler *rec,
+					 u64 generation, retro_time_t start,
+					 int ret)
+{
+	retro_time_t end;
+
+	if (!rec->profiling_enabled || rec->profile_generation != generation)
+		return;
+
+	end = cpu_features_get_time_usec();
+	if (ret)
+		rec->profile.compile_failures++;
+	else
+		rec->profile.compile_completions++;
+	if (start > 0 && end >= start)
+		rec->profile.compile_time_us += (u64) end - (u64) start;
+}
+
 static bool lightrec_cancel_block_rec(struct recompiler *rec,
 				      struct block_rec *block_rec)
 {
@@ -99,6 +171,8 @@ static bool lightrec_cancel_block_rec(struct recompiler *rec,
 
 	/* Block is not yet being processed - remove it from the list */
 	slist_remove(&rec->slist, &block_rec->slist);
+	if (unlikely(rec->profiling_enabled))
+		rec->profile.queue_depth--;
 	lightrec_free(rec->state, MEM_FOR_LIGHTREC,
 		      sizeof(*block_rec), block_rec);
 
@@ -120,6 +194,8 @@ static void lightrec_flush_code_buffer(struct lightrec_state *state, void *d)
 {
 	struct recompiler *rec = d;
 
+	if (unlikely(state->profiling_enabled))
+		state->profile.codecache_reclaims++;
 	lightrec_remove_outdated_blocks(state->block_cache, NULL);
 	rec->must_flush = false;
 }
@@ -129,22 +205,33 @@ static void lightrec_compile_list(struct recompiler *rec,
 {
 	struct block_rec *block_rec;
 	struct block *block;
+	retro_time_t start;
+	u64 generation;
+	bool profiling, compiled;
 	int ret;
 
 	while (!rec->pause &&
 	       !!(block_rec = lightrec_get_best_elm(&rec->slist))) {
 		block_rec->compiling = true;
 		block = block_rec->block;
+		profiling = rec->profiling_enabled;
+		generation = rec->profile_generation;
+		start = profiling ? cpu_features_get_time_usec() : 0;
+		compiled = false;
+		ret = 0;
 
 		slock_unlock(rec->mutex);
 
 		if (likely(!block_has_flag(block, BLOCK_IS_DEAD))) {
 			ret = lightrec_compile_block(thd->cstate, block);
+			compiled = true;
 			if (ret == -ENOMEM) {
 				/* Code buffer is full. Request the reaper to
 				 * flush it. */
 
 				slock_lock(rec->mutex);
+				if (unlikely(profiling))
+					lightrec_profile_compile_done(rec, generation, start, ret);
 				block_rec->compiling = false;
 				scond_broadcast(rec->cond2);
 
@@ -167,7 +254,11 @@ static void lightrec_compile_list(struct recompiler *rec,
 
 		slock_lock(rec->mutex);
 
+		if (unlikely(profiling && compiled))
+			lightrec_profile_compile_done(rec, generation, start, ret);
 		slist_remove(&rec->slist, &block_rec->slist);
+		if (unlikely(rec->profiling_enabled))
+			rec->profile.queue_depth--;
 		lightrec_free(rec->state, MEM_FOR_LIGHTREC,
 			      sizeof(*block_rec), block_rec);
 		scond_broadcast(rec->cond2);
@@ -236,6 +327,9 @@ struct recompiler *lightrec_recompiler_init(struct lightrec_state *state)
 	rec->must_flush = false;
 	rec->nb_recs = nb_recs;
 	rec->nb_cpus = nb_cpus;
+	memset(&rec->profile, 0, sizeof(rec->profile));
+	rec->profile_generation = 0;
+	rec->profiling_enabled = false;
 	slist_init(&rec->slist);
 
 	rec->cond = scond_new();
@@ -334,6 +428,9 @@ int lightrec_recompiler_add(struct recompiler *rec, struct block *block)
 
 	slock_lock(rec->mutex);
 
+	if (unlikely(rec->profiling_enabled))
+		rec->profile.compile_requests++;
+
 	/* If the recompiler must flush the code cache, we can't add the new
 	 * job. It will be re-added next time the block's address is jumped to
 	 * again. */
@@ -399,6 +496,11 @@ int lightrec_recompiler_add(struct recompiler *rec, struct block *block)
 
 	/* Push the new entry to the front of the queue */
 	slist_append(elm, &block_rec->slist);
+	if (unlikely(rec->profiling_enabled)) {
+		rec->profile.queue_depth++;
+		if (rec->profile.queue_max < rec->profile.queue_depth)
+			rec->profile.queue_max = rec->profile.queue_depth;
+	}
 
 	/* Signal the thread */
 	scond_signal(rec->cond);
@@ -480,6 +582,10 @@ void * lightrec_recompiler_run_first_pass(struct lightrec_state *state,
 	old_flags = block_set_flags(block, BLOCK_NO_OPCODE_LIST);
 
 	/* Block wasn't compiled yet - run the interpreter */
+	if (unlikely(state->profiling_enabled)) {
+		state->profile.first_pass_blocks++;
+		state->profile.interpreted_blocks++;
+	}
 	*pc = lightrec_emulate_block(state, block, *pc);
 
 	if (!(old_flags & BLOCK_NO_OPCODE_LIST))

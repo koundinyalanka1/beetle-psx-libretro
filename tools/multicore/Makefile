@@ -6,12 +6,16 @@ THREADS := $(ROOT)/libretro-common/rthreads/rthreads.c
 AFFINITY := $(ROOT)/mednafen/worker_affinity.c
 
 .PHONY: check
-check: $(BUILD_DIR)/spu $(BUILD_DIR)/workers $(BUILD_DIR)/affinity $(BUILD_DIR)/gpu-timing $(BUILD_DIR)/recompiler
+check: $(BUILD_DIR)/spu $(BUILD_DIR)/workers $(BUILD_DIR)/affinity $(BUILD_DIR)/gpu-timing $(BUILD_DIR)/recompiler $(BUILD_DIR)/performance
 	$(BUILD_DIR)/spu
 	$(BUILD_DIR)/workers
 	$(BUILD_DIR)/affinity
 	$(BUILD_DIR)/gpu-timing
 	$(BUILD_DIR)/recompiler
+	$(BUILD_DIR)/performance
+
+$(BUILD_DIR)/performance: performance.c $(ROOT)/mednafen/performance.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DBEETLE_PERF_STANDALONE performance.c -o $@
 
 $(BUILD_DIR)/recompiler: recompiler.c thread_faults.h $(ROOT)/deps/lightrec/recompiler.c $(THREADS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -D_GNU_SOURCE -D__LIBRETRO__ -DENABLE_THREADED_COMPILER=1 -DLOG_LEVEL=0 -I$(ROOT)/include -I$(ROOT)/deps/lightning/include recompiler.c $(THREADS) -pthread -o $@

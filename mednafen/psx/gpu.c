@@ -2850,12 +2850,13 @@ static void GPU_Stage_Resolve(void)
    gpu_stage_inline_n += n;
 
    {
-      retro_time_t t0 = cpu_features_get_time_usec();
+      retro_time_t t0 = gpu_time_words ? cpu_features_get_time_usec() : 0;
 
       for (i = 0; i < n; i++)
          GPU_WriteGP0_Internal(gpu_stage[i].data, gpu_stage[i].addr);
 
-      gpu_inline_us += (uint64_t)(cpu_features_get_time_usec() - t0);
+      if (gpu_time_words)
+         gpu_inline_us += (uint64_t)(cpu_features_get_time_usec() - t0);
    }
    GPU_PublishFIFO();
 }
@@ -3238,6 +3239,12 @@ int32_t GPU_Update(const int32_t sys_timestamp)
    const uint32_t dmc = (GPU.DisplayMode & 0x40) ? 4 : (GPU.DisplayMode & 0x3);
    const uint32_t dmw = 2800 / DotClockRatios[dmc];   /* Must be <= 768 */
    int32_t sys_clocks = sys_timestamp - GPU.lastts;
+
+   if (psx_time_events)
+   {
+      psx_gpu_updates++;
+      psx_gpu_zero_updates += sys_clocks == 0;
+   }
 
    if(!sys_clocks)
       goto TheEnd;

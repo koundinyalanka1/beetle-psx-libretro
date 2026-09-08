@@ -2,7 +2,7 @@ LOCAL_PATH := $(call my-dir)
 
 CORE_DIR := $(abspath $(LOCAL_PATH)/..)
 
-DEBUG                    := 0
+DEBUG                    := $(if $(filter debug,$(APP_OPTIM)),1,0)
 NEED_CD                  := 1
 NEED_BPP                 := 32
 NEED_DEINTERLACER        := 1
@@ -14,11 +14,11 @@ HAVE_VULKAN              := 0
 HAVE_CHD                 := 1
 IS_X86                   := 0
 IS_64BIT                 := 0
-FLAGS                    :=
+FLAGS                    := -DANDROID -DHAVE_MMAP
 HAVE_LIGHTREC            := 1
 THREADED_RECOMPILER      := 1
 
-ifeq ($(TARGET_ARCH),x86)
+ifneq (,$(filter x86 x86_64,$(TARGET_ARCH) $(TARGET_ARCH_ABI)))
   IS_X86 := 1
 endif
 
@@ -62,7 +62,15 @@ ifeq ($(HAVE_HW),1)
 endif
 
 COREFLAGS := -funroll-loops $(INCFLAGS) -DMEDNAFEN_VERSION_NUMERIC=926 -D__LIBRETRO__ -D_LOW_ACCURACY_ -DINLINE="inline" $(FLAGS)
-COREFLAGS += $(GLFLAGS)
+COREFLAGS += $(GLFLAGS) -fwrapv -fsigned-char
+ifeq ($(IS_X86),1)
+  COREFLAGS += -fomit-frame-pointer
+endif
+ifeq ($(DEBUG),1)
+  COREFLAGS += -O0 -g -DDEBUG
+else
+  COREFLAGS += -O3 -DNDEBUG
+endif
 
 GIT_VERSION := " $(shell git rev-parse --short HEAD || echo unknown)"
 ifneq ($(GIT_VERSION)," unknown")
@@ -74,7 +82,7 @@ LOCAL_MODULE       := retro
 LOCAL_SRC_FILES    := $(SOURCES_CXX) $(SOURCES_C)
 LOCAL_CFLAGS       := $(COREFLAGS)
 LOCAL_CXXFLAGS     := $(COREFLAGS) -std=c++11
-LOCAL_LDFLAGS      := -Wl,-version-script=$(CORE_DIR)/link.T -ldl -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384
+LOCAL_LDFLAGS      := -Wl,-version-script=$(CORE_DIR)/link.T -ldl -Wl,--build-id=sha1 -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384
 LOCAL_LDLIBS       := -llog -landroid $(GL_LIB)
 LOCAL_CPP_FEATURES := exceptions rtti
 include $(BUILD_SHARED_LIBRARY)
