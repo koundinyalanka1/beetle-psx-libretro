@@ -67,6 +67,10 @@ static struct lightrec_registers *lightrec_regs;
 
 extern bool psx_gte_overclock;
 
+/* One CPU_Run loop iteration = one event quantum.  Counted here (both engines)
+ * and reported by retro_run's phase log; see the accounting note in libretro.c. */
+extern uint64_t psx_cpu_quanta;
+
 /* CP0 named-register indices.  Used inside the per-instruction switch
  * in lightrec's MTC0/CTC0 path; kept TU-local since nothing outside
  * cpu.c speaks of them by name. */
@@ -915,6 +919,8 @@ static int32_t CPU_RunReal(PS_CPU *self, int32_t timestamp_in)
 
  do
  {
+  psx_cpu_quanta++;
+
   while(MDFN_LIKELY(timestamp < next_event_ts))
   {
    uint32_t instr;
@@ -3750,6 +3756,7 @@ static int32_t lightrec_plugin_execute(PS_CPU *self, int32_t timestamp)
 
    do
    {
+      psx_cpu_quanta++;
 #ifdef LIGHTREC_DEBUG
       uint32_t oldpc = PC;
 #endif

@@ -179,6 +179,27 @@ int memfd = -1;
 int32_t EventCycles = 128;
 uint8_t spu_samples = 1;
 
+/* ---- CPU_Run quantum accounting -------------------------------------------
+ *
+ * The retro_run report below already says how much of the frame is CPU_Run().
+ * It does not say why, and the two candidate answers want opposite fixes:
+ * the emulated machine genuinely having that much work to do, versus the
+ * event quantum being so short that the loop's own overhead - lightrec entry
+ * and exit, the event-list walk, GPU_Update's prologue - is charged thousands
+ * of times per frame for very little emulated progress.
+ *
+ * EventCycles bounds the quantum (GPU_Update clamps its next event to it), so
+ * at the default 128 a 60 Hz frame is ~4,400 quanta.  Dividing CPU_Run time by
+ * the quantum count separates the two: real work scales with the scene, fixed
+ * overhead scales with the quantum count and stays put when the scene idles.
+ *
+ * The count is free.  Timing the dispatch costs two clock reads per call, so
+ * it is opt-in through the GPU Diagnostics option's timing setting. */
+uint64_t psx_cpu_quanta      = 0;
+static uint64_t psx_event_us = 0;
+static uint64_t psx_event_n  = 0;
+static bool     psx_time_events = false;
+
 /* CPU overclock factor (or 0 if disabled) */
 int32_t psx_overclock_factor = 0;
 /* GPU rasterizer overclock shift */
@@ -1502,11 +1523,17 @@ void ForceEventUpdates(const int32_t timestamp)
 bool MDFN_FASTCALL PSX_EventHandler(const int32_t timestamp)
 {
    struct event_list_entry *e = events[PSX_EVENT__SYNFIRST].next;
+   /* Timed here rather than around the CPU_Run call sites so the memory
+    * handlers' own dispatches are counted too - they are event cost as much
+    * as the loop's are, and leaving them out would understate the total. */
+   retro_time_t ev_t0 = psx_time_events ? cpu_features_get_time_usec() : 0;
 
    while(timestamp >= e->event_time)   // If Running = 0, PSX_EventHandler() may be called even if there isn't an event per-se, so while() instead of do { ... } while
    {
       int32_t nt;
       struct event_list_entry *prev = e->prev;
+
+      psx_event_n++;
 
       switch(e->which)
       {
@@ -1534,6 +1561,9 @@ bool MDFN_FASTCALL PSX_EventHandler(const int32_t timestamp)
       // Order of events can change due to calling PSX_SetEventNT(), this prev business ensures we don't miss an event due to reordering.
       e = prev->next;
    }
+
+   if (psx_time_events)
+      psx_event_us += (uint64_t)(cpu_features_get_time_usec() - ev_t0);
 
    return(Running);
 }
@@ -4595,18 +4625,28 @@ static void check_variables(bool startup)
 
    var.key = BEETLE_OPT(gpu_diagnostics);
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-      GPU_SetDiagnostics(!strcmp(var.value, "all") ? 3u :
+   {
+      unsigned diag = !strcmp(var.value, "all") ? 3u :
             !strcmp(var.value, "timing") ? 1u :
-            !strcmp(var.value, "fifo") ? 2u : 0u);
+            !strcmp(var.value, "fifo") ? 2u : 0u;
+      GPU_SetDiagnostics(diag);
+      /* Same bit as the GP0 per-word timing: both are "tell me where the
+       * frame went", both pay for it in clock reads. */
+      psx_time_events = (diag & 1) != 0;
+   }
    else
-      GPU_SetDiagnostics(0);
+   {
+      /* Matches the core option's own default (timing). */
+      GPU_SetDiagnostics(1);
+      psx_time_events = true;
+   }
 
    var.key = BEETLE_OPT(threaded_gpu);
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
       GPU_SetThreaded(strcmp(var.value, "disabled") != 0);
    else
       /* Matches the core option's own default. */
-      GPU_SetThreaded(false);
+      GPU_SetThreaded(true);
 
 #ifdef HAVE_LIGHTREC
    var.key = BEETLE_OPT(cpu_dynarec);
@@ -7123,6 +7163,8 @@ void retro_run(void)
       double final = (double)phase_final_us / 1000.0 / f;
       double audio = (double)phase_audio_us / 1000.0 / f;
 
+      double quanta = (double)psx_cpu_quanta / f;
+
       log_cb(RETRO_LOG_WARN,
             "retro_run over %u frames: %.2f ms/frame = CPU %.2f + finalize "
             "%.2f + audio %.2f + other %.2f | no image: %u frontend-skip + "
@@ -7130,6 +7172,21 @@ void retro_run(void)
             phase_frames, total, cpu, final, audio,
             total - cpu - final - audio,
             phase_skip_av, phase_dupe);
+
+      /* The quantum count is what turns "CPU is 95% of the frame" into an
+       * actionable number: cost per quantum that stays flat across scenes is
+       * loop overhead, and EventCycles is the knob that divides it. */
+      log_cb(RETRO_LOG_WARN,
+            "  CPU %.2f ms/frame over %.0f quanta/frame (%.2f us each, "
+            "EventCycles %d): events %.2f ms/frame over %.0f dispatched%s\n",
+            cpu, quanta, quanta > 0.0 ? cpu * 1000.0 / quanta : 0.0,
+            (int)EventCycles,
+            (double)psx_event_us / 1000.0 / f, (double)psx_event_n / f,
+            psx_time_events ? "" : " (event timing off)");
+
+      psx_cpu_quanta = 0;
+      psx_event_us   = 0;
+      psx_event_n    = 0;
 
       phase_skip_av  = 0;
       phase_dupe     = 0;

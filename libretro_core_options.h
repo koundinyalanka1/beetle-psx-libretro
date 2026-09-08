@@ -232,13 +232,13 @@ struct retro_core_option_v2_definition option_defs_us[] = {
          { "enabled",  NULL },
          { NULL, NULL },
       },
-      "disabled"
+      "enabled"
    },
    {
       BEETLE_OPT(gpu_diagnostics),
       "GPU Diagnostics",
       NULL,
-      "Log inline GPU command time or validate completed worker FIFO snapshots. Timing adds clock reads and should be disabled for normal play. FIFO validation waits for the worker to compare against the authoritative decoder.",
+      "Log inline GPU command time, CPU_Run quantum cost, or validate completed worker FIFO snapshots. Timing adds clock reads and should be disabled for normal play. FIFO validation waits for the worker to compare against the authoritative decoder.",
       NULL,
       "system",
       {
@@ -248,7 +248,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
          { "all", "Timing and FIFO Validation" },
          { NULL, NULL },
       },
-      "disabled"
+      "timing"
    },
 #ifndef EMSCRIPTEN
    {
