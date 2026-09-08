@@ -215,6 +215,7 @@ endif
    SOURCES_C +=   $(MEDNAFEN_DIR)/mempatcher.c \
                   $(MEDNAFEN_DIR)/rthreads_pool.c \
                   $(MEDNAFEN_DIR)/rthreads_worker.c \
+                  $(MEDNAFEN_DIR)/worker_affinity.c \
                   $(MEDNAFEN_DIR)/general.c \
                   $(MEDNAFEN_DIR)/error.c \
                   $(MEDNAFEN_DIR)/video/Deinterlacer.c \

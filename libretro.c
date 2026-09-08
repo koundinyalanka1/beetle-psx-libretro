@@ -4593,6 +4593,14 @@ static void check_variables(bool startup)
    else
       SPU_SetThreaded(true);
 
+   var.key = BEETLE_OPT(gpu_diagnostics);
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      GPU_SetDiagnostics(!strcmp(var.value, "all") ? 3u :
+            !strcmp(var.value, "timing") ? 1u :
+            !strcmp(var.value, "fifo") ? 2u : 0u);
+   else
+      GPU_SetDiagnostics(0);
+
    var.key = BEETLE_OPT(threaded_gpu);
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
       GPU_SetThreaded(strcmp(var.value, "disabled") != 0);
@@ -6686,10 +6694,11 @@ void retro_run(void)
    spec.LineWidths   = rects;
    spec.SoundBufSize = 0;
 
-   /* Start/stop the workers from this thread, so they inherit the affinity and
-    * priority the frontend gave its emulation thread, and so a renderer or
+   /* Start/stop the workers from this thread, so they inherit the priority
+    * the frontend gave its emulation thread, and so a renderer or
     * PGXP change from the option block above takes effect before this frame
-    * draws anything.  A cheap no-op when nothing changed. */
+    * draws anything. Workers can widen an inherited single-CPU pin to the
+    * app's permitted mask at startup. A cheap no-op when nothing changed. */
    {
       bool gpu_was = GPU_Worker_Active();
       bool spu_was = SPU_Worker_Active();
@@ -6724,12 +6733,16 @@ void retro_run(void)
          GPU_Worker_TakeStats(&g);
          SPU_Worker_TakeStats(&spu_us, &spu_n, &spu_jobs, &spu_busy_us);
 
+         log_cb(RETRO_LOG_WARN,
+               "Worker startup eligible CPUs: GPU %u, SPU %u (0 = off/unknown)\n",
+               GPU_Worker_CPUCount(), SPU_Worker_CPUCount());
+
          /* queue-full time is called out separately: it means the two threads
           * are both runnable and the ring is the limit, not the worker. */
          log_cb(RETRO_LOG_WARN,
                "Worker cost over %u frames: GPU busy %.2f ms/frame, sync "
                "%.2f ms/frame (%u blocked + %u spun), queue-full %.2f ms/frame "
-               "(%u stalls), %u words/frame (%u inline, %.2f ms/frame), "
+               "(%u stalls), %u words/frame (%u inline, %.2f ms/frame%s), "
                "depth %u now / %.1f avg / %u max | SPU busy "
                "%.2f ms/frame, sync %.2f ms/frame (%u waits, %u jobs/frame)\n",
                stat_frames,
@@ -6740,6 +6753,7 @@ void retro_run(void)
                g.queue_fulls,
                g.pushes / stat_frames, g.inlines / stat_frames,
                (double)g.inline_us / 1000.0 / (double)stat_frames,
+               g.inline_timed ? "" : "; per-word timing off",
                g.queue_depth,
                g.queue_depth_n ? (double)g.queue_depth_sum / (double)g.queue_depth_n : 0.0,
                g.queue_depth_max,
@@ -6747,16 +6761,16 @@ void retro_run(void)
                (double)spu_us / 1000.0 / (double)stat_frames, spu_n,
                spu_jobs / stat_frames);
 
-         /* The line that actually says whether threading can work.  A poll
-          * that collapses the queue is one the guest did not ask to be a
-          * synchronisation point; while these are non-zero the worker cannot
-          * hold any depth no matter how much GP0 arrives.  FBRead barriers
-          * are the legitimate ones - the emulated CPU asked for pixels. */
+         /* Interpret poll counts alongside measured costs. Pending commands
+          * can affect FIFO readiness at the current emulated timestamp, so
+          * some status/DMA barriers are necessary even without pixel reads. */
          log_cb(RETRO_LOG_WARN,
                "  GPU sync causes: GPUSTAT %u/frame (%u collapsed), "
+               "FIFO exact %u/frame (%u checked, %u mismatched), "
                "DMA-ready %u/frame (%u collapsed), FBRead %u/frame "
                "(%u barriers, %.2f ms readback)\n",
                g.stat_reads / stat_frames, g.stat_collapses / stat_frames,
+               g.fifo_pub / stat_frames, g.fifo_pub_checked, g.fifo_pub_mismatch,
                g.dma_polls / stat_frames, g.dma_collapses / stat_frames,
                g.fbreads / stat_frames, g.fbread_barriers / stat_frames,
                (double)g.readback_us / 1000.0 / (double)stat_frames);

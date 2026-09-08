@@ -85,6 +85,7 @@
 #include "../mednafen-types.h"
 #include "../state.h"
 #include "../state_helpers.h"
+#include "../worker_affinity.h"
 
 #include <libretro.h>
 
@@ -136,6 +137,7 @@ static uint32_t spu_queue_head = 0;
 static uint32_t spu_queue_tail = 0;
 static bool spu_worker_idle = true;
 static bool spu_worker_running = false;
+static unsigned spu_worker_cpu_count;
 static bool spu_worker_stopping = false;
 static bool spu_worker_enabled = false;
 
@@ -1770,6 +1772,9 @@ static void spu_worker_thread_loop(void *arg)
 {
    (void)arg;
 
+   __atomic_store_n(&spu_worker_cpu_count, beetle_worker_init_affinity(),
+         __ATOMIC_RELEASE);
+
    slock_lock(spu_queue_lock);
 
    for (;;)
@@ -1957,6 +1962,7 @@ void SPU_Worker_Init(void)
 
    __atomic_store_n(&spu_worker_running, true, __ATOMIC_RELEASE);
 
+   __atomic_store_n(&spu_worker_cpu_count, 0, __ATOMIC_RELEASE);
    spu_thread = sthread_create(spu_worker_thread_loop, NULL);
    if (!spu_thread)
    {
@@ -2033,6 +2039,12 @@ bool SPU_GetThreaded(void)
 bool SPU_Worker_Active(void)
 {
    return spu_worker_running;
+}
+
+unsigned SPU_Worker_CPUCount(void)
+{
+   return spu_worker_running ?
+      __atomic_load_n(&spu_worker_cpu_count, __ATOMIC_ACQUIRE) : 0;
 }
 
 /*

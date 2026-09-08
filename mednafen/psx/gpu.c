@@ -45,6 +45,7 @@
 #endif
 
 #include "../math_ops.h"
+#include "../worker_affinity.h"
 #include "../state_helpers.h"
 #include "../../rhi/rhi_intf.h"
 #include "../../rhi/tt_trace.h"
@@ -165,7 +166,13 @@ typedef struct
  * of RAM to keep the two threads actually overlapping.  Overflow beyond it
  * still degrades safely (the push blocks) rather than dropping commands.
  */
+/* The regression build forces wraparound and backpressure with short tests.
+ * Android/release builds use the normal queue and staging sizes below. */
+#ifdef BEETLE_GPU_QUEUE_STRESS_TEST
+#define GPU_QUEUE_SIZE 16
+#else
 #define GPU_QUEUE_SIZE (256 * 1024)
+#endif
 #define GPU_QUEUE_MASK (GPU_QUEUE_SIZE - 1)
 
 static gpu_cmd_t gpu_queue[GPU_QUEUE_SIZE];
@@ -195,7 +202,11 @@ static uint32_t gpu_queue_tail = 0;
  * Otherwise they are published and the normal wait applies.  Resolving the
  * buffer therefore never adds a handshake; it only ever removes one.
  */
+#ifdef BEETLE_GPU_QUEUE_STRESS_TEST
+#define GPU_STAGE_MAX 4
+#else
 #define GPU_STAGE_MAX 1024
+#endif
 
 static gpu_cmd_t gpu_stage[GPU_STAGE_MAX];
 static uint32_t gpu_stage_count = 0;
@@ -209,6 +220,7 @@ static uint32_t gpu_stage_inline_n = 0;
 static uint64_t gpu_inline_us = 0;
 /* BEETLE_PSX_GPU_TIME=1 turns on per-word timing of GP0 execution. */
 static bool gpu_time_words = false;
+static unsigned gpu_diagnostics;
 /*
  * VRAM read-back accounting.  These two decide whether the software
  * framebuffer is worth keeping.
@@ -224,9 +236,8 @@ static bool gpu_time_words = false;
  */
 static uint32_t gpu_fbread_n = 0;
 static uint64_t gpu_readback_us = 0;
-/* Times the emulation thread actually performed a deferred read-back on the
- * worker's behalf - the real synchronisation points, as opposed to the polls
- * below which should not be synchronisation points at all. */
+/* Times the emulation thread performed a deferred pixel read-back on the
+ * worker's behalf, separate from command-readiness synchronization. */
 static uint32_t gpu_fbread_barriers = 0;
 
 /*
@@ -235,14 +246,25 @@ static uint32_t gpu_fbread_barriers = 0;
  * The worker measures at zero occupancy not because there is no work but
  * because the guest polls GPUSTAT and DMA-ready between almost every short
  * burst of GP0, and each poll currently drains.  Counting the polls separately
- * from the polls that *collapsed* the queue is what turns "the worker never
- * engages" into an actionable number, and gives the success condition a shape:
- * stat_collapses and dma_collapses must reach zero.
+ * from polls that actually retire pending work distinguishes synchronization
+ * overhead from inexpensive queries. Some barriers are required for emulated
+ * timing; a low collapse count alone does not establish a performance gain.
  */
 static uint32_t gpu_stat_read_n     = 0;
 static uint32_t gpu_stat_collapse_n = 0;
 static uint32_t gpu_dma_poll_n      = 0;
 static uint32_t gpu_dma_collapse_n  = 0;
+
+/* Only the GPU executor publishes readiness, using the real decoder. A
+ * publication becomes usable for DMA only after the worker's retirement tail
+ * covers every submitted command and there are no staged words. */
+static uint8_t gpu_pub_fifo_ready;
+static bool gpu_validate_fifo;
+static uint32_t gpu_fifo_pub_n;
+static uint32_t gpu_fifo_pub_checked_n;
+static uint32_t gpu_fifo_pub_mismatch_n;
+static INLINE void GPU_PublishFIFO(void);
+
 /* Queue occupancy sampled at each push. */
 static uint32_t gpu_depth_max = 0;
 static uint64_t gpu_depth_sum = 0;
@@ -280,6 +302,7 @@ static uintptr_t gpu_worker_thread_id = 0;
 
 static bool gpu_worker_idle = true;
 static bool gpu_worker_running = false;
+static unsigned gpu_worker_cpu_count;
 static bool gpu_worker_stopping = false;
 static bool gpu_worker_enabled = false;
 
@@ -1435,6 +1458,13 @@ static INLINE bool CalcFIFOReadyBit(void)
 
    return(true);
 }
+static INLINE void GPU_PublishFIFO(void)
+{
+   if (gpu_worker_running)
+      __atomic_store_n(&gpu_pub_fifo_ready,
+            CalcFIFOReadyBit() | (gpu_fbwrite_fifo_delay ? 2 : 0),
+            __ATOMIC_RELEASE);
+}
 
 static void RHI_UpdateDisplayMode(void)
 {
@@ -1576,10 +1606,7 @@ bool GPU_Init(bool pal_clock_and_tv,
 {
    int x, y, v;
 
-   {
-      const char *e = getenv("BEETLE_PSX_GPU_TIME");
-      gpu_time_words = e && *e && *e != '0';
-   }
+   GPU_SetDiagnostics(gpu_diagnostics);
 
    /* Defensive: this reallocates GPU.vram and resets state the worker reads.
     * The lifecycle should already have stopped it (retro_unload_game and
@@ -1919,6 +1946,8 @@ void GPU_Power(void)
 
    GPU_SoftReset();
 
+   GPU_PublishFIFO();
+
    IRQ_Assert(IRQ_VBLANK, GPU.InVBlank);
    TIMER_SetVBlank(GPU.InVBlank);
 }
@@ -2255,6 +2284,9 @@ static void gpu_worker_thread_loop(void *arg)
 {
    (void)arg;
 
+   __atomic_store_n(&gpu_worker_cpu_count, beetle_worker_init_affinity(),
+         __ATOMIC_RELEASE);
+
    gpu_worker_thread_id = (uintptr_t)sthread_get_current_thread_id();
 
    slock_lock(gpu_queue_lock);
@@ -2327,6 +2359,8 @@ static void gpu_worker_thread_loop(void *arg)
                break;
             }
          }
+
+         GPU_PublishFIFO();
 
          /* Retire only after the batch has run: GPU_Worker_Sync() reads an
           * empty queue plus an idle worker as "everything is applied". */
@@ -2454,6 +2488,10 @@ void GPU_Worker_TakeStats(gpu_worker_stats_t *out)
       out->stat_collapses  = gpu_stat_collapse_n;
       out->dma_polls       = gpu_dma_poll_n;
       out->dma_collapses   = gpu_dma_collapse_n;
+      out->fifo_pub          = gpu_fifo_pub_n;
+      out->fifo_pub_checked  = gpu_fifo_pub_checked_n;
+      out->fifo_pub_mismatch = gpu_fifo_pub_mismatch_n;
+      out->inline_timed      = gpu_time_words;
       out->fbreads         = gpu_fbread_n;
       out->fbread_barriers = gpu_fbread_barriers;
       out->readback_us     = gpu_readback_us;
@@ -2466,6 +2504,9 @@ void GPU_Worker_TakeStats(gpu_worker_stats_t *out)
    gpu_stat_collapse_n = 0;
    gpu_dma_poll_n      = 0;
    gpu_dma_collapse_n  = 0;
+   gpu_fifo_pub_n          = 0;
+   gpu_fifo_pub_checked_n  = 0;
+   gpu_fifo_pub_mismatch_n = 0;
    gpu_fbread_barriers = 0;
    gpu_sync_block_us = 0;
    gpu_sync_block_n  = 0;
@@ -2525,6 +2566,8 @@ void GPU_Worker_Init(void)
    /* Published before the thread exists so IRQ commands defer CPU delivery. */
    __atomic_store_n(&gpu_worker_running, true, __ATOMIC_RELEASE);
 
+   GPU_PublishFIFO();
+   __atomic_store_n(&gpu_worker_cpu_count, 0, __ATOMIC_RELEASE);
    gpu_thread = sthread_create(gpu_worker_thread_loop, NULL);
    if (!gpu_thread)
    {
@@ -2646,9 +2689,17 @@ void GPU_SetThreaded(bool enabled)
    gpu_worker_enabled = enabled;
 }
 
+void GPU_SetDiagnostics(unsigned flags)
+{
+   const char *e = getenv("BEETLE_PSX_GPU_TIME");
+   gpu_diagnostics = flags;
+   gpu_time_words = (flags & 1) || (e && *e && *e != '0');
+   gpu_validate_fifo = (flags & 2) != 0;
+}
+
 /* Call once per frame from the emulation thread, after option handling and
- * before CPU_Run().  Starting here (rather than at load) means the thread
- * inherits this thread's affinity and priority; re-checking here means a
+ * before CPU_Run(). Starting here inherits the emulation thread's priority;
+ * the worker can widen an inherited single-CPU pin at startup. Re-checking here means a
  * mid-session renderer or PGXP change takes effect before the next frame's
  * drawing rather than one frame late. */
 void GPU_Worker_Refresh(void)
@@ -2676,15 +2727,24 @@ bool GPU_Worker_Active(void)
    return gpu_worker_running;
 }
 
-static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
+unsigned GPU_Worker_CPUCount(void)
+{
+   return gpu_worker_running ?
+      __atomic_load_n(&gpu_worker_cpu_count, __ATOMIC_ACQUIRE) : 0;
+}
+
+static void GPU_Worker_PushMany(const gpu_cmd_t *entries, uint32_t count)
 {
    uint32_t head;
+   uint32_t contiguous;
 
-   if (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
+   assert(count && count < GPU_QUEUE_SIZE);
+
+   if (GPU_Queue_Count() > (GPU_QUEUE_SIZE - 1 - count) && !gpu_worker_stopping)
    {
       retro_time_t t0 = cpu_features_get_time_usec();
 
-      while (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
+      while (GPU_Queue_Count() > (GPU_QUEUE_SIZE - 1 - count) && !gpu_worker_stopping)
       {
          /* The worker may be parked on a published read-back rather than
           * merely behind.  Kicking it would achieve nothing - it is waiting
@@ -2697,7 +2757,7 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
          /* Kick the worker in case it is parked, then re-test under the lock
           * so a not_full signal raised in between can't be missed. */
          scond_broadcast(gpu_queue_not_empty);
-         if (GPU_Queue_Count() >= (GPU_QUEUE_SIZE - 1) && !gpu_worker_stopping)
+         if (GPU_Queue_Count() > (GPU_QUEUE_SIZE - 1 - count) && !gpu_worker_stopping)
             scond_wait_timeout(gpu_queue_not_full, gpu_queue_lock,
                   GPU_WORKER_WAIT_US);
          slock_unlock(gpu_queue_lock);
@@ -2712,20 +2772,24 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
 
    {
       uint32_t depth = GPU_Queue_Count();
-      gpu_depth_sum += depth;
-      gpu_depth_n++;
-      if (depth > gpu_depth_max)
-         gpu_depth_max = depth;
+      gpu_depth_sum += (uint64_t)count * depth + (uint64_t)count * (count - 1) / 2;
+      gpu_depth_n += count;
+      if (depth + count - 1 > gpu_depth_max)
+         gpu_depth_max = depth + count - 1;
    }
 
    head = __atomic_load_n(&gpu_queue_head, __ATOMIC_RELAXED);
-   gpu_queue[head].type = type;
-   gpu_queue[head].data = data;
-   gpu_queue[head].addr = addr;
+   contiguous = GPU_QUEUE_SIZE - head;
+   if (contiguous > count)
+      contiguous = count;
+   memcpy(gpu_queue + head, entries, contiguous * sizeof(*entries));
+   if (count > contiguous)
+      memcpy(gpu_queue, entries + contiguous,
+            (count - contiguous) * sizeof(*entries));
 
-   /* Publish the entry, then look at the worker: see the comment on
+   /* Publish the batch, then look at the worker: see the comment on
     * gpu_worker_thread_loop() for why both must be sequentially consistent. */
-   __atomic_store_n(&gpu_queue_head, (head + 1) & GPU_QUEUE_MASK,
+   __atomic_store_n(&gpu_queue_head, (head + count) & GPU_QUEUE_MASK,
          __ATOMIC_SEQ_CST);
 
    if (__atomic_load_n(&gpu_worker_idle, __ATOMIC_SEQ_CST))
@@ -2734,6 +2798,15 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
       scond_broadcast(gpu_queue_not_empty);
       slock_unlock(gpu_queue_lock);
    }
+}
+
+static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
+{
+   gpu_cmd_t entry;
+   entry.type = type;
+   entry.data = data;
+   entry.addr = addr;
+   GPU_Worker_PushMany(&entry, 1);
 }
 
 /* True when everything older than the staging buffer has already been applied,
@@ -2746,15 +2819,14 @@ static bool GPU_Stage_CanRunInline(void)
 
 static void GPU_Stage_Publish(void)
 {
-   uint32_t i;
    uint32_t n = gpu_stage_count;
 
    /* Cleared up front: GPU_Worker_Push() can block on a full ring, and nothing
     * it reaches may observe a staging buffer that is already in flight. */
    gpu_stage_count = 0;
 
-   for (i = 0; i < n; i++)
-      GPU_Worker_Push(GPU_CMD_GP0, gpu_stage[i].data, gpu_stage[i].addr);
+   if (n)
+      GPU_Worker_PushMany(gpu_stage, n);
 }
 
 /* Retire the staging buffer: inline when the worker has nothing outstanding,
@@ -2784,6 +2856,7 @@ static void GPU_Stage_Resolve(void)
 
       gpu_inline_us += (uint64_t)(cpu_features_get_time_usec() - t0);
    }
+   GPU_PublishFIFO();
 }
 
 /*
@@ -2850,6 +2923,8 @@ void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
       if ((V >> 24) != 0x04)
          GPU_Worker_Sync();
       GPU_WriteGP1_Internal(V);
+      if ((V >> 24) != 0x04)
+         GPU_PublishFIFO();
    }
    else        /* GP0 ("Data") */
    {
@@ -2907,6 +2982,7 @@ static INLINE uint32_t GPU_ReadData(void)
       }
    }
 
+   GPU_PublishFIFO();
    return GPU.DataReadBufferEx;
 }
 
@@ -3181,6 +3257,7 @@ int32_t GPU_Update(const int32_t sys_timestamp)
          if (GPU_Stage_CanRunInline())
          {
             GPU_AdvanceDrawing(draw_clocks, draw_limit);
+            GPU_PublishFIFO();
             GPU_ApplyIRQ();
          }
          else
@@ -3893,6 +3970,7 @@ void GPU_RestoreStateP3(void)
    rhi_intf_set_tex_window(GPU.tww, GPU.twh, GPU.twx, GPU.twy);
 
    FastFIFO_SaveStatePostLoad(&GPU_BlitterFIFO);
+   GPU_PublishFIFO();
    GPU_ApplyIRQ();
 
    GPU.HorizStart &= 0xFFF;
@@ -4129,14 +4207,39 @@ uint8_t GPU_get_upscale_shift(void)
 bool GPU_DMACanWrite(void)
 {
    gpu_dma_poll_n++;
+   if (!gpu_worker_running)
+      return CalcFIFOReadyBit();
+
+   /* An empty host queue is not an empty PS1 FIFO. It only proves that the
+    * published PS1 answer covers every preceding write/clock event. The
+    * acquire of tail pairs with publication before worker retirement. */
+   if (!gpu_stage_count && !gpu_irq_command_possible && GPU_Queue_Empty())
+   {
+      uint8_t published = __atomic_load_n(&gpu_pub_fifo_ready, __ATOMIC_ACQUIRE);
+      /* Disc changes and compatibility options can change the FBWrite
+       * threshold between frames. Reject an answer using the old setting. */
+      if ((published & 2) == (gpu_fbwrite_fifo_delay ? 2 : 0))
+      {
+         bool ready = published & 1;
+         gpu_fifo_pub_n++;
+         if (gpu_validate_fifo)
+         {
+            bool actual;
+            GPU_Worker_Sync();
+            actual = CalcFIFOReadyBit();
+            gpu_fifo_pub_checked_n++;
+            if (ready != actual)
+               gpu_fifo_pub_mismatch_n++;
+            return actual;
+         }
+         return ready;
+      }
+   }
+
    if (GPU_Sync_Would_Collapse())
       gpu_dma_collapse_n++;
-
-   /* DMA tests this at block boundaries. Apply the preceding block before
-    * testing the PS1 FIFO; the host work queue is not a hardware FIFO.
-    *
-    * Same story as the status read: CalcFIFOReadyBit() is a function of the
-    * emulated command FIFO, which the emulation thread could maintain itself. */
+   /* Unretired work can change readiness at this emulated timestamp. Keep
+    * the barrier: returning a stale answer would expose host scheduling. */
    GPU_Worker_Sync();
    return CalcFIFOReadyBit();
 }

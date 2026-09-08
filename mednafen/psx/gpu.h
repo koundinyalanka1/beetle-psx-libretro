@@ -371,12 +371,18 @@ typedef struct
 
    /* Why the pipeline collapsed.  A "collapse" is any point where the
     * emulation thread had to make the worker's progress observable - whether
-    * it blocked, spun, or resolved the staging buffer inline.  The target for
-    * status and DMA-ready polling is zero. */
+    * it blocked, spun, or resolved the staging buffer inline. Required timing
+    * barriers can remain even when synchronization is inexpensive. */
    uint32_t stat_reads;
    uint32_t stat_collapses;
    uint32_t dma_polls;
    uint32_t dma_collapses;
+   /* Exact snapshot hits require all preceding work to be retired.
+    * Optional diagnostics compare those hits with the drained decoder. */
+   uint32_t fifo_pub;
+   uint32_t fifo_pub_checked;
+   uint32_t fifo_pub_mismatch;
+   bool inline_timed;
    /* GP0 C0h: the one synchronisation the emulated machine really asks for. */
    uint32_t fbreads;
    uint32_t fbread_barriers;
@@ -384,6 +390,9 @@ typedef struct
 } gpu_worker_stats_t;
 
 void GPU_Worker_TakeStats(gpu_worker_stats_t *out);
+/* bit 0: GP0 timing, bit 1: validate retired FIFO snapshots. */
+void GPU_SetDiagnostics(unsigned flags);
+unsigned GPU_Worker_CPUCount(void);
 
 #ifdef __cplusplus
 }

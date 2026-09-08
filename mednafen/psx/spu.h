@@ -110,6 +110,7 @@ void     SPU_SetThreaded(bool enabled);
 bool     SPU_GetThreaded(void);
 bool     SPU_Worker_Active(void);
 void     SPU_Worker_Refresh(void);
+unsigned SPU_Worker_CPUCount(void);
 /* Read-and-reset; see GPU_Worker_TakeStats. */
 void     SPU_Worker_TakeStats(uint64_t *blocked_us, uint32_t *blocks,
                               uint32_t *jobs, uint64_t *busy_us);

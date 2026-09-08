@@ -224,12 +224,28 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       BEETLE_OPT(threaded_gpu),
       "Threaded GPU (Graphics)",
       NULL,
-      "Offload GPU drawing commands to a worker thread so they overlap CPU emulation. Off by default because on this system it does not work: the guest polls GPUSTAT and the DMA-ready handshake roughly every four GP0 words, and every poll has to make the worker's progress observable, so the queue collapses before it can hold anything. Measured across two devices, zero of ~150,000 GP0 words per session ever reached the worker while it still cost a thread and a staged copy of every word. Enable it only if you are measuring the worker log yourself. Not available on the software renderer, which scans VRAM out from the emulation thread.",
+      "Offload GPU command execution to a worker thread. Performance depends on the game's synchronization pattern and available CPU resources. Short bursts can execute inline; DMA and status reads preserve emulated FIFO timing. Not available with the software renderer. Use GPU Diagnostics to measure before enabling for a device or game.",
       NULL,
       "system",
       {
          { "disabled", NULL },
          { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+   {
+      BEETLE_OPT(gpu_diagnostics),
+      "GPU Diagnostics",
+      NULL,
+      "Log inline GPU command time or validate completed worker FIFO snapshots. Timing adds clock reads and should be disabled for normal play. FIFO validation waits for the worker to compare against the authoritative decoder.",
+      NULL,
+      "system",
+      {
+         { "disabled", "Disabled" },
+         { "timing", "Command Timing" },
+         { "fifo", "FIFO Validation" },
+         { "all", "Timing and FIFO Validation" },
          { NULL, NULL },
       },
       "disabled"

@@ -37,8 +37,33 @@ GLHOST_SYSTEM_DIR=/tmp/gpu-bios GLHOST_SAVE_DIR=/tmp/gpu-save \
 ```
 
 Repeat at 2x resolution, with `GLHOST_RECREATE_AT=3`, and with the software
-framebuffer enabled. The report must pass all 19 cases (701 words).
+framebuffer enabled. The report must pass all 22 cases (1,734 words).
 Use `--unmapped-probes 1024` to exercise Lightrec's completed unmapped loads;
 test both `execute` and `run_interpreter` and check that no "until reset"
 fallback is logged. Software cores use the `beetle_psx_cpu_dynarec` option key.
 These BIOS files are only for this test, not game compatibility testing.
+
+Use `--dma` to send drawing commands through DMA2 linked lists. The streamed
+upload crosses packet boundaries; quad and polyline checks exercise continuation
+decoding. Readback verifies every transferred word. The polyline check verifies
+that its terminator releases the decoder for the next primitive, without relying
+on native GL line pixel coverage.
+
+The automated hardware-core matrix runs both PIO and DMA, compares threading
+on/off RAM, scratchpad, audio and video hashes for 320 frames, and exercises
+diagnostics, save/load on every frame, context recreation, 2x rendering and the
+software framebuffer:
+
+```
+python3 tools/multicore/check_gpu.py /path/to/hardware-core \
+  --output /tmp/gpu-check
+```
+
+The harness needs a working local graphics context. FIFO validation must exercise
+at least one exact snapshot and report zero mismatches. Normal tests can remain
+entirely inline because the production staging threshold is 1,024 words.
+For queue coverage, build a separate core with
+`EXTRA_FLAGS=-DBEETLE_GPU_QUEUE_STRESS_TEST` and run the matrix with
+`--require-worker-queue`. This uses the production queue implementation with a
+16-entry ring and four-word staging buffer, forcing handoffs and frequent
+wraparound. Never ship this stress build or use its speed to choose defaults.

@@ -138,20 +138,68 @@ def cmd_colour(op, c):
     return (op << 24) | (b << 16) | (g << 8) | r
 
 
-def build(unmapped_probes=0):
+def build(unmapped_probes=0, dma=False):
     a = Asm(LOAD_ADDR)
     cases = []
+    pending = []
+    transfers = 0
+
+    def flush():
+        """Submit actual DMA2 linked-list packets, including split commands."""
+        nonlocal transfers
+        if not pending:
+            return
+        transfers += 1
+        base = 0x000A0000
+        packet = []
+        for start in range(0, len(pending), 255):
+            words = pending[start:start + 255]
+            next_addr = base + 4 * (len(packet) + len(words) + 1)
+            if start + len(words) == len(pending):
+                next_addr = 0xFFFFFF
+            packet.append((len(words) << 24) | next_addr)
+            packet.extend(words)
+        assert len(packet) * 4 < 0x8000  # signed store offset
+        a.li(T1, base | 0x80000000)
+        for i, word in enumerate(packet):
+            a.li(T0, word)
+            a.sw(T0, i * 4, T1)
+        pending.clear()
+        a.li(T0, 0x04000002)       # GP1 DMA direction: CPU -> GPU
+        a.sw(T0, 0, S1)
+        a.li(T1, 0x1F8010A0)      # DMA2 MADR/BCR/CHCR; DPCR at +0x50
+        a.lw(T0, 0x50, T1)
+        a.nop()                   # R3000 load delay
+        a.ori(T0, T0, 0x0800)     # enable DMA2, preserve other priorities
+        a.sw(T0, 0x50, T1)
+        a.li(T0, base)
+        a.sw(T0, 0, T1)
+        a.sw(ZERO, 4, T1)
+        a.li(T0, 0x01000401)      # linked list, from RAM, start
+        a.sw(T0, 8, T1)
+        label = "wait_dma_%d" % transfers
+        a.label(label)
+        a.lw(T0, 8, T1)
+        a.lui(T2, 0x0100)
+        a.and_(T0, T0, T2)
+        a.bne(T0, ZERO, label)
+        a.nop()
 
     def gp0(word):
-        a.li(T0, word)
-        a.sw(T0, 0, S0)
+        if dma:
+            pending.append(word)
+        else:
+            a.li(T0, word)
+            a.sw(T0, 0, S0)
 
     def gp1(word):
+        flush()
         a.li(T0, word)
         a.sw(T0, 0, S1)
 
     def check(x, y, w, h, expected, tag):
         """Read back w*h pixels at (x,y) and compare every word to expected."""
+        flush()
         cases.append(tag)
         a.li(A0, (y << 16) | x)
         a.li(A1, (h << 16) | w)
@@ -266,6 +314,25 @@ def build(unmapped_probes=0):
         gp0((y << 16) | x)
         gp0((h << 16) | w)
 
+    # Larger than both the host staging buffer and a linked-list packet;
+    # the upload remains in progress across four packet boundaries.
+    upload(0, 100, 1024, 2, 0x12341234)
+    check(0, 100, 1024, 2, 0x12341234, "streamed_upload")
+
+    # Quad and polyline continuations have special FIFO readiness rules.
+    gp0(cmd_colour(0x28, C1))
+    for x, y in ((200, 160), (232, 160), (200, 180), (232, 180)):
+        gp0((y << 16) | x)
+    check(208, 168, 8, 2, two(bgr555(*C1)), "quad_continuation")
+    gp0(cmd_colour(0x48, C2))
+    for x in (200, 216, 232):
+        gp0((190 << 16) | x)
+    gp0(0x50005000)
+    # Check that the terminator releases the decoder for the next command.
+    # Native GL line coverage depends on the backend's pixel-center rules.
+    rect(240, 190, 2, 1, C2)
+    check(240, 190, 2, 1, two(bgr555(*C2)), "polyline_termination")
+
     upload(300, 300, 8, 1, 0x80018001)
     gp0(0xE6000002)
     upload(300, 300, 8, 1, 0x001F001F)
@@ -323,6 +390,7 @@ def build(unmapped_probes=0):
     rect(0, 480, 16, 1, C2)
     rect(1022, 511, 2, 1, C3)
     upload(640, 256, 2, 1, 0x11111111)
+    flush()
     a.li(T7, 800000)
     a.label("wait_frames")
     a.addiu(T7, T7, -1)
@@ -433,6 +501,8 @@ def main():
     parser.add_argument("--bios-dir", type=Path, help="write a minimal test-only reset BIOS here")
     parser.add_argument("--unmapped-probes", type=int, default=0,
                         help="issue completed unmapped loads before the GPU checks")
+    parser.add_argument("--dma", action="store_true",
+                        help="send drawing commands via DMA2 linked lists instead of PIO")
     args = parser.parse_args()
     if not 0 <= args.unmapped_probes <= 0x7fffffff:
         parser.error("unmapped-probes must be between 0 and 2147483647")
@@ -444,7 +514,7 @@ def main():
         struct.pack_into("<IIII", bios, 0, 0x3C08BF00, 0x35081000, 0x01000008, 0)
         for name in ("scph5500.bin", "scph5501.bin", "scph5502.bin"):
             (args.bios_dir / name).write_bytes(bios)
-    text, cases = build(args.unmapped_probes)
+    text, cases = build(args.unmapped_probes, args.dma)
 
     # Pad the text to the 2048-byte granularity a PS-X EXE header declares.
     if len(text) % 2048:
