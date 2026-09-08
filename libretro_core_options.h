@@ -248,7 +248,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
          { "all", "Timing and FIFO Validation" },
          { NULL, NULL },
       },
-      "timing"
+      "disabled"
    },
 #ifndef EMSCRIPTEN
    {

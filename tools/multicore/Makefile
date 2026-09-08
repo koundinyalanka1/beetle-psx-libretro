@@ -6,10 +6,15 @@ THREADS := $(ROOT)/libretro-common/rthreads/rthreads.c
 AFFINITY := $(ROOT)/mednafen/worker_affinity.c
 
 .PHONY: check
-check: $(BUILD_DIR)/spu $(BUILD_DIR)/workers $(BUILD_DIR)/affinity
+check: $(BUILD_DIR)/spu $(BUILD_DIR)/workers $(BUILD_DIR)/affinity $(BUILD_DIR)/gpu-timing $(BUILD_DIR)/recompiler
 	$(BUILD_DIR)/spu
 	$(BUILD_DIR)/workers
 	$(BUILD_DIR)/affinity
+	$(BUILD_DIR)/gpu-timing
+	$(BUILD_DIR)/recompiler
+
+$(BUILD_DIR)/recompiler: recompiler.c thread_faults.h $(ROOT)/deps/lightrec/recompiler.c $(THREADS) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -D_GNU_SOURCE -D__LIBRETRO__ -DENABLE_THREADED_COMPILER=1 -DLOG_LEVEL=0 -I$(ROOT)/include -I$(ROOT)/deps/lightning/include recompiler.c $(THREADS) -pthread -o $@
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -19,6 +24,9 @@ $(BUILD_DIR)/spu: spu.c thread_faults.h $(ROOT)/mednafen/psx/spu.c $(THREADS) $(
 
 $(BUILD_DIR)/affinity: affinity.c $(AFFINITY) $(ROOT)/mednafen/worker_affinity.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) affinity.c -o $@
+
+$(BUILD_DIR)/gpu-timing: gpu_timing.c $(ROOT)/mednafen/psx/gpu_timing.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) gpu_timing.c -o $@
 
 ifeq ($(shell uname -s),Linux)
 check: check-affinity-linux

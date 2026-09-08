@@ -12,6 +12,9 @@
  * undef keeps lightrec's own definition in force for lightrec code. */
 #include <rthreads/rthreads.h>
 #include <features/features_cpu.h>
+#ifdef __LIBRETRO__
+#include "../../mednafen/worker_affinity.h"
+#endif
 #undef ARRAY_SIZE
 
 #include "blockcache.h"
@@ -176,21 +179,26 @@ static void lightrec_recompiler_thd(void *d)
 	struct recompiler_thd *thd = d;
 	struct recompiler *rec = container_of(thd, struct recompiler, thds[thd->tid]);
 
+#ifdef __LIBRETRO__
+	beetle_worker_init_affinity();
+#endif
 	slock_lock(rec->mutex);
 
 	while (!rec->stop) {
-		do {
+		/* Work can arrive before this thread first acquires the mutex.
+		 * Test the predicate before sleeping so that first job is not
+		 * left interpreted until some unrelated compilation wakes us.
+		 * Entries already compiling belong to other workers: sleep so
+		 * they can acquire the mutex again to retire those entries. */
+		while (!rec->stop && (rec->pause || !lightrec_get_best_elm(&rec->slist)))
 			scond_wait(rec->cond, rec->mutex);
 
-			if (rec->stop)
-				goto out_unlock;
-
-		} while (rec->pause || slist_empty(&rec->slist));
+		if (rec->stop)
+			break;
 
 		lightrec_compile_list(rec, thd);
 	}
 
-out_unlock:
 	slock_unlock(rec->mutex);
 }
 
@@ -258,8 +266,16 @@ struct recompiler *lightrec_recompiler_init(struct lightrec_state *state)
 		rec->thds[i].thd = sthread_create(lightrec_recompiler_thd,
 						  &rec->thds[i]);
 		if (!rec->thds[i].thd) {
+			unsigned int started;
 			pr_err("Cannot create recompiler thread\n");
-				/* TODO: Handle cleanup properly */
+			/* Earlier workers can already be waiting on these objects.
+			 * Join them before the shared mutex/conditions/cstates go away. */
+			slock_lock(rec->mutex);
+			rec->stop = true;
+			scond_broadcast(rec->cond);
+			slock_unlock(rec->mutex);
+			for (started = 0; started < i; started++)
+				sthread_join(rec->thds[started].thd);
 			goto err_mtx_destroy;
 		}
 	}
@@ -289,10 +305,9 @@ void lightrec_free_recompiler(struct recompiler *rec)
 {
 	unsigned int i;
 
-	rec->stop = true;
-
 	/* Stop the thread */
 	slock_lock(rec->mutex);
+	rec->stop = true;
 	scond_broadcast(rec->cond);
 	lightrec_cancel_list(rec);
 	slock_unlock(rec->mutex);
@@ -498,9 +513,8 @@ void lightrec_code_alloc_unlock(struct lightrec_state *state)
 
 void lightrec_recompiler_pause(struct recompiler *rec)
 {
-	rec->pause = true;
-
 	slock_lock(rec->mutex);
+	rec->pause = true;
 	scond_broadcast(rec->cond);
 	lightrec_cancel_list(rec);
 	slock_unlock(rec->mutex);
@@ -508,5 +522,8 @@ void lightrec_recompiler_pause(struct recompiler *rec)
 
 void lightrec_recompiler_unpause(struct recompiler *rec)
 {
+	slock_lock(rec->mutex);
 	rec->pause = false;
+	scond_broadcast(rec->cond);
+	slock_unlock(rec->mutex);
 }

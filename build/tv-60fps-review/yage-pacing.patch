@@ -1,0 +1,169 @@
+--- a/native/yage_frame_loop.c
++++ b/native/yage_frame_loop.c
+@@ -28,6 +28,7 @@
+ #endif
+ 
+ #include "yage_internal.h"
++#include "yage_frame_pacing.h"
+ 
+ #ifndef _WIN32
+ 
+@@ -1582,39 +1583,16 @@
+             diag_time = now;
+         }
+ 
+-        int64_t next_emu_ns     = target_ns - emu_accum_ns;
+-        int64_t next_display_ns = DISPLAY_INTERVAL_NS - display_accum_ns;
+-        int64_t sleep_ns = next_emu_ns < next_display_ns ? next_emu_ns : next_display_ns;
+-
+-        /* A refused gate leaves emu_accum_ns above target, which makes both
+-         * deltas negative and skips the sleep entirely — so the loop spun at
+-         * full CPU, re-asking a gate that was going to say no again and
+-         * logging a line each time. A capture of one 30-second SRAM auto-save
+-         * shows 358 of them back to back. Nothing can run until the owner
+-         * releases, so wait a frame instead of burning one. */
+-        if (gate_refused && sleep_ns < target_ns) sleep_ns = target_ns;
+-
+-        /* Never hot-spin waiting for a display tick that cannot be serviced.
+-         *
+-         * The blit is gated on `frames_run > 0` — it only runs in an iteration
+-         * that also emulated a frame. So once the display tick falls due,
+-         * display_accum_ns keeps growing until the NEXT emulated frame, which
+-         * makes next_display_ns negative, which makes sleep_ns negative, which
+-         * skips the sleep below entirely. The loop then span at full CPU for
+-         * most of every frame interval, on a thread deliberately pinned to a
+-         * big core and raised to nice -8.
+-         *
+-         * A capture measures it directly: loop=0.0ms (a mean iteration under
+-         * 50 microseconds, i.e. thousands of iterations per emulated frame)
+-         * with slept=0.0ms beside it. The cost is not just the wasted core —
+-         * it is the heat, and the throttling that follows it is the most
+-         * likely reason the same captures cannot hold 59.94.
+-         *
+-         * Waiting on an overdue display tick achieves nothing because only an
+-         * emulated frame can clear it, so wait for that instead. */
+-        if (sleep_ns <= 0) {
+-            sleep_ns = (next_emu_ns > 0) ? next_emu_ns : 1000000; /* 1 ms */
+-        }
++        /* The accumulators describe iteration START. Include work already
++         * completed before deciding whether the next emulated frame is due.
++         * Leave accumulator updates to the top of the next iteration so this
++         * elapsed time is counted exactly once. */
++        struct timespec pace_now;
++        clock_gettime(CLOCK_MONOTONIC, &pace_now);
++        int64_t work_ns = (pace_now.tv_sec - now.tv_sec) * 1000000000LL
++                       + (pace_now.tv_nsec - now.tv_nsec);
++        int64_t sleep_ns = yage_frame_sleep_ns(target_ns, emu_accum_ns,
++                DISPLAY_INTERVAL_NS, display_accum_ns, work_ns, gate_refused);
+ 
+         if (sleep_ns > 500000) {
+             struct timespec ts, s0, s1;
+--- /dev/null
++++ b/native/yage_frame_pacing.h
+@@ -0,0 +1,22 @@
++#ifndef YAGE_FRAME_PACING_H
++#define YAGE_FRAME_PACING_H
++#include <stdint.h>
++
++static inline int64_t yage_frame_sleep_ns(int64_t target_ns, int64_t emu_accum_ns,
++        int64_t display_interval_ns, int64_t display_accum_ns,
++        int64_t work_ns, int gate_refused)
++{
++    int64_t next_emu_ns, next_display_ns;
++    /* A lifecycle operation owns the core: back off rather than spin. */
++    if (gate_refused) return target_ns;
++    if (work_ns < 0) work_ns = 0;
++    next_emu_ns = target_ns - emu_accum_ns - work_ns;
++    next_display_ns = display_interval_ns - display_accum_ns - work_ns;
++    /* An overdue emulation deadline is real work, so run the next iteration.
++     * An overdue display deadline alone cannot be serviced: presentation
++     * requires a newly emulated frame. Wait for that frame instead. */
++    if (next_emu_ns <= 0) return 0;
++    if (next_display_ns <= 0) return next_emu_ns;
++    return next_emu_ns < next_display_ns ? next_emu_ns : next_display_ns;
++}
++#endif
+--- /dev/null
++++ b/native/test/test_frame_pacing.c
+@@ -0,0 +1,24 @@
++#include <assert.h>
++#include <stdio.h>
++#include "../yage_frame_pacing.h"
++
++#define MS(n) ((int64_t)(n) * 1000000)
++
++int main(void)
++{
++    /* Core/presentation time consumes the remaining frame budget. */
++    assert(yage_frame_sleep_ns(MS(17), 0, MS(17), 0, MS(9), 0) == MS(8));
++    assert(yage_frame_sleep_ns(MS(17), 0, MS(17), 0, MS(42), 0) == 0);
++    assert(yage_frame_sleep_ns(MS(17), MS(30), MS(17), 0, MS(42), 0) == 0);
++    /* Expired display tick cannot force a hot spin before emulation is due. */
++    assert(yage_frame_sleep_ns(MS(17), MS(5), MS(17), MS(20), MS(1), 0) == MS(11));
++    assert(yage_frame_sleep_ns(MS(17), 0, MS(17), MS(14), MS(1), 0) == MS(2));
++    /* Gate backoff remains intact even when emulation is overdue. */
++    assert(yage_frame_sleep_ns(MS(17), MS(50), MS(17), MS(50), MS(42), 1) == MS(17));
++    /* Same scheduling arithmetic for PAL and explicit speed changes. */
++    assert(yage_frame_sleep_ns(MS(20), 0, MS(17), 0, MS(10), 0) == MS(7));
++    assert(yage_frame_sleep_ns(MS(4), 0, MS(17), 0, MS(3), 0) == MS(1));
++    assert(yage_frame_sleep_ns(MS(68), MS(30), MS(17), MS(50), MS(2), 0) == MS(36));
++    puts("Frame pacing: completed work, overdue frames, display-only waits, gate backoff and speed changes passed");
++    return 0;
++}
+--- a/native/test/CMakeLists.txt
++++ b/native/test/CMakeLists.txt
+@@ -1,5 +1,7 @@
+ cmake_minimum_required(VERSION 3.16)
+ project(yage_native_tests C)
++
++add_executable(test_frame_pacing test_frame_pacing.c)
+ 
+ set(CMAKE_C_STANDARD 11)
+ set(CMAKE_C_STANDARD_REQUIRED ON)
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -854,6 +854,15 @@
+ 
+ **Speed control:** Frame interval = `(1/fps) / speedMultiplier`. Supported range: 0.25× (slow motion) to 8× (fast forward). Fast-forward is always available on every game: the phone HUD button, Select+R1, Tab, and the pause-menu speed chips all go through `EmulatorService.setSpeed` / `toggleFastForward`. Select+R1 is `LogicalKeyboardKey.gameButtonSelect` (the physical Select/View button), not `PadSlot.select` — see §4.5. A former Settings **Turbo Mode** switch could disable that; it is retired (`enableTurbo` in old JSON is ignored). **Turbo Speed** in Settings still sets the HUD/hotkey multiplier (default 2×).
+ 
++The native loop's sleep decision includes the time spent in the current
++iteration (core execution, achievement evaluation and presentation). Accumulators
++are still updated only at the next iteration start, so elapsed time is counted
++once. An overdue emulation deadline runs immediately; an overdue display tick
++alone waits for the next emulated frame. A refused lifecycle gate retains a
++full-frame backoff. `native/test/test_frame_pacing.c` covers these cases, PAL
++and explicit speed changes. This removes frontend oversleep; it cannot make a
++core whose execution exceeds the frame budget sustain full speed.
++
+ ### 4.9.1 Core options: registry, preset, and the *effective* default
+ 
+ Three layers decide the value a core actually receives, applied in this order inside
+--- a/docs/IMPLEMENTATION_PROGRESS.md
++++ b/docs/IMPLEMENTATION_PROGRESS.md
+@@ -2,6 +2,26 @@
+ 
+ **Last updated:** 2026-08-31  
+ **Agent entry:** Read `AGENTS.md` first; this document tracks remediation status. Deep architecture is in `docs/ARCHITECTURE.md`. Crash/ANR signatures are in `docs/ANDROID_FAILURE_BASELINE.md`.
++
++## PS1 TV frame-loop pacing (2026-09-08)
++
++The latest PID 17931 capture has working GPU presentation and correct PS1 audio
++batch size (`spf_in` and `spf_out` about 736). Heavy frames take 40–42 ms, while
++the loop adds roughly 3.6–3.7 ms of sleep. The sleep deadline was calculated
++from accumulators sampled before `retro_run`, excluding the current iteration's
++work. It also imposed a 1 ms sleep when emulation was already overdue.
++
++The sleep calculation now subtracts completed iteration work and returns zero
++when the next emulated frame is due. An overdue display-only deadline still
++waits for emulation, preserving the hot-spin fix; lifecycle gate refusal still
++backs off by a frame. Audio samples, the core clock and one achievement
++evaluation per emulated frame are unchanged.
++
++Host validation: frame-pacing policy, lifecycle, state-policy, presentation
++geometry and Vulkan chooser tests. Device validation remains required. This
++fix removes avoidable waiting; it does not establish 60 FPS or resolve the
++core's heavy-scene execution cost. Do not mask underproduction by discarding,
++repeating or fabricating audio frames.
+ 
+ ## GPU presentation on every Android ABI (2026-09-07)
+ 

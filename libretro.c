@@ -199,6 +199,9 @@ uint64_t psx_cpu_quanta      = 0;
 static uint64_t psx_event_us = 0;
 static uint64_t psx_event_n  = 0;
 static bool     psx_time_events = false;
+static uint64_t psx_event_type_us[PSX_EVENT__COUNT];
+static uint32_t psx_event_type_n[PSX_EVENT__COUNT];
+static uint32_t psx_event_type_samples[PSX_EVENT__COUNT];
 
 /* CPU overclock factor (or 0 if disabled) */
 int32_t psx_overclock_factor = 0;
@@ -1523,6 +1526,8 @@ void ForceEventUpdates(const int32_t timestamp)
 bool MDFN_FASTCALL PSX_EventHandler(const int32_t timestamp)
 {
    struct event_list_entry *e = events[PSX_EVENT__SYNFIRST].next;
+   if (timestamp < e->event_time)
+      return Running;
    /* Timed here rather than around the CPU_Run call sites so the memory
     * handlers' own dispatches are counted too - they are event cost as much
     * as the loop's are, and leaving them out would understate the total. */
@@ -1532,6 +1537,9 @@ bool MDFN_FASTCALL PSX_EventHandler(const int32_t timestamp)
    {
       int32_t nt;
       struct event_list_entry *prev = e->prev;
+      unsigned which = e->which;
+      bool sample = psx_time_events && ((psx_event_type_n[which]++ & 63) == 0);
+      retro_time_t sample_start = sample ? cpu_features_get_time_usec() : 0;
 
       psx_event_n++;
 
@@ -1554,6 +1562,12 @@ bool MDFN_FASTCALL PSX_EventHandler(const int32_t timestamp)
          case PSX_EVENT_FIO:
             nt = FrontIO_Update(PSX_FIO, e->event_time);
             break;
+      }
+
+      if (sample)
+      {
+         psx_event_type_us[which] += cpu_features_get_time_usec() - sample_start;
+         psx_event_type_samples[which]++;
       }
 
       PSX_SetEventNT(e->which, nt);
@@ -4636,9 +4650,8 @@ static void check_variables(bool startup)
    }
    else
    {
-      /* Matches the core option's own default (timing). */
-      GPU_SetDiagnostics(1);
-      psx_time_events = true;
+      GPU_SetDiagnostics(0);
+      psx_time_events = false;
    }
 
    var.key = BEETLE_OPT(threaded_gpu);
@@ -7183,6 +7196,24 @@ void retro_run(void)
             (int)EventCycles,
             (double)psx_event_us / 1000.0 / f, (double)psx_event_n / f,
             psx_time_events ? "" : " (event timing off)");
+
+      if (psx_time_events)
+      {
+         unsigned event;
+         double estimate[PSX_EVENT__COUNT] = {0};
+         for (event = PSX_EVENT_GPU; event <= PSX_EVENT_FIO; event++)
+            if (psx_event_type_samples[event])
+               estimate[event] = (double)psx_event_type_us[event] *
+                  psx_event_type_n[event] / psx_event_type_samples[event] / 1000.0 / f;
+         log_cb(RETRO_LOG_WARN,
+               "  Event handlers estimated ms/frame (1/64 sampled): "
+               "GPU %.2f, CDC/SPU %.2f, timers %.2f, DMA %.2f, input %.2f\n",
+               estimate[PSX_EVENT_GPU], estimate[PSX_EVENT_CDC],
+               estimate[PSX_EVENT_TIMER], estimate[PSX_EVENT_DMA], estimate[PSX_EVENT_FIO]);
+      }
+      memset(psx_event_type_us, 0, sizeof(psx_event_type_us));
+      memset(psx_event_type_n, 0, sizeof(psx_event_type_n));
+      memset(psx_event_type_samples, 0, sizeof(psx_event_type_samples));
 
       psx_cpu_quanta = 0;
       psx_event_us   = 0;

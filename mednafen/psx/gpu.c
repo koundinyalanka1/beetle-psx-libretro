@@ -17,6 +17,7 @@
 
 #include "psx.h"
 #include "gpu.h"
+#include "gpu_timing.h"
 #include "irq.h"
 #include "timer.h"
 #include "FastFIFO.h"
@@ -3291,7 +3292,7 @@ int32_t GPU_Update(const int32_t sys_timestamp)
       GPU.LineClockCounter -= chunk_clocks;
 
       GPU.DotClockCounter += chunk_clocks;
-      dot_clocks = GPU.DotClockCounter / DotClockRatios[GPU.DisplayMode & 0x3];
+      dot_clocks = GPU_DotClocks(GPU.DotClockCounter, GPU.DisplayMode);
       GPU.DotClockCounter -= dot_clocks * DotClockRatios[GPU.DisplayMode & 0x3];
 
       TIMER_AddDotClocks(dot_clocks);
@@ -3741,14 +3742,8 @@ int32_t GPU_Update(const int32_t sys_timestamp)
 TheEnd:
    GPU.lastts = sys_timestamp;
 
-   int32_t next_dt = GPU.LineClockCounter;
-
-   next_dt = (((int64_t)next_dt << 16) - GPU.GPUClockCounter + GPU.GPUClockRatio - 1) / GPU.GPUClockRatio;
-
-   if (next_dt < 1)          next_dt = 1;
-   if (next_dt > EventCycles) next_dt = EventCycles;
-
-   return(sys_timestamp + next_dt);
+   return sys_timestamp + GPU_NextEventDelay(GPU.LineClockCounter,
+         GPU.GPUClockCounter, GPU.GPUClockRatio, EventCycles);
 }
 
 void GPU_StartFrame(EmulateSpecStruct *espec_arg)

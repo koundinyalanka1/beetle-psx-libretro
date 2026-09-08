@@ -74,6 +74,7 @@
 #include <libretro.h>
 
 #include "../mednafen.h"
+#include "../worker_affinity.h"
 #include "../error.h"
 #include "CDUtility.h"
 #include "CDAccess.h"
@@ -267,6 +268,8 @@ static int CDIF_ReadThread(void *v_arg)
    CDIF *cdif    = (CDIF *)v_arg;
    bool  Running = true;
    CDIF_Message done_msg;
+
+   beetle_worker_init_affinity();
 
    done_msg.message = CDIF_MSG_DONE;
    memset(done_msg.args, 0, sizeof(done_msg.args));
@@ -742,4 +745,3 @@ CDIF *CDIF_Open(bool *success, const char *path,
    }
    return cdif;
 }
-
