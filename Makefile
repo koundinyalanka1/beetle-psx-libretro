@@ -128,7 +128,18 @@ ifeq ($(TARGET_IS_ANDROID),1)
    endif
    fpic := -fPIC
    SHARED := -shared -Wl,--no-undefined -Wl,--version-script=link.T -Wl,--build-id=sha1
-   LDFLAGS += -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384 -ldl -llog -landroid -lm
+   LDFLAGS += -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384
+   # The Android system libraries go in SYS_LIBS rather than LDFLAGS/LIBS.
+   # Frontends that drive this Makefile from their own build scripts routinely
+   # pass `LDFLAGS=...` (and sometimes `LIBS=...`) as command-line assignments,
+   # and Make lets a command-line assignment override an in-makefile `+=`
+   # outright instead of merging with it - so anything parked in those two
+   # variables can silently vanish at link time. -llog is not optional here:
+   # fallback_log() in libretro.c calls __android_log_vprint under -DANDROID,
+   # so dropping it is an undefined-symbol link failure rather than a missing
+   # feature. SYS_LIBS is appended directly in the link rule below and is not
+   # a name frontends override.
+   SYS_LIBS += -ldl -llog -landroid -lm
    ifeq ($(LINK_STATIC_LIBCPLUSPLUS),1)
       LDFLAGS += -static-libstdc++
    endif
@@ -732,7 +743,7 @@ $(TARGET): $(OBJECTS)
 ifeq ($(STATIC_LINKING), 1)
 	$(AR) rcs $@ $(OBJECTS)
 else
-	@$(LD) $(LINKOUT)$@ $^ $(LDFLAGS) $(GL_LIB) $(LIBS)
+	@$(LD) $(LINKOUT)$@ $^ $(LDFLAGS) $(GL_LIB) $(LIBS) $(SYS_LIBS)
 endif
 
 $(OBJECT_PREFIX)%.o: %.cpp
