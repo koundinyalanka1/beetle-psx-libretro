@@ -50,7 +50,7 @@ struct recompiler {
 	scond_t *cond;
 	scond_t *cond2;
 	slock_t *mutex;
-	bool stop, pause, must_flush;
+	bool stop, pause, must_flush, stopped;
 	struct slist_elm slist;
 
 	slock_t *alloc_mutex;
@@ -325,6 +325,7 @@ struct recompiler *lightrec_recompiler_init(struct lightrec_state *state)
 	rec->stop = false;
 	rec->pause = false;
 	rec->must_flush = false;
+	rec->stopped = false;
 	rec->nb_recs = nb_recs;
 	rec->nb_cpus = nb_cpus;
 	memset(&rec->profile, 0, sizeof(rec->profile));
@@ -395,9 +396,23 @@ err_free_cstates:
 	return NULL;
 }
 
-void lightrec_free_recompiler(struct recompiler *rec)
+/* Stop and join the compiler threads without releasing anything they or the
+ * rest of lightrec still point at.  Teardown needs that split: until the
+ * threads are joined they keep compiling blocks and queueing reaper work, and
+ * that queued work has to be retired while the recompiler is still alive - see
+ * lightrec_destroy().  Idempotent, so lightrec_free_recompiler() can call it
+ * for the callers that free without stopping first.
+ *
+ * Only the thread performing teardown ever calls this (never the compiler
+ * threads), so the `stopped` guard needs no lock of its own. */
+void lightrec_recompiler_stop(struct recompiler *rec)
 {
 	unsigned int i;
+
+	if (rec->stopped)
+		return;
+
+	rec->stopped = true;
 
 	/* Stop the thread */
 	slock_lock(rec->mutex);
@@ -408,6 +423,13 @@ void lightrec_free_recompiler(struct recompiler *rec)
 
 	for (i = 0; i < rec->nb_recs; i++)
 		sthread_join(rec->thds[i].thd);
+}
+
+void lightrec_free_recompiler(struct recompiler *rec)
+{
+	unsigned int i;
+
+	lightrec_recompiler_stop(rec);
 
 	for (i = 0; i < rec->nb_recs; i++)
 		lightrec_free_cstate(rec->thds[i].cstate);

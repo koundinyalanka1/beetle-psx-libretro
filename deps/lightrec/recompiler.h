@@ -12,6 +12,7 @@ struct lightrec_profile;
 struct recompiler;
 
 struct recompiler *lightrec_recompiler_init(struct lightrec_state *state);
+void lightrec_recompiler_stop(struct recompiler *rec);
 void lightrec_free_recompiler(struct recompiler *rec);
 int lightrec_recompiler_add(struct recompiler *rec, struct block *block);
 void lightrec_recompiler_remove(struct recompiler *rec, struct block *block);

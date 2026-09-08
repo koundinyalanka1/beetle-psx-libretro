@@ -2528,6 +2528,25 @@ void lightrec_destroy(struct lightrec_state *state)
 	state->current_cycle = ~state->current_cycle;
 	lightrec_print_info(state);
 
+	if (ENABLE_THREADED_COMPILER) {
+		/* Stop the compiler threads before anything is released: until
+		 * they are joined they keep compiling the blocks freed below,
+		 * and they keep queueing reaper work. */
+		lightrec_recompiler_stop(state->rec);
+
+		/* Then retire that queued work here, while everything it
+		 * touches is still alive.  Leaving it to
+		 * lightrec_reaper_destroy(), which reaps as its first step,
+		 * runs those callbacks after the block cache and the
+		 * recompiler are already gone, and each of them is then a
+		 * use-after-free: reaping a block unregisters it from the
+		 * block cache, freeing a block's code takes the recompiler's
+		 * alloc_mutex - which bionic catches as a lock on a destroyed
+		 * mutex and aborts on - and the code-buffer flush entry is
+		 * handed the recompiler itself as its data. */
+		lightrec_reaper_reap(state->reaper);
+	}
+
 	lightrec_free_block_cache(state->block_cache);
 	lightrec_free_block(state, state->dispatcher);
 	lightrec_free_block(state, state->c_wrapper_block);
