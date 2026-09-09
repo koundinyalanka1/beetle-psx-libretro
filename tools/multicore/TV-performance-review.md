@@ -1,4 +1,75 @@
-# Plan: native-speed PS1 with clear audio on Android TVs and phones
+# TV performance review — September 9 capture
+
+Updated 2026-09-09. **The supplied changes improve the comparable heavy section modestly, but native speed and clear audio are still not established.** This section supersedes the September 8 capture analysis and phase status below; those records remain historical context. Work stays in this core, with device-neutral behavior, no device profiling, and no release library generation or deployment.
+
+## Capture identity
+
+Both input files were read in full from `/Users/koundinya/flutter_projects/yage/`; full logcat was decoded with replacement for analysis. Line numbers refer to the original files.
+
+| File | Lines | SHA-256 |
+|---|---:|---|
+| `tv_logs.txt` | 1,233 | `a050fd8f5914b27f2dfa9656fde3e3426e95d6c813cee3a12cba4943531e579f` |
+| `full_logcat_tv.txt` | 67,449 | `267a619ea79f0310ca445034d602841543ca05df669e227d203113a4002a93e9` |
+
+Runtime is PID **8280**, emulation TID **8914**, `bf030853-dirty`, ARM32, Vulkan, Lightrec execute with mapping=4, three compiler workers, opcode cycles=2, EventCycles=128 and SPU samples=1. GPU/SPU workers are enabled (`tv_logs.txt:300,312–314`; full log `51609`). The checkout started clean at `bf030853eff046865c4a3b87c9164abe42874dbe`. The runtime dirty suffix still leaves the exact deployed patch unknown.
+
+## What improved, and what remains expensive
+
+- **Comparable heavy section:** four complete windows at `tv_logs.txt:373–396` cost **27.14–27.44 ms/frame**, with **26.67–26.95 ms** in the CPU-run bucket. The four adjacent 5-second frontend windows (`382–397`) report median **36.05 runs/s and 18.0 presentations/s**, versus the previous review's plateau medians 34.2 and 17.2. That is about **5.4% higher run throughput**, not a controlled speedup: scene labels, dirty patches, device scheduling and thermal conditions are not paired.
+- **Fewer exits:** heavy-section quanta are **6,350–6,370/frame**, down from roughly 8,100 in the older plateau. The quiet second window is 5,129 versus the older 8,791. Deadline sharing is engaging, but its 41.3% synthetic idle-case exit reduction must not be advertised as a 41.3% gameplay speedup.
+- **Bypass works:** all 15 complete windows have zero GPU worker busy time and all GP0 words inline. Heavy-section bypass handles 14,062–14,348 words/frame, and all 1,031–1,039 DMA polls/frame without a barrier. Zero collapsed polls now means the previous synchronization overhead was avoided. It does not mean GPU commands are free; their cost remains inside CPU-run time.
+- **Audio is still underproduced:** 36.05 runs/s × 736 stereo frames/run is about **26,533 frames/s**, or **60.2%** of 44,100. The frontend switches playback rate to 500 permille (`353`), later reports 25,123 underruns (`416`), and ends at 19.6 runs/s with additional underruns (`1013,1109`). A nonempty ring after lowering playback rate does not establish normal game speed or pitch.
+- **Late slowdown is distinct:** the last complete core window costs **54.44 ms**, including CPU-run **50.93 ms**, with 6,396 quanta, 8,535 GP0 words and 4,078 DMA polls/frame (`911–916`). This is almost the same exit count as the earlier plateau but much higher time per exit (7.96 versus ~4.2 us). More quanta and GPU worker waits do not explain it.
+- **System pressure appears in full logcat:** at **05:47:24.870**, Android kills background process `com.google.android.tungsten.setupwraith` because the low memory watermark was breached and swap was low (`full_logcat_tv.txt:52190`). This precedes the 36.35/54.44 ms windows. It is evidence of system pressure, not proof that this core leaks or that paging caused those CPU times. There are also 746 frontend InputRoute debug lines in the small log, many repeating at 50 ms intervals during the late section; their cost is unmeasured.
+- **Session termination was requested:** ActivityManager explicitly stops PID 8280 at 05:48:12.217 (`full_logcat_tv.txt:54177`), followed by SIGKILL exit (`54301`). No same-session fatal signal or explicit Vulkan device-loss record was found. The four unmapped guest warnings are bounded (`tv_logs.txt:348–351`) and no interpreter-fallback warning appears.
+
+The log's `CPU` label is **wall time inside CPU_Run**, including inline GPU/device/helper execution and any descheduling. It is not isolated JIT time or a thread CPU-time measurement. Event timing and per-word timing are off throughout this capture, so it cannot attribute the remaining milliseconds to JIT, GTE, command decoding, rasterization or host contention.
+
+## All 15 complete core windows
+
+Each row covers 300 emulated frames. Times are means, not percentiles. Window durations differ; do not average the rows into a session FPS number.
+
+| tv line | Run ms | CPU-run ms | Finalize ms | GP0 words/frame | Bypass words/frame | Barrier-free DMA polls/frame |
+|---:|---:|---:|---:|---:|---:|---:|
+| 338 | 25.05 | 23.45 | 0.96 | 16 | 16 | 0 |
+| 345 | 12.76 | 12.52 | 0.10 | 2 | 2 | 0 |
+| 359 | 17.46 | 14.59 | 2.65 | 524 | 524 | 217 |
+| 367 | 26.38 | 25.57 | 0.61 | 12207 | 12203 | 899 |
+| 373 | 27.14 | 26.67 | 0.29 | 14357 | 14325 | 1032 |
+| 379 | 27.35 | 26.86 | 0.30 | 14357 | 14265 | 1031 |
+| 387 | 27.44 | 26.95 | 0.30 | 14357 | 14062 | 1031 |
+| 395 | 27.30 | 26.81 | 0.30 | 14456 | 14348 | 1039 |
+| 408 | 28.33 | 25.62 | 2.51 | 13342 | 13209 | 1006 |
+| 424 | 28.44 | 23.17 | 4.94 | 649 | 636 | 775 |
+| 445 | 17.78 | 16.66 | 0.85 | 899 | 896 | 1412 |
+| 468 | 17.51 | 16.44 | 0.80 | 882 | 877 | 1329 |
+| 475 | 12.22 | 11.99 | 0.10 | 273 | 272 | 43 |
+| 518 | 36.35 | 29.58 | 6.52 | 4216 | 4212 | 1881 |
+| 915 | 54.44 | 50.93 | 3.21 | 8535 | 8525 | 4052 |
+
+## Implemented in this review
+
+The change targets repeated inline GPU work confirmed by the word counts. It does not claim attribution of the entire CPU bucket.
+
+1. **Avoid renderer queries on ordinary FIFO attempts.** `ProcessFIFO()` previously called `rhi_intf_has_software_renderer()` before checking the command type, command completeness or drawing credit. The query is now inside `INCMD_FBWRITE`, its only consumer. Command retries, polygon/line decoding and clock-driven FIFO attempts no longer pay this cross-file renderer dispatch. Upload masking still uses the same predicate.
+2. **Read commands in batches with PGXP disabled.** `FastFIFO_ReadMany()` copies the command's one or two contiguous ring segments and advances read position/count once. The decoder tests PGXP once per complete command; enabled PGXP retains per-word metadata lookup at the original ring slot. Command lengths, execution count, drawing credit and FIFO layout are unchanged. The helper uses short loops for these small commands.
+3. **Use the established bypass invariant for clocks and fields.** `GPU_Stage_CanRunInline()` can answer immediately while bypass is engaged. Entry already established an empty queue and idle worker; every queue push ends bypass before publishing. This removes repeated acquire loads from those checks. Staging resolve, FIFO publication, IRQ application and deferred readback handling remain in place.
+
+Validation completed on macOS ARM64:
+
+- All **10 native multicore suites passed**, including existing SPU state/audio/IRQ comparisons, workers, DMA, scheduler and staging tests.
+- New FastFIFO test passed **17,952 differential read/refill cases**, covering every ring position, occupancy and valid read length, full FIFO-state equality, output guards and subsequent writes/drains. It also passed **AddressSanitizer and UBSan**.
+- Changed production `gpu.c` compiled cleanly through the root Makefile with NDK 30, release `-O3`, hardware/GLES3/Vulkan/Lightrec flags for **ARM32/API21 and ARM64/API21**. Only isolated object files were generated under `/tmp`.
+- An exploratory host-only FIFO microbenchmark (10 million mixed 1/3/4/6/7/9/12-word reads, five alternating runs, matching checksums) favored batch reads. This is not full decoder timing or TV performance evidence.
+- Full GPU command/state/queue-stress matrices against a newly built core and TV FPS/audio checks were **not run**. These remain validation limits; the standalone FIFO and policy tests do not establish complete renderer/worker ordering.
+
+## Remaining priorities
+
+At ~27.3 ms/run, reaching the native ~16.7 ms period still needs roughly **39% less total frame time**. The bounded changes above remove avoidable work, but their TV saving is unmeasured and cannot be assumed to close that gap.
+
+The next substantial optimization needs timing attribution of inline GPU work versus JIT/device execution. Reuse the existing host tools under the standing no-device-profiling constraint. Keep the late memory-pressure section separate from steady-scene comparisons. Scanout creation still occurs about once per presentation; safe reuse needs a proven frontend sync-index/lifetime contract, because the renderer's rotating three-slot array alone does not establish retirement. Preserve guest timing, audio fidelity and worker correctness while investigating these costs.
+
+# Historical September 8 plan and implementation record
 
 Updated 2026-09-08 from the supplied September 8 capture, after a full re-read of both logs. **This is the current plan; 60 FPS with clear audio is not yet achieved.** Implementation has now covered portable GPU arithmetic, an idle-DMA channel fast path, idle-DMA event-deadline sharing and an adaptive GP0 staging bypass. Earlier FIFO work and Phase 1 verification are recorded at the end as historical results; fresh results appear in the current implementation records below.
 

@@ -2000,7 +2000,6 @@ static void ProcessFIFO(uint32_t in_count)
    uint32_t cc            = GPU.InCmd_CC;
    const CTEntry *command = &Commands[cc];
    bool read_fifo         = false;
-   bool sw                = rhi_intf_has_software_renderer();
 
    switch (GPU.InCmd)
    {
@@ -2008,6 +2007,8 @@ static void ProcessFIFO(uint32_t in_count)
       case INCMD_NONE:
          break;
       case INCMD_FBWRITE:
+      {
+         bool sw = rhi_intf_has_software_renderer();
          InData = FastFIFO_Read(&GPU_BlitterFIFO);
 
          for(i = 0; i < 2; i++)
@@ -2042,6 +2043,7 @@ static void ProcessFIFO(uint32_t in_count)
             InData >>= 16;
          }
          return;
+      }
 
       case INCMD_QUAD:
          if(GPU.DrawTimeAvail < 0)
@@ -2080,12 +2082,16 @@ static void ProcessFIFO(uint32_t in_count)
    if(in_count < command_len)
       return;
 
-   for (i = 0; i < command_len; i++)
+   if (PGXP_enabled())
    {
-      if(PGXP_enabled())
+      for (i = 0; i < command_len; i++)
+      {
          PGXP_WriteCB(PGXP_ReadFIFO(GPU_BlitterFIFO.read_pos), i);
-      CB[i] = FastFIFO_Read(&GPU_BlitterFIFO);
+         CB[i] = FastFIFO_Read(&GPU_BlitterFIFO);
+      }
    }
+   else
+      FastFIFO_ReadMany(&GPU_BlitterFIFO, CB, command_len);
 
    if (!read_fifo)
    {
@@ -2889,6 +2895,11 @@ static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr)
  * which is what makes running the buffer on this thread order-preserving. */
 static bool GPU_Stage_CanRunInline(void)
 {
+   /* Only the emulation thread submits work. Entering bypass established an
+    * empty ring and a parked worker, and every push ends it before publishing.
+    * Staged IRQ words are still retired by the caller before clocks/fields. */
+   if (gpu_stage_policy.bypass)
+      return true;
    return GPU_Queue_Empty()
       && __atomic_load_n(&gpu_worker_idle, __ATOMIC_ACQUIRE);
 }

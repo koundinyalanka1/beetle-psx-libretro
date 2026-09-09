@@ -38,6 +38,11 @@ correctly on state load, reset and worker restart. It covers the
 Ordering and barrier correctness for that path stay with the generated GPU
 matrix below, which needs a built core.
 
+The FastFIFO test compares batched command reads against scalar reads across all
+32 ring positions, every occupancy and every valid read length (17,952 cases).
+It checks output guards, complete FIFO state, and refill/drain after wraparound.
+The PGXP path retains scalar reads so each metadata entry uses its original slot.
+
 For race detection, use a separate build directory:
 
 ```

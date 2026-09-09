@@ -74,6 +74,25 @@ static INLINE uint32_t FastFIFO_Read(FastFIFO *f)
    return ret;
 }
 
+/* Read an already available command into separate storage. The caller must
+ * provide count <= in_count and a destination that does not alias the FIFO.
+ * Advance the ring once, including when the command crosses its end. */
+static INLINE void FastFIFO_ReadMany(FastFIFO *f, uint32_t *out, uint32_t count)
+{
+   uint32_t first = FASTFIFO_SIZE - f->read_pos;
+   uint32_t i;
+   if (first > count)
+      first = count;
+
+   for (i = 0; i < first; i++)
+      out[i] = f->data[f->read_pos + i];
+   for (i = first; i < count; i++)
+      out[i] = f->data[i - first];
+
+   f->read_pos = (f->read_pos + count) & FASTFIFO_SIZE_MASK;
+   f->in_count -= count;
+}
+
 static INLINE void FastFIFO_Write(FastFIFO *f, uint32_t v)
 {
    f->data[f->write_pos] = v;

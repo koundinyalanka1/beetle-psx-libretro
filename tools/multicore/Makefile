@@ -6,7 +6,7 @@ THREADS := $(ROOT)/libretro-common/rthreads/rthreads.c
 AFFINITY := $(ROOT)/mednafen/worker_affinity.c
 
 .PHONY: check
-check: $(BUILD_DIR)/spu $(BUILD_DIR)/workers $(BUILD_DIR)/affinity $(BUILD_DIR)/gpu-timing $(BUILD_DIR)/recompiler $(BUILD_DIR)/performance $(BUILD_DIR)/dma $(BUILD_DIR)/event-scheduler $(BUILD_DIR)/gpu-stage
+check: $(BUILD_DIR)/spu $(BUILD_DIR)/workers $(BUILD_DIR)/affinity $(BUILD_DIR)/gpu-timing $(BUILD_DIR)/recompiler $(BUILD_DIR)/performance $(BUILD_DIR)/dma $(BUILD_DIR)/event-scheduler $(BUILD_DIR)/gpu-stage $(BUILD_DIR)/fastfifo
 	$(BUILD_DIR)/spu
 	$(BUILD_DIR)/workers
 	$(BUILD_DIR)/affinity
@@ -16,6 +16,10 @@ check: $(BUILD_DIR)/spu $(BUILD_DIR)/workers $(BUILD_DIR)/affinity $(BUILD_DIR)/
 	$(BUILD_DIR)/dma
 	$(BUILD_DIR)/event-scheduler
 	$(BUILD_DIR)/gpu-stage
+	$(BUILD_DIR)/fastfifo
+
+$(BUILD_DIR)/fastfifo: fastfifo.c $(ROOT)/mednafen/psx/FastFIFO.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) fastfifo.c -o $@
 
 $(BUILD_DIR)/performance: performance.c $(ROOT)/mednafen/performance.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DBEETLE_PERF_STANDALONE performance.c -o $@
