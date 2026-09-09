@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 #include <time.h>
 #include "thread_faults.h"
@@ -25,11 +26,27 @@ retro_time_t cpu_features_get_time_usec(void)
    return (retro_time_t)t.tv_sec * 1000000 + t.tv_nsec / 1000;
 }
 
+/* Renderer state-sets ride the same stream as the draws; the consumer checks
+ * they arrive in the position the producer issued them, not merely that they
+ * arrive. */
+static unsigned applied_clip;
+static bool check_interleave = true;
+
 static void draw(void *user, const rhi_defer_op_t *op)
 {
    const unsigned *expected_state = (const unsigned *)user;
    assert(!pthread_equal(pthread_self(), producer));
    assert(state_version == *expected_state);
+   if (op->kind == RHI_DEFER_SET_DRAW_AREA)
+   {
+      /* Interleaved before the primitive that carries the same id. */
+      if (check_interleave)
+         assert(op->u.set_draw_area.x0 == (uint16_t)consumed);
+      applied_clip = op->u.set_draw_area.x0;
+      return;
+   }
+   if (check_interleave)
+      assert(applied_clip == consumed);
    assert(op->u.push_poly.c[0] == consumed);
    assert(op->u.push_poly.precise_rgb[0] == (float)consumed);
    assert(op->u.push_poly.fog[11] == (float)consumed + 11);
@@ -80,6 +97,19 @@ int main(void)
                1, 2, 3, 4, 5, 6, 7, 8, 9, id, 10, 11, rgb, fog,
                13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
                25, 26, 2, 1, true, 2, true, true);
+         /* A clip change immediately ahead of the primitive, which is what
+          * the guest actually does and what used to force a drain.  Pushed
+          * unconditionally here so ordering is what is under test; the
+          * queue-only-when-busy policy is checked separately below. */
+         {
+            rhi_defer_op_t sop;
+            rhi_defer_queue_t sq = {0};
+            sq.ops = &sop;
+            sq.capacity = 1;
+            rhi_defer_push_set_draw_area(&sq, (uint16_t)id, 0, 1023, 511);
+            rhi_geometry_worker_push(w, &sop);
+            memset(&sop, 0x5a, sizeof(sop));
+         }
          rhi_geometry_worker_push(w, &op);
          /* Reused stack inputs must not alter an already queued command. */
          memset(&op, 0xa5, sizeof(op));
@@ -93,7 +123,8 @@ int main(void)
       expected_state++;
    }
    rhi_geometry_worker_stats(w, &stats);
-   assert(stats.commands == 2104 && stats.batches == 72);
+   /* Two ops per iteration: the clip change and the primitive. */
+   assert(stats.commands == 2104 * 2 && stats.batches == 136);
    assert(stats.eligible_cpus == 4 && affinity_calls == 1);
    /* Every sync counts as a barrier whether or not it blocked: 8 round
     * barriers plus the one this stats call performed. */
@@ -122,6 +153,7 @@ int main(void)
    consumed = 0;
    state_version = 0;
    expected_state = 0;
+   check_interleave = false;
    {
       float rgb[9] = {0}, fog[12];
       unsigned j;
@@ -142,6 +174,45 @@ int main(void)
    assert(stats.commands == 1 && stats.batches == 1);
    assert(stats.barriers == 2 && stats.barrier_n == 1);
 
+   /* Queue-only-when-busy: with nothing outstanding the caller owns the
+    * backend, so the op must be refused rather than copied and handed over.
+    * Once something is queued it must be accepted, so order is preserved. */
+   {
+      rhi_defer_op_t sop;
+      rhi_defer_queue_t sq = {0};
+      float rgb[9] = {0}, fog[12];
+      unsigned j;
+      sq.ops = &sop;
+      sq.capacity = 1;
+      consumed = 0;
+      for (j = 0; j < 12; j++)
+         fog[j] = (float)j;
+      /* The 1-slot builder queue records one op at a time. */
+      sq.count = 0;
+      rhi_defer_push_set_draw_area(&sq, 7, 0, 1023, 511);
+      assert(!rhi_geometry_worker_queue_if_busy(w, &sop));
+      assert(!rhi_geometry_worker_queue_if_busy(NULL, &sop));
+
+      /* One primitive makes the worker busy; the state op must now ride the
+       * stream instead of being applied behind it. */
+      sq.count = 0;
+      rhi_defer_push_triangle(&sq, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 10, 11, rgb, fog,
+            13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 2, 1,
+            true, 2, true, true);
+      rhi_geometry_worker_push(w, &sop);
+      sq.count = 0;
+      rhi_defer_push_set_draw_area(&sq, 7, 0, 1023, 511);
+      assert(rhi_geometry_worker_queue_if_busy(w, &sop));
+
+      /* And refused again once the barrier has drained it. */
+      rhi_geometry_worker_sync(w);
+      sq.count = 0;
+      rhi_defer_push_set_draw_area(&sq, 7, 0, 1023, 511);
+      assert(!rhi_geometry_worker_queue_if_busy(w, &sop));
+   }
+   rhi_geometry_worker_stats(w, &stats);
+   assert(stats.commands == 2 && stats.batches == 1);
+
    rhi_geometry_worker_free(w);
    assert(!live_locks && !live_conds && !live_threads);
 
@@ -150,6 +221,6 @@ int main(void)
    assert(w);
    rhi_geometry_worker_free(w);
    assert(!live_locks && !live_conds && !live_threads);
-   puts("Geometry worker: 2104 ordered snapshots, backpressure, state barriers, idle-barrier fast path, split stall accounting and startup failures passed");
+   puts("Geometry worker: 2104 ordered snapshots interleaved with in-stream state changes, queue-only-when-busy, backpressure, barriers, idle-barrier fast path, split stall accounting and startup failures passed");
    return 0;
 }

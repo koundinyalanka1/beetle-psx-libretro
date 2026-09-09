@@ -131,15 +131,55 @@ rhi_geometry_worker_t *rhi_geometry_worker_new(rhi_defer_dispatch_fn dispatch,
    return w;
 }
 
+/* Value-owned only: an op that aliases caller memory (RHI_DEFER_LOAD_IMAGE
+ * carries a live VRAM pointer) cannot outlive the call that queued it, and
+ * pixel work is not what this queue is for. Renderer state-sets are accepted
+ * alongside the draws because ordering is the whole point - the worker applies
+ * them at exactly the position in the stream where the guest issued them,
+ * which is what removes the drain the producer would otherwise pay. */
+static bool geometry_op_is_queueable(rhi_defer_kind_t kind)
+{
+   switch (kind)
+   {
+      case RHI_DEFER_PUSH_TRIANGLE:
+      case RHI_DEFER_PUSH_QUAD:
+      case RHI_DEFER_PUSH_LINE:
+      case RHI_DEFER_SET_TEX_WINDOW:
+      case RHI_DEFER_SET_DRAW_OFFSET:
+      case RHI_DEFER_SET_DRAW_AREA:
+      case RHI_DEFER_SET_VRAM_FRAMEBUFFER_COORDS:
+      case RHI_DEFER_SET_HORIZONTAL_DISPLAY_RANGE:
+      case RHI_DEFER_SET_VERTICAL_DISPLAY_RANGE:
+      case RHI_DEFER_SET_DISPLAY_MODE:
+      case RHI_DEFER_TOGGLE_DISPLAY:
+         return true;
+      default:
+         return false;
+   }
+}
+
 void rhi_geometry_worker_push(rhi_geometry_worker_t *w,
       const rhi_defer_op_t *op)
 {
    geometry_batch_t *batch = &w->batches[w->current];
-   assert(op->kind == RHI_DEFER_PUSH_TRIANGLE ||
-          op->kind == RHI_DEFER_PUSH_QUAD || op->kind == RHI_DEFER_PUSH_LINE);
+   assert(geometry_op_is_queueable(op->kind));
+   (void)geometry_op_is_queueable;
    batch->ops[batch->count++] = *op;
    if (batch->count == GEOMETRY_BATCH_SIZE)
       geometry_submit(w);
+}
+
+bool rhi_geometry_worker_queue_if_busy(rhi_geometry_worker_t *w,
+      const rhi_defer_op_t *op)
+{
+   if (!w)
+      return false;
+   /* Same test the barrier fast path uses: nothing queued and the worker
+    * parked means the caller owns the backend already. */
+   if (!w->batches[w->current].count && !geometry_inflight(w))
+      return false;
+   rhi_geometry_worker_push(w, op);
+   return true;
 }
 
 void rhi_geometry_worker_sync(rhi_geometry_worker_t *w)

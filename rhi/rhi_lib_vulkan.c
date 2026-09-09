@@ -19402,6 +19402,20 @@ static uint32_t prev_frame_height = 240;
 static bool show_vram = false;
 
 
+static void rhi_vulkan_set_tex_window_direct(uint8_t tww, uint8_t twh,
+                               uint8_t twx, uint8_t twy);
+static void rhi_vulkan_set_draw_offset_direct(int16_t x, int16_t y);
+static void rhi_vulkan_set_draw_area_direct(uint16_t x0, uint16_t y0,
+                              uint16_t x1, uint16_t y1);
+static void rhi_vulkan_set_vram_framebuffer_coords_direct(uint32_t xstart, uint32_t ystart);
+static void rhi_vulkan_set_horizontal_display_range_direct(uint16_t x1, uint16_t x2);
+static void rhi_vulkan_set_vertical_display_range_direct(uint16_t y1, uint16_t y2);
+static void rhi_vulkan_set_display_mode_direct(bool depth_24bpp,
+                                 bool is_pal,
+                                 bool is_480i,
+                                 int width_mode);
+static void rhi_vulkan_toggle_display_direct(bool status);
+
 /* Decoded geometry owns all vertex/PGXP data. Guest FIFO and GPU timing
  * stay on the emulation thread; only this worker touches Renderer until a
  * barrier transfers ownership back. No raw GP0 worker runs in this mode. */
@@ -19459,6 +19473,13 @@ static void rhi_vulkan_push_line_direct(
 static void vk_geometry_dispatch(void *user, const rhi_defer_op_t *op)
 {
    (void)user;
+   /* Enqueueing requires a live renderer, and the worker is stopped before
+    * `renderer` can change, so the _direct calls below always take their
+    * renderer branch. Stated as a guard rather than an assumption because the
+    * other branch would push to the pre-context defer queue, which belongs to
+    * the producer and is not safe to touch from here. */
+   if (!renderer)
+      return;
    switch (op->kind)
    {
       case RHI_DEFER_PUSH_TRIANGLE:
@@ -19509,6 +19530,51 @@ static void vk_geometry_dispatch(void *user, const rhi_defer_op_t *op)
                           op->u.push_line.c0, op->u.push_line.c1,
                           op->u.push_line.dither, op->u.push_line.blend_mode,
                           op->u.push_line.mask_test, op->u.push_line.set_mask);
+         break;
+      /* Renderer state, applied at its own position in the stream. The guest
+       * changes clip rect and texture window far more often than it draws -
+       * the September 9 capture shows 3,100-6,900 of these a frame against
+       * 0-1,097 primitives - so draining for each one was both the producer's
+       * stall and the reason batches never filled. */
+      case RHI_DEFER_SET_TEX_WINDOW:
+         rhi_vulkan_set_tex_window_direct(op->u.set_tex_window.tww,
+                                          op->u.set_tex_window.twh,
+                                          op->u.set_tex_window.twx,
+                                          op->u.set_tex_window.twy);
+         break;
+      case RHI_DEFER_SET_DRAW_OFFSET:
+         rhi_vulkan_set_draw_offset_direct(op->u.set_draw_offset.x,
+                                           op->u.set_draw_offset.y);
+         break;
+      case RHI_DEFER_SET_DRAW_AREA:
+         rhi_vulkan_set_draw_area_direct(op->u.set_draw_area.x0,
+                                         op->u.set_draw_area.y0,
+                                         op->u.set_draw_area.x1,
+                                         op->u.set_draw_area.y1);
+         break;
+      case RHI_DEFER_SET_VRAM_FRAMEBUFFER_COORDS:
+         rhi_vulkan_set_vram_framebuffer_coords_direct(
+               op->u.set_vram_framebuffer_coords.xstart,
+               op->u.set_vram_framebuffer_coords.ystart);
+         break;
+      case RHI_DEFER_SET_HORIZONTAL_DISPLAY_RANGE:
+         rhi_vulkan_set_horizontal_display_range_direct(
+               op->u.set_horizontal_display_range.x1,
+               op->u.set_horizontal_display_range.x2);
+         break;
+      case RHI_DEFER_SET_VERTICAL_DISPLAY_RANGE:
+         rhi_vulkan_set_vertical_display_range_direct(
+               op->u.set_vertical_display_range.y1,
+               op->u.set_vertical_display_range.y2);
+         break;
+      case RHI_DEFER_SET_DISPLAY_MODE:
+         rhi_vulkan_set_display_mode_direct(op->u.set_display_mode.depth_24bpp,
+                                            op->u.set_display_mode.is_pal,
+                                            op->u.set_display_mode.is_480i,
+                                            op->u.set_display_mode.width_mode);
+         break;
+      case RHI_DEFER_TOGGLE_DISPLAY:
+         rhi_vulkan_toggle_display_direct(op->u.toggle_display.status);
          break;
       default:
          abort();
@@ -20745,11 +20811,31 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
 void rhi_vulkan_set_tex_window(uint8_t tww, uint8_t twh,
                                uint8_t twx, uint8_t twy)
 {
+   /* Ordered rather than exclusive, but only while the worker has something
+    * to stay ahead of: queueing keeps the change at its own point in the
+    * command stream without a drain, and with nothing outstanding the drain
+    * below is already free and costs no op copy. */
+   if (vk_geometry_worker && inside_frame && renderer)
+   {
+      rhi_defer_op_t op;
+      rhi_defer_queue_t q = {0};
+      q.ops = &op;
+      q.capacity = 1;
+      rhi_defer_push_set_tex_window(&q, tww, twh, twx, twy);
+      if (rhi_geometry_worker_queue_if_busy(vk_geometry_worker, &op))
+         return;
+   }
+   vk_geometry_sync();
+   rhi_vulkan_set_tex_window_direct(tww, twh, twx, twy);
+}
+
+static void rhi_vulkan_set_tex_window_direct(uint8_t tww, uint8_t twh,
+                               uint8_t twx, uint8_t twy)
+{
    uint8_t tex_x_mask = ~(tww << 3);
    uint8_t tex_y_mask = ~(twh << 3);
    uint8_t tex_x_or   = (twx & tww) << 3;
    uint8_t tex_y_or   = (twy & twh) << 3;
-   vk_geometry_sync();
 
    if (renderer)
       {
@@ -20762,7 +20848,26 @@ void rhi_vulkan_set_tex_window(uint8_t tww, uint8_t twh,
 
 void rhi_vulkan_set_draw_offset(int16_t x, int16_t y)
 {
+   /* Ordered rather than exclusive, but only while the worker has something
+    * to stay ahead of: queueing keeps the change at its own point in the
+    * command stream without a drain, and with nothing outstanding the drain
+    * below is already free and costs no op copy. */
+   if (vk_geometry_worker && inside_frame && renderer)
+   {
+      rhi_defer_op_t op;
+      rhi_defer_queue_t q = {0};
+      q.ops = &op;
+      q.capacity = 1;
+      rhi_defer_push_set_draw_offset(&q, x, y);
+      if (rhi_geometry_worker_queue_if_busy(vk_geometry_worker, &op))
+         return;
+   }
    vk_geometry_sync();
+   rhi_vulkan_set_draw_offset_direct(x, y);
+}
+
+static void rhi_vulkan_set_draw_offset_direct(int16_t x, int16_t y)
+{
    if (renderer)
    {
       renderer->render_state.draw_offset_x = x;
@@ -20775,9 +20880,29 @@ void rhi_vulkan_set_draw_offset(int16_t x, int16_t y)
 void rhi_vulkan_set_draw_area(uint16_t x0, uint16_t y0,
                               uint16_t x1, uint16_t y1)
 {
+   /* Ordered rather than exclusive, but only while the worker has something
+    * to stay ahead of: queueing keeps the change at its own point in the
+    * command stream without a drain, and with nothing outstanding the drain
+    * below is already free and costs no op copy. */
+   if (vk_geometry_worker && inside_frame && renderer)
+   {
+      rhi_defer_op_t op;
+      rhi_defer_queue_t q = {0};
+      q.ops = &op;
+      q.capacity = 1;
+      rhi_defer_push_set_draw_area(&q, x0, y0, x1, y1);
+      if (rhi_geometry_worker_queue_if_busy(vk_geometry_worker, &op))
+         return;
+   }
+   vk_geometry_sync();
+   rhi_vulkan_set_draw_area_direct(x0, y0, x1, y1);
+}
+
+static void rhi_vulkan_set_draw_area_direct(uint16_t x0, uint16_t y0,
+                              uint16_t x1, uint16_t y1)
+{
    int width  = x1 - x0 + 1;
    int height = y1 - y0 + 1;
-   vk_geometry_sync();
    if (width  < 0) width  = 0;
    if (height < 0) height = 0;
 
@@ -20803,7 +20928,26 @@ void rhi_vulkan_set_draw_area(uint16_t x0, uint16_t y0,
 
 void rhi_vulkan_set_vram_framebuffer_coords(uint32_t xstart, uint32_t ystart)
 {
+   /* Ordered rather than exclusive, but only while the worker has something
+    * to stay ahead of: queueing keeps the change at its own point in the
+    * command stream without a drain, and with nothing outstanding the drain
+    * below is already free and costs no op copy. */
+   if (vk_geometry_worker && inside_frame && renderer)
+   {
+      rhi_defer_op_t op;
+      rhi_defer_queue_t q = {0};
+      q.ops = &op;
+      q.capacity = 1;
+      rhi_defer_push_set_vram_framebuffer_coords(&q, xstart, ystart);
+      if (rhi_geometry_worker_queue_if_busy(vk_geometry_worker, &op))
+         return;
+   }
    vk_geometry_sync();
+   rhi_vulkan_set_vram_framebuffer_coords_direct(xstart, ystart);
+}
+
+static void rhi_vulkan_set_vram_framebuffer_coords_direct(uint32_t xstart, uint32_t ystart)
+{
    if (renderer)
       renderer_set_vram_framebuffer_coords(renderer, xstart, ystart);
    else
@@ -20812,7 +20956,26 @@ void rhi_vulkan_set_vram_framebuffer_coords(uint32_t xstart, uint32_t ystart)
 
 void rhi_vulkan_set_horizontal_display_range(uint16_t x1, uint16_t x2)
 {
+   /* Ordered rather than exclusive, but only while the worker has something
+    * to stay ahead of: queueing keeps the change at its own point in the
+    * command stream without a drain, and with nothing outstanding the drain
+    * below is already free and costs no op copy. */
+   if (vk_geometry_worker && inside_frame && renderer)
+   {
+      rhi_defer_op_t op;
+      rhi_defer_queue_t q = {0};
+      q.ops = &op;
+      q.capacity = 1;
+      rhi_defer_push_set_horizontal_display_range(&q, x1, x2);
+      if (rhi_geometry_worker_queue_if_busy(vk_geometry_worker, &op))
+         return;
+   }
    vk_geometry_sync();
+   rhi_vulkan_set_horizontal_display_range_direct(x1, x2);
+}
+
+static void rhi_vulkan_set_horizontal_display_range_direct(uint16_t x1, uint16_t x2)
+{
    if (renderer)
       renderer_set_horizontal_display_range(renderer, x1, x2);
    else
@@ -20821,7 +20984,26 @@ void rhi_vulkan_set_horizontal_display_range(uint16_t x1, uint16_t x2)
 
 void rhi_vulkan_set_vertical_display_range(uint16_t y1, uint16_t y2)
 {
+   /* Ordered rather than exclusive, but only while the worker has something
+    * to stay ahead of: queueing keeps the change at its own point in the
+    * command stream without a drain, and with nothing outstanding the drain
+    * below is already free and costs no op copy. */
+   if (vk_geometry_worker && inside_frame && renderer)
+   {
+      rhi_defer_op_t op;
+      rhi_defer_queue_t q = {0};
+      q.ops = &op;
+      q.capacity = 1;
+      rhi_defer_push_set_vertical_display_range(&q, y1, y2);
+      if (rhi_geometry_worker_queue_if_busy(vk_geometry_worker, &op))
+         return;
+   }
    vk_geometry_sync();
+   rhi_vulkan_set_vertical_display_range_direct(y1, y2);
+}
+
+static void rhi_vulkan_set_vertical_display_range_direct(uint16_t y1, uint16_t y2)
+{
    if (renderer)
       renderer_set_vertical_display_range(renderer, y1, y2);
    else
@@ -20833,7 +21015,29 @@ void rhi_vulkan_set_display_mode(bool depth_24bpp,
                                  bool is_480i,
                                  int width_mode)
 {
+   /* Ordered rather than exclusive, but only while the worker has something
+    * to stay ahead of: queueing keeps the change at its own point in the
+    * command stream without a drain, and with nothing outstanding the drain
+    * below is already free and costs no op copy. */
+   if (vk_geometry_worker && inside_frame && renderer)
+   {
+      rhi_defer_op_t op;
+      rhi_defer_queue_t q = {0};
+      q.ops = &op;
+      q.capacity = 1;
+      rhi_defer_push_set_display_mode(&q, depth_24bpp, is_pal, is_480i, width_mode);
+      if (rhi_geometry_worker_queue_if_busy(vk_geometry_worker, &op))
+         return;
+   }
    vk_geometry_sync();
+   rhi_vulkan_set_display_mode_direct(depth_24bpp, is_pal, is_480i, width_mode);
+}
+
+static void rhi_vulkan_set_display_mode_direct(bool depth_24bpp,
+                                 bool is_pal,
+                                 bool is_480i,
+                                 int width_mode)
+{
    if (renderer)
       renderer_set_display_mode(renderer, get_scanout_mode(depth_24bpp), is_pal,
                                  is_480i, (WidthMode)(width_mode));
@@ -21310,7 +21514,26 @@ void rhi_vulkan_copy_rect(uint16_t src_x, uint16_t src_y,
 
 void rhi_vulkan_toggle_display(bool status)
 {
+   /* Ordered rather than exclusive, but only while the worker has something
+    * to stay ahead of: queueing keeps the change at its own point in the
+    * command stream without a drain, and with nothing outstanding the drain
+    * below is already free and costs no op copy. */
+   if (vk_geometry_worker && inside_frame && renderer)
+   {
+      rhi_defer_op_t op;
+      rhi_defer_queue_t q = {0};
+      q.ops = &op;
+      q.capacity = 1;
+      rhi_defer_push_toggle_display(&q, status);
+      if (rhi_geometry_worker_queue_if_busy(vk_geometry_worker, &op))
+         return;
+   }
    vk_geometry_sync();
+   rhi_vulkan_toggle_display_direct(status);
+}
+
+static void rhi_vulkan_toggle_display_direct(bool status)
+{
    if (renderer)
    {
       bool enable = status == 0;

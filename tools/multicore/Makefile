@@ -63,3 +63,10 @@ $(BUILD_DIR)/gpu-stage: gpu_stage.c $(ROOT)/mednafen/psx/gpu_stage_policy.h | $(
 
 $(BUILD_DIR)/geometry-worker: geometry_worker.c thread_faults.h $(ROOT)/rhi/rhi_geometry_worker.c $(ROOT)/rhi/rhi_geometry_worker.h $(ROOT)/rhi/rhi_defer.c $(ROOT)/mednafen/rthreads_worker.c $(THREADS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) geometry_worker.c $(ROOT)/rhi/rhi_defer.c $(THREADS) -pthread -o $@
+
+# Attribution harness. Needs a core built for this host, so it is not part of
+# `check`; see README.md for the two-command recipe.
+.PHONY: profile-host
+profile-host: $(BUILD_DIR)/profile_host
+$(BUILD_DIR)/profile_host: profile_host.c testrom_report.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I. profile_host.c -o $@

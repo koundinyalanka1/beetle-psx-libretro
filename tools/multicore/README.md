@@ -47,7 +47,10 @@ The geometry-worker test drives the production `rhi/rhi_geometry_worker.c` with
 a deliberately slow consumer, so the producer outruns the bounded banks and the
 backpressure path is exercised rather than merely present. It checks that
 queued commands own their payload (the producer's stack buffers are overwritten
-immediately after each push), that order is preserved, that a partial batch is
+immediately after each push), that renderer state changes interleaved with the
+primitives are applied in the position the producer issued them, that a state
+op is refused while nothing is outstanding and accepted once the worker is
+busy, that order is preserved, that a partial batch is
 drained by a barrier before state changes, that an idle barrier takes the
 lock-free path without blocking, that worker-thread busy time is kept apart
 from the producer's backpressure and barrier stalls, that affinity is
@@ -55,6 +58,43 @@ initialised once and on the worker, and that failure injected at each internal
 allocation leaves no thread, lock or condition behind. It does not test Vulkan;
 renderer ordering against real command streams belongs to the generated GPU
 matrix below.
+
+## Attribution: running the core's own profiler off-device
+
+The core has full CPU/JIT/event instrumentation, opt-in behind
+`gpu_diagnostics=timing`. The device captures never carried it, and the Vulkan
+and GL hosts need a GPU. The software renderer needs neither, so
+`profile_host.c` is a headless libretro frontend with no GL, no Vulkan and no
+window: it loads the core, turns the diagnostics on, runs frames and prints
+the `core_profile_*_v1` records the core emits.
+
+```sh
+# 1. Build a core for this host (any renderer; software needs no GPU).
+make platform=unix HAVE_LIGHTREC=1 OBJECT_DIR=/tmp/psx-host
+
+# 2. Build the harness and a self-checking ROM, then run.
+make -C tools/multicore profile-host BUILD_DIR=/tmp/mc
+python3 tools/multicore/make_gpu_test.py /tmp/gpu-test.exe --bios-dir /tmp/bios
+PROFILE_HOST_SYSTEM_DIR=/tmp/bios PROFILE_HOST_SAVE_DIR=/tmp/save \
+  /tmp/mc/profile_host /tmp/psx-host/core.so /tmp/gpu-test.exe 600
+```
+
+It is a correctness gate as well as a stopwatch: the generated ROM draws
+primitives whose VRAM result is exactly predictable and reads them back, and
+the harness exits non-zero unless all 22 cases pass. Timing a scheduler change
+without that verdict is meaningless, so it refuses to report one alone.
+
+Two things to keep in mind when reading its output. **The profiler is not
+free** - on a light workload it costs about a third of frame time, because it
+takes two clock reads per sampled event, so always pair a run with
+`beetle_psx_gpu_diagnostics=disabled` before quoting a millisecond figure.
+**Absolute microseconds are this host's**, not a TV's; what transfers is the
+shape - events per frame by type, JIT quanta and their exit reasons, and how
+those move when the workload or a setting changes.
+
+Note also that under the software renderer `GPU_Update` performs scanout, so
+its per-event cost rises with internal resolution. That is a software-renderer
+property and does not describe the hardware-renderer path.
 
 For race detection, use a separate build directory:
 

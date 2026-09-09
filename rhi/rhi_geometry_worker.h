@@ -35,6 +35,14 @@ rhi_geometry_worker_t *rhi_geometry_worker_new(rhi_defer_dispatch_fn dispatch,
       void *user);
 void rhi_geometry_worker_push(rhi_geometry_worker_t *worker,
       const rhi_defer_op_t *op);
+/* Queue `op` only when the worker already has work outstanding. With an empty
+ * queue and a parked worker the caller already owns the backend, so applying
+ * the change itself is both ordered and cheaper: a queued op costs a
+ * full-union copy (232 bytes) and a wakeup, which an eight-byte renderer state
+ * change should not pay when there is nothing to stay ahead of. Returns false
+ * when the caller should apply it directly. */
+bool rhi_geometry_worker_queue_if_busy(rhi_geometry_worker_t *worker,
+      const rhi_defer_op_t *op);
 void rhi_geometry_worker_sync(rhi_geometry_worker_t *worker);
 void rhi_geometry_worker_free(rhi_geometry_worker_t *worker);
 /* Drains before reading/resetting the worker-owned counters. */

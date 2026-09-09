@@ -736,6 +736,116 @@ The harness proves ordering, ownership and lifecycle. It does not prove the spli
 
 Ordering correctness against real command streams still needs the generated PIO/DMA matrix (`tools/multicore/check_gpu.py`) and the queue-stress build against a built core, and real Vulkan validation layers. None of those ran here.
 
+## Capture 2 — September 9, `97751385-dirty` (30 windows)
+
+A second capture on the same device and content, after the event-cadence, staging and geometry-split work. `tv_logs.txt` 1,294 lines, `full_logcat_tv.txt` 85,470 lines; SHA-256 `00e7f982...` and `cd3ef3ac...`. Runtime reports `gpu_worker=0 spu_worker=1` and `Vulkan geometry worker on`, which is the intended configuration: the raw GP0 worker is off for Vulkan and decoded geometry goes to the render worker.
+
+### What the previous work bought, in the same scene
+
+The plateau is reproducible across captures — identical GP0 traffic (14,357 words/frame), identical DMA-ready poll count (1,032/frame), identical event count (~9,990/frame) — so the two are directly comparable:
+
+| | Capture 1 (`56134fb0`) | Capture 2 (`97751385`) | Change |
+|---|---:|---:|---:|
+| CPU ms/frame | 28.41 | 25.60 | **-9.9%** |
+| lightrec quanta/frame | 8,131 | 6,355 | **-21.8%** |
+| us per quantum | 3.50 | 4.03 | +15% (same work, fewer exits) |
+| events/frame | 9,966 | 9,993 | unchanged |
+| Frontend fps | 34.2 | 37.9 | **+10.8%** |
+| Frontend run ms | 28.7 | 26.1 | -9.1% |
+
+The quantum reduction is smaller than the harness's 41.3% because that figure is for an idle controller: in this scene DMA is actively streaming 14,357 words, and an active channel deliberately keeps the original grid. The measured 21.8% is the idle fraction of a DMA-busy scene, and it converts to ~10% frame time.
+
+### What the capture found next
+
+The capture also reaches scenes the first one never sampled, and they are much heavier: **21.3-23.4 fps at 42-46 ms/frame** (`tv_logs.txt:1041, 1094, 1192, 1196`), with 8,700-8,800 GP0 words, ~1,090 geometry primitives and 4,100-4,200 DMA-ready polls per frame. That is now the worst case, not the 28 ms plateau.
+
+The geometry counters answer the question the last session left open, and the answer is split:
+
+| Window | commands/frame | batches/frame | worker busy | barriers | blocked | barrier wait |
+|---|---:|---:|---:|---:|---:|---:|
+| Plateau (`:339`-`:485`) | **0.0** | 0.0 | 0.00 ms | **3,100** | 0 | 0.00 ms |
+| `:522` | 126.4 | 7.4 | 0.64 ms | 6,900 | 1,666 | 0.70 ms |
+| `:534` | 115.5 | 7.4 | 0.58 ms | 6,475 | 1,666 | 0.67 ms |
+| `:950` (heavy 3D) | 1,097.0 | 34.8 | **4.09 ms** | 3,890 | 299 | 0.57 ms |
+| `:1186` | 1,079.2 | 34.2 | 3.82 ms | 3,907 | 298 | 0.45 ms |
+
+- **Where it works**, it works well: the heavy 3D windows move **3.8-4.1 ms/frame** of rendering off the emulation thread for 0.45-0.57 ms of stalls, in batches averaging 31.5 of a 32 cap.
+- **Where it does not**, the ratio is absurd: 55-80 barriers per command in the mid-load windows, and **3,100 barriers a frame against zero commands** in the plateau. That is the "narrow the split" signal the last session named in advance.
+
+The barriers come from the renderer state setters. `Command_TexWindow` (GP0 E2), `Command_Clip0` (E3) and `Command_Clip1` (E4) each drove a full drain, and the display-state block in `GPU_Update` adds more per scanline. The guest changes clip rect and texture window far more often than it draws.
+
+### Change: renderer state rides the stream, but only when the worker is busy
+
+Both halves of that sentence matter, and the second one is what the data forced.
+
+Queueing a state set instead of draining removes the stall and lets batches fill - in `:534` that is 1,666 blocking drains and 0.67 ms/frame. But `sizeof(rhi_defer_op_t)` is **232 bytes**, and an eight-byte clip change does not want to pay a full-union copy plus a worker wakeup. In the plateau - 3,100 state sets, **zero** draws, **zero** blocked barriers - queueing would have been a pure regression: ~700 KB/frame of stores replacing a barrier that already cost nothing.
+
+So the rule is: queue the op only when the worker already has something outstanding. With an empty queue and a parked worker the producer already owns the backend, so it applies the change itself - trivially ordered, no copy, no wakeup. `rhi_geometry_worker_queue_if_busy()` makes that one test, the same one the barrier fast path uses.
+
+- Plateau (no draws): every state set applies directly. No copies, no wakeups, and the following barrier takes its lock-free path. No worse than before.
+- Draw-heavy: state sets ride the stream, removing the blocking drains and letting batches fill.
+
+Eight setters are routed this way - texture window, draw offset, draw area, VRAM framebuffer coords, horizontal and vertical display range, display mode, display toggle. All are value-owned. `load_image` keeps its barrier because the op aliases a live VRAM pointer; `read_vram`, `fill_rect`, `copy_rect`, the frame boundary, option refresh and context lifecycle keep theirs.
+
+`vk_geometry_dispatch` gained a `renderer` guard: enqueueing already requires a live renderer and the worker is stopped before it can change, but the alternative branch in the `_direct` bodies pushes to the pre-context defer queue, which belongs to the producer. Stated as a guard rather than left as an assumption.
+
+**Tests:** `tools/multicore/geometry_worker.c` now interleaves a clip change ahead of every primitive and checks it is applied in that position, not merely delivered - 4,208 ops in 136 batches. Separate cases prove the policy itself: refused with nothing outstanding, accepted once a primitive is queued, refused again after a barrier drains it. 11/11 suites pass, clean under TSan and ASan/UBSan, and `libretro.c`, `rhi_lib_vulkan.c`, `rhi_geometry_worker.c`, `rhi_intf.c` and `mednafen/psx/gpu.c` compile clean on ARM32 and ARM64 through the real root Makefile.
+
+### GPU: one image allocation per presented frame, not fixed here
+
+`img_create_seen` tracks presentations at a ratio of **0.95-1.01 across the whole capture** - one core-side `vkCreateImage` per presented frame, confirming capture 1's finding on a second session. The array is called `reuseable_scanout` but is not reused: all three creation sites do `ih_move(&self->reuseable_scanout[idx], device_create_image(...))`, so the ring only rotates which slot holds the newest image. With ~10 swapchain images in flight (`got=10`), steady state is ~10 live scanout images with one allocated and one freed per frame.
+
+I did not change it, and the reason is worth recording. Reuse needs proof that the frontend is done with the slot's image. The refcount (`Image.reference_count`) is a **single-threaded, non-atomic** counter, and `scanout_handles` holds a reference per swapchain index - so a 3-slot ring against a 10-image swapchain would keep the count above one and silently fall back to allocating anyway. The correct fix is a keyed recycler at the device's existing retirement point, `PerFrame.destroyed_images` + `PerFrame.allocations`, which is where the device already knows an image is GPU-retired. That is an allocator change, and getting it wrong produces intermittent corruption that shows on one driver and not another. It needs Vulkan validation layers and a device, neither of which is available here, so it stays specified rather than guessed at.
+
+**Next capture should answer:** whether the barrier counts collapse in the mid-load windows (expect `barriers` to fall toward the load_image count and `blocked` toward zero), whether batches/frame rise in `:522`/`:534` from 7.4 toward the 32 cap, and whether the heavy 3D windows at 42-46 ms move at all - the geometry split is already paying 3.8-4.1 ms there, so their remaining cost is CPU-side and belongs to Phase C's unfinished attribution work.
+
+## Phase C unblocked — the core's own profiler, run off-device (2026-09-09)
+
+Phase C was blocked on attribution: `event timing off` and `per-word timing off` in every device window, so nothing said how CPU_Run splits. The instrumentation was never missing - it is opt-in behind `gpu_diagnostics=timing`, and there was simply nowhere to run it, because device profiling is suspended and both existing hosts need a GPU. The software renderer needs neither.
+
+**`tools/multicore/profile_host.c`** is a headless libretro frontend with no GL, no Vulkan and no window. It loads the core, enables the diagnostics, runs frames, and prints the `core_profile_*_v1` records. It is also a correctness gate: `make_gpu_test.py` produces a self-checking ROM, and the harness exits non-zero unless all 22 cases pass, so a scheduler change cannot be timed without also being verified. The current tree passes **22 cases, 1,734 words, 0 mismatches**.
+
+### The scheduler change is confirmed end to end
+
+The host run reports what the count analysis predicted and the device measured indirectly:
+
+- **8,973 `GPU_Update` calls per frame, of which 4,487 (exactly half) are zero-elapsed.** That is the DMA-driven call landing on the GPU's own timestamp - idle-DMA deadline sharing working on real code, and taking the early-out added for it.
+- **9,942 events dispatched across 5,186 JIT quanta = 1.92 events per exit.** The theoretical ceiling for a fully shared GPU+DMA grid is 2.0. Before the change the two grids were out of phase and this ratio was near 1.
+- Event counts match the device almost exactly: 9,942 host vs 9,993 device per frame, split GPU 4,485 / DMA 4,485 / CDC 739 / timer 264 / FIO 0. The grid is workload-independent, which is the whole point of what follows.
+- `core_profile_cpu_v1` shows **1,560,501 of 1,560,553 exits are `normal`** - budget exhausted, not IRQ, fault or syscall. There is no pathological exit cause to chase.
+
+### What the machinery costs
+
+An `EventCycles` sweep, diagnostics **off** so the profiler's own clock reads are not counted (they cost about a third of frame time on a light workload - a caveat worth having found):
+
+| EventCycles | events/frame | quanta/frame | events per exit | CPU ms/frame |
+|---:|---:|---:|---:|---:|
+| 128 | 9,942 | 5,186 | 1.92 | 0.333 |
+| 256 | 5,471 | 3,092 | 1.77 | 0.245 |
+| 512 | 3,367 | 2,046 | 1.65 | 0.209 |
+| 1024 | 2,315 | 1,522 | 1.52 | 0.192 |
+
+Marginal cost is stable at **18.5 ns per event / 38.5 ns per quantum** on this host, and the scheduler machinery is **0.144 ms of the 0.333 ms frame - 43%** of CPU_Run at `EventCycles=128` on a light workload. Extrapolating the sweep to zero gives a guest-work residual of 0.189 ms.
+
+**What the host cannot separate:** varying `EventCycles` moves quanta and events together by construction, so a two-variable fit on this data is degenerate (it returns a negative per-quantum coefficient). Do not attempt to split "JIT exit" from "event dispatch" this way.
+
+**What already did separate them:** the idle-DMA deadline-sharing change, on the device. It removed 1,776 quanta/frame while leaving the event count unchanged (9,966 -> 9,993), for -2.81 ms/frame - **about 1.6 us per removed exit, inclusive of the GPU_Updates that became zero-elapsed**. That is a device-side measurement of exactly the quantity the host sweep cannot isolate.
+
+### What this says about the 42-46 ms scenes
+
+Taking the device's own 1.6 us per exit against the plateau's 6,355 quanta/frame puts the quantum machinery at roughly **6-10 ms of the 25.6 ms plateau**, with the range reflecting that the removed exits may not have cost the average. It is the largest single identified component, and it is a fixed tax: the count is set by the grid, not the scene, so the same 6-10 ms sits inside the 46 ms window too - where it is a smaller share, and the remaining ~36 ms is guest execution, memory wrappers and GP0.
+
+The practical ceiling is now visible. Quanta are already within 18% of the floor for a single 128-cycle grid (5,186 against 4,414), because the GPU and DMA grids are now shared. **Further quantum reduction requires lengthening the GPU's own grid**, which is Phase D item 2 and a guest-timing question, not a scheduling one: `GPU_AdvanceDrawing`'s credit is consumed by `ProcessFIFO` between updates, so a longer tick needs every observer (`GPU_Read`, `GPU_Write`, `GPU_DMACanWrite`, `TIMER_Read`) to bring the GPU current on demand, plus a dot-clock-aware timer deadline.
+
+That work now has somewhere to be tested: the harness measures the speed and the ROM checks the pixels, in one command.
+
+### Limits of this measurement
+
+- Absolute microseconds are this host's (wide out-of-order, ~4 GHz) not a TV's (in-order, 1.53 GHz). Ratios and counts transfer; milliseconds do not.
+- The host build reports `mapping=0` ("Memory map is sub-par") where the device reports `mapping=4`, so its `generic_rw` count (139/frame) is a host artifact and says nothing about device memory-wrapper traffic. Fixing that mapping on the host would make generic-access attribution possible and is the obvious next harness improvement.
+- Under the software renderer `GPU_Update` performs scanout, so its per-event cost rises with internal resolution (0.12 -> 0.40 ms/frame from 1x to 4x). That is a software-renderer property; it does not describe the Vulkan path the device uses.
+- The synthetic ROM's workload is not Tekken's. It is the right shape for measuring the *workload-independent* grid and the wrong shape for measuring GP0 or GTE cost.
+
 ## Historical FIFO implementation and verification
 
 The earlier review covered a different PID 10375 session. Its performance figures and GPU-worker default are superseded by the current capture. It reported an atomic byte publishing FIFO readiness and the compatibility threshold, usable only when worker retirement covers submissions, staging is empty and no pending IRQ/setting mismatch requires a barrier. Batched queue submission uses up to two contiguous copies with one publication/wake check. This is not a complete emulation-thread shadow decoder; command-cycle progress and continuation semantics still require authoritative synchronization.
@@ -785,7 +895,7 @@ The prior session reported IDE access restrictions for GL-host sources and no us
 |---|---|---|
 | **A — Baseline/profiling** | The periodic record turned out to be present and complete for counts (31 windows); only the *timing* inside it is off. Native suites and mock checks pass; device profiling suspended | Price a CPU-loop exit and a GP0 word on the host, since that is what every remaining decision needs. Add a `LIGHTREC_EXIT_SEGFAULT` counter. When device capture resumes, require `gpu_diagnostics=timing` paired against a `disabled` control on one labelled scene |
 | **B — Android builds** | Build-system fixes and policy tests implemented; the three changed production files compile clean on ARM32 and ARM64 through the real root Makefile | Re-run the full policy matrix; when builds are requested again, verify all ABI variants, final flags, exports, dependencies, 16 KB alignment, and normal-versus-profile defaults. O2/O3/LTO/ISA comparisons remain unperformed |
-| **C — JIT/memory** | The exit-count problem is now addressed from the scheduler side (Phase D item 1). No JIT fast paths added, and none should be until attribution exists | Build the host attribution; only then choose guarded memory/helper/register/GTE work, with failing-before/passing-after probes on ARM32 and ARM64 and both mapping paths |
+| **C — JIT/memory** | **Attribution now exists**: `tools/multicore/profile_host.c` runs the core's own profiler off-device, with the self-checking ROM as a correctness gate. Scheduler machinery measured at 43% of CPU_Run on a light host workload; ~6-10 ms of the device's 25.6 ms plateau. Exits are 99.99% `normal` - no fault path to chase | Fix the host's sub-par Lightrec mapping so generic memory-wrapper traffic becomes measurable, then choose guarded memory/helper/GTE work against real numbers. Quanta are within 18% of the single-grid floor, so further reduction is Phase D item 2, not a JIT change |
 | **D — Event scheduler** | Idle-channel fast path, idle-DMA deadline sharing and the zero-elapsed `GPU_Update` early-out implemented; differential DMA harness and a new full-frame scheduler harness cover them. 41.3% fewer CPU-loop exits with an identical emulated outcome | Watch dot-clock timer IRQ latency in game testing. Lengthening the GPU's own grid is a design (on-demand device updates plus a dot-clock-aware timer deadline), not an edit - do not start it before the exit cost is priced |
 | **E — Compiler concurrency** | Profiling and tests added; worker count unchanged. Nothing in the capture implicates compile churn in warm gameplay | Measure queue contention and cold/warm behavior before comparing worker counts |
 | **F — GPU/rendering** | Portable five-mode scanout division; adaptive staging bypass and the folded barrier predicate; and the split moved downstream - decoded geometry now goes to a Vulkan render worker while GP0 decoding, FIFO readiness and drawing time stay on the emulation thread. Lifecycle audited end to end; two latching bugs fixed. Whether the split pays is unmeasured | Capture `worker_busy_us` against `backpressure_wait_us` / `barrier_wait_us`; narrow the split if barriers approach commands or barrier waits dominate busy time. Scanout image reuse (one `vkCreateImage` per presented frame). Run the generated PIO/DMA matrix, the queue-stress build and Vulkan validation against a built core |
