@@ -846,6 +846,53 @@ That work now has somewhere to be tested: the harness measures the speed and the
 - Under the software renderer `GPU_Update` performs scanout, so its per-event cost rises with internal resolution (0.12 -> 0.40 ms/frame from 1x to 4x). That is a software-renderer property; it does not describe the Vulkan path the device uses.
 - The synthetic ROM's workload is not Tekken's. It is the right shape for measuring the *workload-independent* grid and the wrong shape for measuring GP0 or GTE cost.
 
+## Capture 3 — September 9, `0d93276b-dirty` (22 windows)
+
+Third capture, same device and content, after the in-stream state-set change. `tv_logs.txt` 1,237 lines, SHA-256 `567c5ad4...`.
+
+### The barrier change worked
+
+Mid-load windows, the ones the change targeted:
+
+| | Capture 2 | Capture 3 |
+|---|---:|---:|
+| geometry commands/frame | 126.4 | 136.9 |
+| batches/frame | 7.4 | 5.0 |
+| commands per batch | 17.1 | **27.4** (cap 32) |
+| barriers/frame | 6,900 | **3,900** |
+| barriers **blocked** | 1,666 | **300** |
+| barrier wait ms/frame | 0.70 | **0.22** |
+| CPU ms/frame | 16.01 | 15.40 |
+
+Blocked barriers land at ~300 per 300-frame window in almost every scene - **one per frame**, which is the frame-end drain and cannot be removed. The barrier problem is finished. Heavy 3D improved alongside it: CPU 46.00 -> 42.63 ms, barrier wait 0.57 -> 0.31 ms, batches at 31.5 of a 32 cap.
+
+The plateau is unchanged at ~26 ms, as designed: it draws nothing, so every state set takes the direct path and pays no op copy.
+
+### Where the remaining cost is not
+
+Three candidates ruled out by this capture:
+
+- **Not frontend presentation.** `present_wait` is 1.0-1.4 ms in every window, including those with 5-6 ms `finalize`. The finalize spikes are core-side.
+- **Not scanout image allocation.** The plateau creates one image per presented frame (`img_create` ratio 1.00) and has the *smallest* finalize in the capture, 0.26-0.32 ms. Whatever the 5-6 ms spikes are, per-frame image creation is not it - it bounds out below ~0.6 ms per presented frame. The spikes are also unstable between windows of the same scene (5.78 vs 2.03 ms at identical workloads), which reads as pipeline creation or resource churn, not steady per-frame work.
+- **Not GP0 volume, and not scheduling.** This is the decisive comparison:
+
+| window | CPU ms | quanta | us/quantum | GP0 words | geometry cmds |
+|---|---:|---:|---:|---:|---:|
+| plateau `:373` | 26.00 | 6,353 | 4.09 | **14,357** | 0 |
+| heavy 3D `:912` | 43.03 | 6,410 | 6.71 | 8,533 | 1,081 |
+
+Same quantum count, *fewer* GP0 words, 17 ms apart. The scheduler cost is identical by construction and the command volume is lower, so the difference is per-quantum work: guest instruction mix.
+
+### GTE accounting added
+
+Tekken's heavy scenes are 3D transform work, and GTE ops reach the emulator through `cop2_op()` -> `GTE_Instruction()`, one C helper call per op from recompiled code. Nothing counted them, so it stayed a hypothesis for three captures.
+
+`cpu_profile_t` now carries `gte_ops`, `gte_samples` and `gte_sample_us`, reported in `core_profile_cpu_v1`. The timing is sampled 1-in-64, matching the event timers - two clock reads on every GTE op would cost more than the op on exactly the scene being measured. When profiling is off the path is unchanged: one predicted branch.
+
+Verified through `profile_host` on the real core: the fields report cleanly and read zero on a GTE-free ROM, which is the correct answer for that workload. Both Android ABIs compile clean. **The next capture with `gpu_diagnostics=timing` answers whether GTE explains the 17 ms**, and `gte_sample_us / gte_samples` gives the per-op cost directly.
+
+If it does, Phase C item 7 applies - optimise GTE's integer math and register transfer with equivalence tests, never its latency model. If it does not, the remaining suspect is the memory wrappers, and the host harness needs its Lightrec mapping fixed first (it reports `mapping=0` against the device's `mapping=4`).
+
 ## Historical FIFO implementation and verification
 
 The earlier review covered a different PID 10375 session. Its performance figures and GPU-worker default are superseded by the current capture. It reported an atomic byte publishing FIFO readiness and the compatibility threshold, usable only when worker retirement covers submissions, staging is empty and no pending IRQ/setting mismatch requires a barrier. Batched queue submission uses up to two contiguous copies with one publication/wake check. This is not a complete emulation-thread shadow decoder; command-cycle progress and continuation semantics still require authoritative synchronization.

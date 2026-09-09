@@ -6638,10 +6638,12 @@ static void perf_report(void)
          " zero_progress=%" PRIu64 " interpreter_frames=%" PRIu64
          " normal=%" PRIu64 " irq_check=%" PRIu64 " break=%" PRIu64
          " syscall=%" PRIu64 " unmapped=%" PRIu64 " nomem=%" PRIu64
-         " unknown_op=%" PRIu64 " code_inv=%" PRIu64 " spgp_slow=%" PRIu64 "\n",
+         " unknown_op=%" PRIu64 " code_inv=%" PRIu64 " spgp_slow=%" PRIu64
+         " gte_ops=%" PRIu64 " gte_samples=%" PRIu64 " gte_sample_us=%" PRIu64 "\n",
          cpu.jit_quanta, cpu.guest_cycles, cpu.zero_progress, cpu.interpreter_frames,
          cpu.exits[0], cpu.exits[1], cpu.exits[2], cpu.exits[3], cpu.exits[4],
-         cpu.exits[5], cpu.exits[6], cpu.exits[7], cpu.exits[8]);
+         cpu.exits[5], cpu.exits[6], cpu.exits[7], cpu.exits[8],
+         cpu.gte_ops, cpu.gte_samples, cpu.gte_sample_us);
 #ifdef HAVE_LIGHTREC
    {
       struct lightrec_profile jit;

@@ -159,6 +159,19 @@ typedef struct
    uint64_t zero_progress;
    uint64_t exits[9];
    uint64_t interpreter_frames;
+   /* GTE (COP2) compute ops issued from recompiled code.
+    *
+    * The September 9 capture puts two scenes at the same quantum count -
+    * ~6,355 and ~6,410 per frame - and 17 ms apart, with the slower one
+    * issuing *fewer* GP0 words. Neither scheduling nor command volume
+    * explains that, which leaves guest instruction mix, and Tekken's heavy
+    * scenes are 3D transform work. Nothing counted GTE, so it stayed a
+    * hypothesis. `gte_sample_us` is sampled 1-in-64 like the event timings,
+    * so the cost of measuring does not swamp what is measured; divide it by
+    * `gte_samples`, not by `gte_ops`. */
+   uint64_t gte_ops;
+   uint64_t gte_samples;
+   uint64_t gte_sample_us;
 } cpu_profile_t;
 
 void CPU_SetProfiling(bool enabled);

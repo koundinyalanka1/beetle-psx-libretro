@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <assert.h>
 
+#include <features/features_cpu.h>
 #include "psx.h"
 #include "cpu.h"
 #include "psx_mem.h"
@@ -3151,7 +3152,25 @@ static void cop2_op(struct lightrec_state *state, uint32_t func)
        * by recompiled code returned the GTE result without the proper
        * stall, while the interpreter blocked on the latency. */
       int32_t timestamp = lightrec_current_cycle_count(state);
-      int32_t latency   = GTE_Instruction(func);
+      int32_t latency;
+
+      if (MDFN_LIKELY(!cpu_profile_enabled))
+         latency = GTE_Instruction(func);
+      else
+      {
+         /* Sampled 1-in-64, matching the event timers: two clock reads on
+          * every GTE op would cost more than the op on a scene that issues
+          * thousands of them, which is exactly the scene being measured. */
+         bool sample = (cpu_profile.gte_ops++ & 63) == 0;
+         retro_time_t t0 = sample ? cpu_features_get_time_usec() : 0;
+         latency = GTE_Instruction(func);
+         if (sample)
+         {
+            cpu_profile.gte_sample_us += cpu_features_get_time_usec() - t0;
+            cpu_profile.gte_samples++;
+         }
+      }
+
       if (timestamp < gte_ts_done)
          timestamp = gte_ts_done;
       gte_ts_done = timestamp + latency;
