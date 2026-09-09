@@ -553,9 +553,74 @@ static INLINE int32_t CalcNextEvent(int32_t next_event)
    return(next_event);
 }
 
+/*
+ * Idle-DMA deadline sharing.
+ *
+ * DMA re-arms on a fixed EventCycles grid whether or not it has anything to
+ * transfer, and GPU_Update() does the same on a grid of its own.  The two
+ * grids drift out of phase (the GPU's shortens at every scanline boundary),
+ * so the CPU loop is interrupted by both: the September 8 capture shows
+ * ~9,966 dispatched events and ~8,100 lightrec quanta per frame against the
+ * ~4,414 a single 128-cycle grid implies.  Roughly half of those exits pay
+ * lightrec entry/exit and an event-list walk to advance a DMA controller with
+ * no active channel.
+ *
+ * When no channel is busy and none holds a partially consumed block, a DMA
+ * update has no channel work left to do: the idle branch below only clamps
+ * accumulated credit to zero, which is idempotent, and both remaining callees
+ * are invariant to how the interval is subdivided (MDEC_Run saturates its
+ * clock counter at EventCycles, and GPU_Update's drawing credit saturates at
+ * 2*EventCycles - `min` composes).  So an idle controller can be re-armed at
+ * the GPU's existing deadline instead of its own: the events then coincide and
+ * PSX_EventHandler retires both in one CPU exit.
+ *
+ * This does move GPU_Update's call sites onto the GPU's grid alone, where
+ * today they land on the union of both grids.  The gap between GPU updates
+ * stays bounded by EventCycles either way, which is the granularity this
+ * scheduler already declares, but it is a real change in when dot clocks reach
+ * TIMER, so it is confined to the idle case and only ever moves the deadline
+ * inside the current quantum.  An active channel keeps the original grid,
+ * because RunChannel discards leftover credit when a device blocks and is
+ * therefore not subdivision-invariant.
+ */
+static INLINE int32_t DMA_IdleShareDeadline(const int32_t timestamp,
+      const int32_t gpu_next, int32_t next_event)
+{
+   /* Both candidates are CPU-domain delays bounded by EventCycles, because
+    * GPU_Update() clamps its own next event to that quantum.
+    *
+    * The armed entry is preferred while it is still in the future.  When it is
+    * not - the GPU event is due at this very timestamp and has not been
+    * dispatched yet, which happens whenever DMA sorts ahead of it - that entry
+    * is stale, and the deadline GPU_Update() just returned is the one the GPU
+    * will re-arm to. Taking it makes both events converge on the same
+    * timestamp after a single update instead of oscillating. */
+   int32_t armed;
+   int32_t shared;
+
+   /* Under a CPU overclock the two domains round separately
+    * (overclock_cpu_to_device rounds up per call), so a differently
+    * subdivided interval does not accumulate to the same device-clock total
+    * and DMACycleCounter's phase would drift from the original schedule.
+    * That configuration is not part of the full-speed baseline, so leave it
+    * on the original grid rather than trade exactness for its sake. */
+   if (psx_overclock_factor)
+      return next_event;
+
+   armed  = PSX_PeekEventNT(PSX_EVENT_GPU) - timestamp;
+   shared = (armed > 0) ? armed : (gpu_next - timestamp);
+
+   if (shared > 0 && shared <= EventCycles)
+      return shared;
+
+   return next_event;
+}
+
 int32_t DMA_Update(const int32_t timestamp)
 {
    int32_t clocks, i;
+   int32_t next_event, gpu_next;
+   bool all_idle = true;
    /*   uint32_t dc = (DMAControl >> (ch * 4)) & 0xF; */
    clocks = timestamp - lastts;
    if (psx_time_events)
@@ -565,11 +630,33 @@ int32_t DMA_Update(const int32_t timestamp)
 
    lastts = timestamp;
 
-   GPU_Update(timestamp);
+   gpu_next = GPU_Update(timestamp);
    MDEC_Run(clocks);
 
    for (i = 0; i < 7; i++)
-      RunChannel(timestamp, clocks, i);
+   {
+      /* An idle channel cannot touch a device or RAM. RunChannel would
+       * only add elapsed clocks and discard positive credit. Keep negative
+       * debt (including restored state), and never skip a partially consumed
+       * block: forced stops may clear busy while WordCounter is nonzero.
+       * Test live state after GPU/MDEC updates; no cached active mask needs
+       * re-arming on register writes or state loads. */
+      if (!DMACH[i].WordCounter && !(DMACH[i].ChanControl & (1U << 24)))
+      {
+         DMACH[i].ClockCounter += clocks;
+         if (DMACH[i].ClockCounter > 0)
+            DMACH[i].ClockCounter = 0;
+      }
+      else
+      {
+         RunChannel(timestamp, clocks, i);
+         /* Re-test after the transfer: a channel that reached its terminal
+          * count during this update is idle again from here on, and only a
+          * register write (which re-arms on the grid) can restart it. */
+         if (DMACH[i].WordCounter || (DMACH[i].ChanControl & (1U << 24)))
+            all_idle = false;
+      }
+   }
 
    DMACycleCounter -= clocks;
    while(DMACycleCounter <= 0)
@@ -577,7 +664,12 @@ int32_t DMA_Update(const int32_t timestamp)
 
    RecalcHalt();
 
-   return (timestamp + CalcNextEvent(0x10000000));
+   next_event = CalcNextEvent(0x10000000);
+
+   if (all_idle)
+      next_event = DMA_IdleShareDeadline(timestamp, gpu_next, next_event);
+
+   return (timestamp + next_event);
 }
 
 void DMA_Write(const int32_t timestamp, uint32_t A, uint32_t V)

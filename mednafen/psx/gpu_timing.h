@@ -16,6 +16,24 @@ static inline uint32_t GPU_DotClocks(uint32_t clocks, unsigned mode)
    }
 }
 
+/* Scanout has a fifth /7 mode selected by bit 6. Timer dot clocks above
+ * deliberately retain their existing four-mode interpretation. Constant
+ * divisors let compilers use shifts/multiplies instead of runtime division.
+ * Unsigned input preserves the original table-divisor conversion, including
+ * unusual restored horizontal coordinates. */
+static inline uint32_t GPU_DisplayClocks(uint32_t clocks, unsigned mode)
+{
+   if (mode & 0x40)
+      return clocks / 7;
+   return GPU_DotClocks(clocks, mode);
+}
+
+static inline uint32_t GPU_DisplayWidth(unsigned mode)
+{
+   static const uint16_t widths[5] = {280, 350, 560, 700, 400};
+   return widths[(mode & 0x40) ? 4 : (mode & 3)];
+}
+
 static inline int32_t GPU_NextEventDelay(int32_t line_clocks,
       uint64_t fractional_clocks, int32_t ratio, int32_t quantum)
 {

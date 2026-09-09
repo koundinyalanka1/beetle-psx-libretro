@@ -13,6 +13,31 @@ The worker test covers a full FIFO, ordering, draining during destruction,
 multiple callers dispatching to a shared pool, and creation failures. Both
 tests inject failure at each thread/lock/condition allocation and check cleanup.
 
+The DMA test drives the production `DMA_Update()` against the original
+unconditional channel walk and, separately, checks idle-DMA deadline sharing:
+serialized state, RAM and the ordered device/IRQ trace must not depend on the
+GPU deadline the scheduler holds, the controller is never left unserviced for
+longer than one event quantum, and an active or partially consumed channel
+stays on the original grid.
+
+The event-scheduler test runs a full NTSC frame through the same event list
+`libretro.c` uses, with the production `DMA_Update()` and the production
+`GPU_NextEventDelay()` arithmetic driving a scanline model built from `gpu.c`'s
+constants. It reports how many CPU-loop exits (lightrec re-entries) the frame
+costs with and without deadline sharing and asserts the emulated outcome is
+identical. Its baseline exit count lands in the same range as the quanta/frame
+the September 8 device capture reports, which is what makes the comparison
+meaningful; it is a schedule model, not a performance measurement.
+
+The GPU staging test replays recorded guest batching shapes through
+`mednafen/psx/gpu_stage_policy.h` and checks when staging is bypassed: never
+before the trip count, never on a shape a worker could help with, re-armed as
+soon as one uninterrupted run reaches the publication threshold, and reset
+correctly on state load, reset and worker restart. It covers the
+`BEETLE_GPU_QUEUE_STRESS_TEST` threshold of 4 as well as the shipping 1024.
+Ordering and barrier correctness for that path stay with the generated GPU
+matrix below, which needs a built core.
+
 For race detection, use a separate build directory:
 
 ```
@@ -67,3 +92,12 @@ For queue coverage, build a separate core with
 `--require-worker-queue`. This uses the production queue implementation with a
 16-entry ring and four-word staging buffer, forcing handoffs and frequent
 wraparound. Never ship this stress build or use its speed to choose defaults.
+
+The DMA test compares production `DMA_Update` with the original unconditional
+channel walk using the unchanged production transfer engine. It checks serialized
+DMA state, RAM, next deadlines and ordered GPU/MDEC/SPU/CDC/IRQ/JIT-invalidation
+calls over idle credit/debt, zero elapsed time, every active-channel combination,
+backpressure, partial forced stops, register restarts and linked-list termination.
+This permits the idle fast path without caching an active mask or relaxing any
+device update deadline. Device calls are stubs; full game compatibility is not
+established by this harness.

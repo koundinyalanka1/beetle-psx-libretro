@@ -18,6 +18,7 @@
 #include "psx.h"
 #include "gpu.h"
 #include "gpu_timing.h"
+#include "gpu_stage_policy.h"
 #include "irq.h"
 #include "timer.h"
 #include "FastFIFO.h"
@@ -211,6 +212,36 @@ static uint32_t gpu_queue_tail = 0;
 
 static gpu_cmd_t gpu_stage[GPU_STAGE_MAX];
 static uint32_t gpu_stage_count = 0;
+
+/*
+ * Staging bypass.
+ *
+ * Staging assumes a batch will eventually be long enough to hand over.  The
+ * September 8 Tekken 3 capture says that in the heavy scene it never is: 14357
+ * GP0 words a frame, every one of them retired inline, worker busy 0.00
+ * ms/frame in every sampled window, and ~1032 DMA readiness polls a frame of
+ * which ~98% found staged words and forced a resolve - roughly fourteen words
+ * per batch against a threshold of 1024.  In that regime the buffer is pure
+ * overhead: each word is written to gpu_stage[] and read back a few
+ * microseconds later, and because gpu_stage_count is almost never zero the
+ * published-readiness fast path in GPU_DMACanWrite() cannot answer either (22
+ * of 1032 polls in the plateau, against 1230 of 1405 in a later scene where
+ * the guest streams instead of polling).
+ *
+ * So track how the guest is actually behaving.  After a run of short inline
+ * resolves, stop staging and execute GP0 where it would have ended up anyway.
+ * While bypassing, nothing is outstanding by construction - the buffer is
+ * empty, the ring is empty and the worker is parked - which is exactly the
+ * condition every barrier in this file is testing for, so status reads and
+ * readiness polls answer without one.
+ *
+ * The bypass is left as soon as the guest streams a batch long enough to have
+ * been published, so a game (or scene) that would benefit from the worker
+ * still gets it.  This is a policy over observed guest behaviour, not a device
+ * or model check, and it changes no emulated result: the same words execute in
+ * the same order on the same thread that GPU_Stage_Resolve() would have used.
+ */
+static gpu_stage_policy_t gpu_stage_policy = { GPU_STAGE_MAX, false, 0, 0, 0, 0, 0, 0 };
 /* Words retired on the emulation thread rather than handed over (diagnostic). */
 static uint32_t gpu_stage_inline_n = 0;
 /* Time GP0 execution costs the emulation thread when it runs inline.  This is
@@ -386,6 +417,7 @@ static void GPU_WriteGP0_Internal(uint32_t InData, uint32_t addr);
 static void GPU_WriteGP1_Internal(uint32_t V);
 static void GPU_Worker_Push(gpu_cmd_type_t type, uint32_t data, uint32_t addr);
 static void GPU_Stage_Resolve(void);
+static void GPU_Stage_Bypass_End(void);
 static bool GPU_Stage_CanRunInline(void);
 static void GPU_AdvanceDrawing(int32_t clocks, int32_t limit);
 
@@ -850,10 +882,8 @@ static void Command_IRQ(PS_GPU* g, const uint32_t *cb)
  * go through the same flag. */
 static bool RectOverlapsDisplay(int32_t x, int32_t y, int32_t w, int32_t h)
 {
-   static const uint32_t DotClockRatios[5] = { 10, 8, 5, 4, 7 };
-   const uint32_t dmc = (GPU.DisplayMode & 0x40) ? 4 : (GPU.DisplayMode & 0x3);
    /* Display width in VRAM cells (matches the scanout dmw; <= 768). */
-   const int32_t  disp_w = (int32_t)(2800 / DotClockRatios[dmc]);
+   const int32_t disp_w = (int32_t)GPU_DisplayWidth(GPU.DisplayMode);
    /* Generous height bound: a 480i field reads up to 512 lines. Using
     * the maximum keeps the test from ever under-covering the visible
     * region regardless of the current vertical timing. */
@@ -1839,6 +1869,9 @@ static void GPU_SoftReset(void) /* Control command 0x00 */
 void GPU_Power(void)
 {
    GPU_Worker_Sync();
+   /* Reset clears the FIFO and the drawing state the bypass answers polls
+    * from, so drop the learned policy with them. */
+   GPU_Stage_Bypass_End();
 
    memset(GPU.vram, 0, 512 * 1024 * UPSCALE(&GPU) * UPSCALE(&GPU) * sizeof(*GPU.vram));
 
@@ -2098,6 +2131,11 @@ static INLINE void GPU_WriteCB(uint32_t InData, uint32_t addr)
 
 static INLINE bool GPU_Sync_Would_Collapse(void)
 {
+   /* Bypassing means nothing is outstanding, so this cannot collapse - and
+    * saying so without the three acquire loads matters: GPU_Read() asks on
+    * every status poll, which the capture puts at 1485-5384 per frame. */
+   if (gpu_stage_policy.bypass)
+      return false;
    if (!__atomic_load_n(&gpu_worker_running, __ATOMIC_ACQUIRE))
       return false;
    return gpu_stage_count != 0
@@ -2393,10 +2431,30 @@ void GPU_Worker_Sync(void)
 {
    /* Staged words are the newest part of the command stream, so they must be
     * applied - or at least published - before anything observes GPU state.
-    * This runs ahead of the early-out below so a stopped worker still leaves
-    * the buffer retired rather than stranded. */
+    * This runs ahead of the early-outs below so a stopped worker - or one the
+    * bypass has parked - still leaves the buffer retired rather than
+    * stranded.  The GP0 paths do stage while bypassing when a possible IRQ
+    * command is in flight, so this is not merely defensive. */
    if (gpu_stage_count)
       GPU_Stage_Resolve();
+
+   /* With the buffer retired, bypassing means the ring is empty and the
+    * worker is parked - the invariant the rest of this function exists to
+    * establish - so there is nothing to wait for.  GPU_ApplyIRQ() still runs:
+    * it also rescans the FIFO for a pending 0x1f command, which is emulated
+    * state rather than worker progress.  The run counter resets because this
+    * is a drain: any batch the guest was building has ended here. */
+   if (gpu_stage_policy.bypass)
+   {
+      /* One read-back can still be outstanding: the worker publishes the
+       * rectangle after retiring the batch, so it can park with an empty
+       * queue and be seen as idle - which is exactly the state the bypass
+       * engages in.  Settle it here as the full path would. */
+      GPU_FBRead_Service();
+      GPU_StagePolicy_Drain(&gpu_stage_policy);
+      GPU_ApplyIRQ();
+      return;
+   }
 
    if (!__atomic_load_n(&gpu_worker_running, __ATOMIC_ACQUIRE) || !gpu_queue_lock)
       return;
@@ -2492,6 +2550,10 @@ void GPU_Worker_TakeStats(gpu_worker_stats_t *out)
       out->fifo_pub          = gpu_fifo_pub_n;
       out->fifo_pub_checked  = gpu_fifo_pub_checked_n;
       out->fifo_pub_mismatch = gpu_fifo_pub_mismatch_n;
+      out->bypass_words      = gpu_stage_policy.words;
+      out->bypass_polls      = gpu_stage_policy.polls;
+      out->bypass_entries    = gpu_stage_policy.entries;
+      out->bypass_exits      = gpu_stage_policy.exits;
       out->inline_timed      = gpu_time_words;
       out->fbreads         = gpu_fbread_n;
       out->fbread_barriers = gpu_fbread_barriers;
@@ -2508,6 +2570,10 @@ void GPU_Worker_TakeStats(gpu_worker_stats_t *out)
    gpu_fifo_pub_n          = 0;
    gpu_fifo_pub_checked_n  = 0;
    gpu_fifo_pub_mismatch_n = 0;
+   gpu_stage_policy.words   = 0;
+   gpu_stage_policy.polls   = 0;
+   gpu_stage_policy.entries = 0;
+   gpu_stage_policy.exits   = 0;
    gpu_fbread_barriers = 0;
    gpu_sync_block_us = 0;
    gpu_sync_block_n  = 0;
@@ -2530,6 +2596,8 @@ void GPU_Worker_Init(void)
    /* A teardown that raced a full ring can drop staged words; never carry one
     * of those buffers into a new session. */
    gpu_stage_count = 0;
+   /* A fresh session re-learns the guest's batching from scratch. */
+   GPU_StagePolicy_Reset(&gpu_stage_policy, GPU_STAGE_MAX);
 
    /* The software renderer's scanout runs on the emulation thread and reads
     * GPU.vram line by line from GPU_Update(), which would race the worker's
@@ -2588,6 +2656,7 @@ void GPU_Worker_Kill(void)
    /* Retire queued drawing before the thread goes away, otherwise teardown
     * throws away a frame's worth of VRAM writes. */
    GPU_Worker_Sync();
+   GPU_Stage_Bypass_End();
 
    if (gpu_queue_lock)
    {
@@ -2741,6 +2810,12 @@ static void GPU_Worker_PushMany(const gpu_cmd_t *entries, uint32_t count)
 
    assert(count && count < GPU_QUEUE_SIZE);
 
+   /* Anything reaching the ring breaks the "nothing outstanding" invariant
+    * the bypass relies on.  Nothing should get here while it is engaged - the
+    * GP0 paths execute inline and GPU_Update() takes its inline branch - but
+    * the invariant is asserted here rather than assumed. */
+   GPU_Stage_Bypass_End();
+
    if (GPU_Queue_Count() > (GPU_QUEUE_SIZE - 1 - count) && !gpu_worker_stopping)
    {
       retro_time_t t0 = cpu_features_get_time_usec();
@@ -2859,7 +2934,21 @@ static void GPU_Stage_Resolve(void)
          gpu_inline_us += (uint64_t)(cpu_features_get_time_usec() - t0);
    }
    GPU_PublishFIFO();
+
+   /* This batch ran here rather than on the worker, so the queue is empty and
+    * the worker parked: the bypass invariant already holds. */
+   GPU_StagePolicy_Resolved(&gpu_stage_policy, n);
 }
+
+/* Return to staging, so a guest that has started streaming can reach the
+ * worker again.  The published readiness byte is refreshed here because the
+ * bypass answers polls from the decoder directly and leaves it stale. */
+static void GPU_Stage_Bypass_End(void)
+{
+   if (GPU_StagePolicy_End(&gpu_stage_policy))
+      GPU_PublishFIFO();
+}
+
 
 /*
  * GP0 accounting for the non-threaded path.
@@ -2893,6 +2982,16 @@ static INLINE void GPU_ExecGP0_Inline(uint32_t V, uint32_t addr)
       GPU_WriteGP0_Internal(V, addr);
       gpu_inline_us += (uint64_t)(cpu_features_get_time_usec() - t0);
    }
+}
+
+/* One GP0 word on the bypass path: executed where GPU_Stage_Resolve() would
+ * have executed it, with the run length tracked so a genuine burst re-arms
+ * the worker. */
+static INLINE void GPU_Stage_Bypass_GP0(uint32_t V, uint32_t addr)
+{
+   GPU_ExecGP0_Inline(V, addr);
+   if (GPU_StagePolicy_Word(&gpu_stage_policy))
+      GPU_Stage_Bypass_End();
 }
 
 static INLINE void GPU_Stage_GP0(uint32_t V, uint32_t addr)
@@ -2935,6 +3034,11 @@ void GPU_Write(const int32_t timestamp, uint32_t A, uint32_t V)
       {
          if ((V >> 24) == 0x1f)
             gpu_irq_command_possible = true;
+         if (gpu_stage_policy.bypass && !gpu_irq_command_possible)
+         {
+            GPU_Stage_Bypass_GP0(V, A);
+            return;
+         }
          GPU_Stage_GP0(V, A);
          if (gpu_irq_command_possible)
             GPU_Worker_Sync();
@@ -2950,6 +3054,11 @@ void GPU_WriteDMA(uint32_t V, uint32_t addr)
    {
       if ((V >> 24) == 0x1f)
          gpu_irq_command_possible = true;
+      if (gpu_stage_policy.bypass && !gpu_irq_command_possible)
+      {
+         GPU_Stage_Bypass_GP0(V, addr);
+         return;
+      }
       GPU_Stage_GP0(V, addr);
       if (gpu_irq_command_possible)
          GPU_Worker_Sync();
@@ -3232,12 +3341,21 @@ static INLINE void ReorderRGB_Var(uint32_t out_Rshift,
    }
 }
 
+/* Advance the GPU to `sys_timestamp` and return when it next needs attention.
+ *
+ * Called from its own event and from DMA_Update(), so a good share of calls
+ * arrive with nothing elapsed - and now that an idle DMA controller shares the
+ * GPU's deadline, about half of them do (the event-scheduler harness measures
+ * 4,465 of 8,928 over an NTSC frame).  Those return the deadline the previous
+ * call computed, so the early-out comes before any of the display-mode
+ * arithmetic below rather than after it. */
 int32_t GPU_Update(const int32_t sys_timestamp)
 {
    int32_t gpu_clocks;
    static const uint32_t DotClockRatios[5] = { 10, 8, 5, 4, 7 };
-   const uint32_t dmc = (GPU.DisplayMode & 0x40) ? 4 : (GPU.DisplayMode & 0x3);
-   const uint32_t dmw = 2800 / DotClockRatios[dmc];   /* Must be <= 768 */
+   unsigned display_mode;
+   uint32_t dmc;
+   uint32_t dmw;
    int32_t sys_clocks = sys_timestamp - GPU.lastts;
 
    if (psx_time_events)
@@ -3247,7 +3365,12 @@ int32_t GPU_Update(const int32_t sys_timestamp)
    }
 
    if(!sys_clocks)
-      goto TheEnd;
+      return sys_timestamp + GPU_NextEventDelay(GPU.LineClockCounter,
+            GPU.GPUClockCounter, GPU.GPUClockRatio, EventCycles);
+
+   display_mode = GPU.DisplayMode;
+   dmc = (display_mode & 0x40) ? 4 : (display_mode & 3);
+   dmw = GPU_DisplayWidth(display_mode);   /* Must be <= 768 */
 
    {
       int32_t draw_clocks = sys_clocks << (1 + psx_gpu_overclock_shift);
@@ -3550,11 +3673,11 @@ int32_t GPU_Update(const int32_t sys_timestamp)
                if(dx_end < dx_start)
                   dx_end = dx_start;
 
-               dx_start = dx_start / DotClockRatios[dmc];
-               dx_end = dx_end / DotClockRatios[dmc];
+               dx_start = GPU_DisplayClocks((uint32_t)dx_start, display_mode);
+               dx_end = GPU_DisplayClocks((uint32_t)dx_end, display_mode);
 
-               dx_start -= 488 / DotClockRatios[dmc];
-               dx_end -= 488 / DotClockRatios[dmc];
+               dx_start -= GPU_DisplayClocks(488, display_mode);
+               dx_end -= GPU_DisplayClocks(488, display_mode);
 
                if(dx_start < 0)
                {
@@ -3704,8 +3827,8 @@ int32_t GPU_Update(const int32_t sys_timestamp)
                }
 
                dmw_width = dmw;
-               pix_clock_offset = (488 - 146) / DotClockRatios[dmc];
-               pix_clock = (GPU.HardwarePALType ? 53203425 : 53693182) / DotClockRatios[dmc];
+               pix_clock_offset = GPU_DisplayClocks(488 - 146, display_mode);
+               pix_clock = GPU_DisplayClocks(GPU.HardwarePALType ? 53203425 : 53693182, display_mode);
                pix_clock_div = DotClockRatios[dmc];
 
                FrontIO_GPULineHook(PSX_FIO,
@@ -3746,7 +3869,6 @@ int32_t GPU_Update(const int32_t sys_timestamp)
 
    /*puts("GPU Update End"); */
 
-TheEnd:
    GPU.lastts = sys_timestamp;
 
    return sys_timestamp + GPU_NextEventDelay(GPU.LineClockCounter,
@@ -4014,6 +4136,9 @@ void GPU_RestoreStateP3(void)
 int GPU_StateAction(StateMem *sm, int load, int data_only)
 {
    GPU_Worker_Sync();
+   /* A load replaces the FIFO and InCmd state the bypass answers readiness
+    * from, and a save must not record a stale published snapshot. */
+   GPU_Stage_Bypass_End();
 
    if (!GPU_RestoreStateP1(load))
       return 0;
@@ -4211,6 +4336,15 @@ bool GPU_DMACanWrite(void)
    gpu_dma_poll_n++;
    if (!gpu_worker_running)
       return CalcFIFOReadyBit();
+
+   /* Bypassing: every preceding word already executed on this thread, so the
+    * decoder is authoritative without a barrier or a published snapshot.
+    * This is the poll the capture shows collapsing ~1010 times a frame. */
+   if (gpu_stage_policy.bypass && !gpu_irq_command_possible)
+   {
+      GPU_StagePolicy_Poll(&gpu_stage_policy);
+      return CalcFIFOReadyBit();
+   }
 
    /* An empty host queue is not an empty PS1 FIFO. It only proves that the
     * published PS1 answer covers every preceding write/clock event. The

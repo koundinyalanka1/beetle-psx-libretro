@@ -14,7 +14,7 @@ VARIABLES = (
     "IS_64BIT", "HAVE_CDROM", "CFLAGS", "CXXFLAGS", "LDFLAGS", "GL_LIB",
     "SOURCES_C", "GLES", "GLES3", "LOCAL_CFLAGS", "LOCAL_CXXFLAGS",
     "LOCAL_LDFLAGS", "LOCAL_LDLIBS", "APP_OPTIM", "APP_ABI", "APP_STL",
-    "OBJECT_DIR", "OBJECTS", "DEPS",
+    "OBJECT_DIR", "OBJECTS", "DEPS", "LIBS", "SYS_LIBS",
 )
 TARGETS = (
     ("armv7a-linux-androideabi21", "armeabi-v7a", "arm", "0", "0"),
@@ -81,7 +81,17 @@ class AndroidBuildTest(unittest.TestCase):
             "    *) return 1 ;;\n"
             "esac; }\n"
         )
-        (cls.directory / "shell.sh").write_bytes((uname + 'eval "$1"\n').encode("utf-8"))
+        # GNU Make 3.81 (still shipped on macOS) ignores .SHELLFLAGS.
+        # On POSIX use an executable shell adapter which accepts make's -c;
+        # Windows needs the explicit interpreter used by the existing harness.
+        cls.mock_shell = cls.directory / "shell.sh"
+        script = uname + 'eval "$1"\n'
+        if os.name != "nt":
+            script = ("#!" + cls.shell + "\n" + uname +
+                      'if [ "$1" = "-c" ]; then shift; fi\n' + 'eval "$1"\n')
+        cls.mock_shell.write_bytes(script.encode("utf-8"))
+        if os.name != "nt":
+            cls.mock_shell.chmod(0o700)
         report = (
             ".PHONY: check-android-config\n"
             "check-android-config:\n" +
@@ -113,7 +123,8 @@ class AndroidBuildTest(unittest.TestCase):
         env["PATH"] = str(Path(self.shell).parent) + os.pathsep + env.get("PATH", "")
         compiler = f'"{Path(sys.executable).as_posix()}" "compiler.py"'
         arguments = {
-            "SHELL": Path(self.shell).as_posix(), ".SHELLFLAGS": "shell.sh",
+            "SHELL": (Path(self.shell) if os.name == "nt" else self.mock_shell).as_posix(),
+            ".SHELLFLAGS": "shell.sh" if os.name == "nt" else "-c",
             "CC": compiler, "CXX": compiler, "GIT_VERSION": "test", "platform": platform,
         }
         arguments.update(overrides)
@@ -159,7 +170,7 @@ class AndroidBuildTest(unittest.TestCase):
             for flag in (("-O3", "-DNDEBUG") if debug else ("-O0", "-DDEBUG")):
                 self.assertNotIn(flag, flags, name)
         links = " ".join(values[name] for name in
-                         (("LOCAL_LDFLAGS", "LOCAL_LDLIBS") if jni else ("LDFLAGS", "GL_LIB"))).split()
+                         (("LOCAL_LDFLAGS", "LOCAL_LDLIBS") if jni else ("LDFLAGS", "GL_LIB", "LIBS", "SYS_LIBS"))).split()
         for flag in ("-Wl,--build-id=sha1", "-Wl,-z,max-page-size=16384",
                      "-Wl,-z,common-page-size=16384", "-ldl", "-llog", "-landroid"):
             self.assertIn(flag, links)
@@ -167,6 +178,16 @@ class AndroidBuildTest(unittest.TestCase):
             self.assertNotIn(flag, links)
         if not jni:
             self.assertIn("-static-libstdc++", links)
+
+    def test_android_system_libraries_survive_link_overrides(self):
+        for target, platform in itertools.product(TARGETS, ("unix", "android")):
+            with self.subTest(target=target[0], platform=platform):
+                values = self.config(target[0], platform,
+                                     LDFLAGS="-Wl,--build-id=sha1", LIBS="-lcustom")
+                self.assertEqual(values["LDFLAGS"], "-Wl,--build-id=sha1")
+                self.assertEqual(values["LIBS"], "-lcustom")
+                for flag in ("-ldl", "-llog", "-landroid", "-lm"):
+                    self.assertIn(flag, values["SYS_LIBS"].split())
 
     def test_shared_cpp_runtime_override(self):
         values = self.config(TARGETS[1][0], LINK_STATIC_LIBCPLUSPLUS="0")

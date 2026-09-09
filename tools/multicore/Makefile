@@ -6,13 +6,16 @@ THREADS := $(ROOT)/libretro-common/rthreads/rthreads.c
 AFFINITY := $(ROOT)/mednafen/worker_affinity.c
 
 .PHONY: check
-check: $(BUILD_DIR)/spu $(BUILD_DIR)/workers $(BUILD_DIR)/affinity $(BUILD_DIR)/gpu-timing $(BUILD_DIR)/recompiler $(BUILD_DIR)/performance
+check: $(BUILD_DIR)/spu $(BUILD_DIR)/workers $(BUILD_DIR)/affinity $(BUILD_DIR)/gpu-timing $(BUILD_DIR)/recompiler $(BUILD_DIR)/performance $(BUILD_DIR)/dma $(BUILD_DIR)/event-scheduler $(BUILD_DIR)/gpu-stage
 	$(BUILD_DIR)/spu
 	$(BUILD_DIR)/workers
 	$(BUILD_DIR)/affinity
 	$(BUILD_DIR)/gpu-timing
 	$(BUILD_DIR)/recompiler
 	$(BUILD_DIR)/performance
+	$(BUILD_DIR)/dma
+	$(BUILD_DIR)/event-scheduler
+	$(BUILD_DIR)/gpu-stage
 
 $(BUILD_DIR)/performance: performance.c $(ROOT)/mednafen/performance.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DBEETLE_PERF_STANDALONE performance.c -o $@
@@ -43,3 +46,12 @@ endif
 
 $(BUILD_DIR)/workers: workers.c thread_faults.h $(ROOT)/mednafen/rthreads_worker.c $(ROOT)/mednafen/rthreads_pool.c $(THREADS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) workers.c $(THREADS) -pthread -o $@
+
+$(BUILD_DIR)/dma: dma.c $(ROOT)/mednafen/psx/dma.c | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DHAVE_LIGHTREC -I$(ROOT)/include -I$(ROOT)/deps/lightrec -I$(ROOT)/deps/lightning/include dma.c -o $@
+
+$(BUILD_DIR)/event-scheduler: event_scheduler.c $(ROOT)/mednafen/psx/dma.c $(ROOT)/mednafen/psx/gpu_timing.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DHAVE_LIGHTREC -I$(ROOT)/include -I$(ROOT)/deps/lightrec -I$(ROOT)/deps/lightning/include event_scheduler.c -o $@
+
+$(BUILD_DIR)/gpu-stage: gpu_stage.c $(ROOT)/mednafen/psx/gpu_stage_policy.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) gpu_stage.c -o $@

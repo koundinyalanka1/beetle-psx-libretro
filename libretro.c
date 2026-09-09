@@ -1460,6 +1460,11 @@ static void RebaseTS(const int32_t timestamp)
    CPU_SetEventNT(events[PSX_EVENT__SYNFIRST].next->event_time);
 }
 
+int32_t PSX_PeekEventNT(const int type)
+{
+   return events[type].event_time;
+}
+
 void PSX_SetEventNT(const int type, const int32_t next_timestamp)
 {
    struct event_list_entry *e = &events[type];
@@ -7000,6 +7005,16 @@ void retro_run(void)
                g.dma_polls / stat_frames, g.dma_collapses / stat_frames,
                g.fbreads / stat_frames, g.fbread_barriers / stat_frames,
                (double)g.readback_us / 1000.0 / (double)stat_frames);
+
+         /* Staging bypass. Words and polls are subsets of the inline and
+          * DMA-ready figures above, not additional work. Entries/exits are
+          * totals for the interval, not per frame: a scene the worker cannot
+          * help should show one entry and no exits. */
+         log_cb(RETRO_LOG_WARN,
+               "  GPU staging bypass: %u words/frame, %u polls/frame "
+               "answered without a barrier, %u engaged / %u re-armed\n",
+               g.bypass_words / stat_frames, g.bypass_polls / stat_frames,
+               g.bypass_entries, g.bypass_exits);
 
          stat_frames = 0;
       }

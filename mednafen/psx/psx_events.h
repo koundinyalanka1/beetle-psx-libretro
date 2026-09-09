@@ -28,6 +28,12 @@ enum
 #define PSX_EVENT_MAXTS             0x20000000
 
 void PSX_SetEventNT(const int type, const int32_t next_timestamp);
+/* Currently scheduled timestamp for an event, without dispatching or
+ * re-arming it.  A device that would otherwise re-arm on its own fixed
+ * cadence can use this to land on an existing deadline instead of adding
+ * a second one, which costs the CPU loop an extra exit for no emulated
+ * progress. */
+int32_t PSX_PeekEventNT(const int type);
 void PSX_SetDMACycleSteal(unsigned stealage);
 
 uint32_t PSX_GetRandU32(uint32_t mina, uint32_t maxa);

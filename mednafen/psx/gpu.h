@@ -382,6 +382,15 @@ typedef struct
    uint32_t fifo_pub;
    uint32_t fifo_pub_checked;
    uint32_t fifo_pub_mismatch;
+   /* Staging bypass: how much of the frame ran with the worker parked
+    * because the guest kept draining before a batch could pay for itself.
+    * bypass_words are GP0 words that skipped the staging buffer entirely and
+    * bypass_polls are readiness/status observations answered without a
+    * barrier.  Both are subsets of `inlines` / `dma_polls`. */
+   uint32_t bypass_words;
+   uint32_t bypass_polls;
+   uint32_t bypass_entries;   /* times the bypass engaged */
+   uint32_t bypass_exits;     /* times a long burst re-armed the worker */
    bool inline_timed;
    /* GP0 C0h: the one synchronisation the emulated machine really asks for. */
    uint32_t fbreads;
