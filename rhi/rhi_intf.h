@@ -172,6 +172,8 @@ enum rhi_renderer_type rhi_intf_is_type(void);
  * thread.  Only OpenGL cares: its API is thread-affine, so it records calls
  * and replays them on the emulation thread.  A no-op elsewhere. */
 void rhi_intf_set_threaded_recording(bool enabled);
+/* Vulkan decoded geometry worker; lifecycle calls are emulation-thread only. */
+void rhi_intf_set_render_threaded(bool enabled);
 
 /* Ask the backend to finish the frame without presenting it: drawing is still
  * flushed and the frame is still reported (as a NULL/duped frame), but the

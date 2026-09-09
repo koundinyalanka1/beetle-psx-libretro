@@ -43,6 +43,19 @@ The FastFIFO test compares batched command reads against scalar reads across all
 It checks output guards, complete FIFO state, and refill/drain after wraparound.
 The PGXP path retains scalar reads so each metadata entry uses its original slot.
 
+The geometry-worker test drives the production `rhi/rhi_geometry_worker.c` with
+a deliberately slow consumer, so the producer outruns the bounded banks and the
+backpressure path is exercised rather than merely present. It checks that
+queued commands own their payload (the producer's stack buffers are overwritten
+immediately after each push), that order is preserved, that a partial batch is
+drained by a barrier before state changes, that an idle barrier takes the
+lock-free path without blocking, that worker-thread busy time is kept apart
+from the producer's backpressure and barrier stalls, that affinity is
+initialised once and on the worker, and that failure injected at each internal
+allocation leaves no thread, lock or condition behind. It does not test Vulkan;
+renderer ordering against real command streams belongs to the generated GPU
+matrix below.
+
 For race detection, use a separate build directory:
 
 ```

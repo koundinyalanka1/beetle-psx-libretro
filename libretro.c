@@ -6617,6 +6617,18 @@ static void perf_report(void)
          psx_renderer_profile.sync_wait_us, psx_renderer_profile.frame_context_us,
          psx_renderer_profile.scanout_us, psx_renderer_profile.finalize_flush_us,
          psx_renderer_profile.pipeline_us, psx_renderer_profile.pipeline_creates);
+   /* geometry_worker_busy_us is worker-thread time and overlaps the emulation
+    * thread; the two wait figures are the only part of this that is serial
+    * with it. Do not sum them. */
+   log_cb(RETRO_LOG_WARN,
+         "core_profile_geometry_v1: commands=%" PRIu64 " batches=%" PRIu64
+         " worker_busy_us=%" PRIu64 " backpressure_wait_us=%" PRIu64
+         " barrier_wait_us=%" PRIu64 " barriers=%" PRIu64 "\n",
+         psx_renderer_profile.geometry_commands, psx_renderer_profile.geometry_batches,
+         psx_renderer_profile.geometry_busy_us,
+         psx_renderer_profile.geometry_backpressure_us,
+         psx_renderer_profile.geometry_barrier_us,
+         psx_renderer_profile.geometry_barriers);
    for (event = PSX_EVENT_GPU; event <= PSX_EVENT_FIO; event++)
       log_cb(RETRO_LOG_WARN,
             "core_profile_event_v1: type=%u dispatches=%u timed_samples=%u inclusive_sample_us=%" PRIu64 "\n",

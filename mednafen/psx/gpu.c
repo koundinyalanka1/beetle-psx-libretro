@@ -2654,6 +2654,7 @@ void GPU_Worker_Init(void)
 
 void GPU_Worker_Kill(void)
 {
+   rhi_intf_set_render_threaded(false);
    /* Also the cleanup path for a partially-built worker, so test the
     * primitives too and not just the running flag. */
    if (!gpu_worker_running && !gpu_thread && !gpu_queue_lock)
@@ -2715,9 +2716,9 @@ static bool GPU_Worker_Permitted(void)
     * Software: GPU_Update() scans VRAM out line by line on this thread, which
     * would race the rasteriser.  Never threaded.
     *
-    * Vulkan: no thread-affine context.  Submission is serialised through the
-    * frontend's queue lock (rhi_vk_lock_queue) and everything else the worker
-    * touches is core-owned, so the worker calls the renderer directly.
+    * Vulkan: decoded geometry is distributed in the RHI instead. Keep GP0
+    * decoding and timing on this thread so GPUSTAT/DMA readiness do not wait
+    * for rendering. The raw worker must not run alongside that producer.
     *
     * OpenGL: GL calls are only valid on the thread holding the context, and
     * the draw entry points reach gl_renderer_draw() whenever the vertex or
@@ -2735,6 +2736,8 @@ static bool GPU_Worker_Permitted(void)
    switch (rhi_intf_is_type())
    {
       case RHI_VULKAN:
+         /* Vulkan distributes decoded rendering instead of raw GP0 words. */
+         return false;
       case RHI_OPENGL:
          break;
       default:
@@ -2782,13 +2785,17 @@ void GPU_Worker_Refresh(void)
 {
    bool permitted = GPU_Worker_Permitted();
 
-   if (permitted == gpu_worker_running)
-      return;
-
-   if (permitted)
-      GPU_Worker_Init();
-   else
-      GPU_Worker_Kill();
+   if (permitted != gpu_worker_running)
+   {
+      if (permitted)
+         GPU_Worker_Init();
+      else
+         GPU_Worker_Kill();
+   }
+   /* This runs after the raw worker has stopped, so there is one producer
+    * and one owner of Renderer in either mode. Readiness polls never drain
+    * the decoded-geometry queue; RHI resource/state barriers do. */
+   rhi_intf_set_render_threaded(gpu_worker_enabled);
 }
 
 bool GPU_GetThreaded(void)

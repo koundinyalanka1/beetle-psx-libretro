@@ -679,6 +679,63 @@ Three changes, each with a differential or replay harness, all device-neutral an
 4. **Run the generated GPU matrix and the queue-stress build against a built core** to close the ordering gap the staging bypass leaves open, whenever building is authorized again.
 5. When device measurement is authorized again, the first capture should carry `beetle_psx_hw_gpu_diagnostics=timing` on the same labelled scene, paired against a `disabled` control - that is the only thing that converts any of this into a millisecond figure.
 
+## Current implementation record — distributed Vulkan geometry (2026-09-09)
+
+The staging bypass established that the raw GP0 worker cannot help this workload: the guest drains between ~14-word bursts, so no batch ever reaches the publication threshold. That is a property of *where* the split was made, not of threading. This change moves the split downstream.
+
+**The split.** GP0 decoding, FIFO readiness and emulated drawing time stay on the emulation thread, so GPUSTAT and DMA-ready polls answer at once and never wait for rendering. What crosses to a worker is *decoded* geometry - triangles, quads and lines with their vertex, texture and PGXP payloads copied by value into the queued op. The raw GP0 worker is therefore disabled for Vulkan (`GPU_Worker_Permitted()`), so there is exactly one producer and one owner of `Renderer` at any moment.
+
+- **`rhi/rhi_geometry_worker.{c,h}`** — four fixed 32-op banks, no per-primitive allocation or locking. A full bank renders while the producer fills the next; the bounded bank count is the backpressure that keeps memory flat when the renderer falls behind.
+- **Ownership rule.** Between barriers the worker owns `Renderer`. A barrier transfers exclusive ownership back to the producer. Barriers are VRAM transfers (`load_image`, `read_vram`, `fill_rect`, `copy_rect`), every renderer state setter (draw area/offset, texture window, display range/mode, VRAM framebuffer coords, display toggle), the frame boundary, option refresh and context lifecycle.
+- **The worker touches nothing else.** Audited: `rhi_vulkan_push_{triangle,quad,line}_direct` reference exactly one file-scope object, `renderer`, and call only `renderer_*`. `GPU.vram`, `dither_upscale_shift` and `GPU_Rescale` belong to the software rasteriser, which this path never enters.
+
+### Lifecycle audit
+
+Every emulation-thread route to renderer state was enumerated mechanically rather than by inspection, and the gaps that turned up were fixed:
+
+| Boundary | Result |
+|---|---|
+| All 27 public `rhi_vulkan_*` entry points | Every one that touches renderer state has a barrier. The three without (`context_ready`, `has_software_renderer`, the commented-out `set_blend_mode`) read only pointers/flags |
+| All `rhi_intf_*` dispatch paths into Vulkan | None reaches unbarriered renderer state |
+| All nine `inside_frame` transitions | Each is inside a function that has already drained or stopped the worker |
+| `rhi_defer_drain` replay | Runs in `vk_context_reset` after the worker is stopped |
+| `retro_run` frame boundary | `finalize_frame` is called on every path (VCD, duped, skipped, error), and drains first - so the worker never holds state across a `retro_run` |
+| Save/load (`GPU_RestoreStateP3`, `GPU_StateAction`) | Reaches the renderer only through `load_image` / `read_vram` / the state setters, all barriered |
+| `GPU_Rescale`, `GPU_SyncVRAM`, `GPU_get_vram`, `GPU_set_dither_upscale_shift` | Software-rasteriser state; `GPU_SyncVRAM`'s readback goes through the barriered `rhi_intf_read_vram` |
+| **Enable predicate was latched** | **Fixed.** `has_software_fb`, `track_textures`, `dump_textures` and `replace_textures` can all be turned on by `refresh_variables` mid-session, and the worker would have kept running against state it must not share. The predicate is now re-tested (`vk_geometry_allowed`), and `refresh_variables` stops the worker when it no longer holds |
+| **Context rebuild retired the worker permanently** | **Fixed.** `vk_context_reset`/`destroy` used to clear the request, so after any scale change or context loss the split stayed off for the session. They now stop without forgetting the request, and the next `GPU_Worker_Refresh()` restores it |
+| Thread ownership of lifecycle calls | `refresh_variables` is reachable from `retro_get_system_av_info`, which the frontend may call on its own thread, so revalidation there only ever **stops** the worker. Starting stays with `GPU_Worker_Refresh()` at the top of `retro_run` |
+
+### Timing counters
+
+The point of the split is to move work off the critical path, so the accounting has to keep overlapped and serial time apart, and has to say *why* the producer stopped - the two reasons want opposite fixes.
+
+- `worker_busy_us` — worker-thread execution. Overlaps the emulation thread; **must not be added to frame time**.
+- `backpressure_wait_us` / `n` — the producer blocked waiting for a free bank. Rising alongside busy time means the renderer is the limit; rising on its own means four banks are too few.
+- `barrier_wait_us` / `n` — the producer blocked waiting for exclusive ownership back.
+- `barriers` — drains *requested*, blocked or not. Against `commands` this is the same measurement the GP0 staging analysis rests on: how long a run of geometry the guest leaves undisturbed.
+
+Collected every frame (the frame boundary is already a barrier, so taking them is free) into both `psx_renderer_profile` and a 300-frame summary, so the profile record covers the same window as the rest of the core's per-frame accounting and a worker stopped mid-interval does not take its numbers with it. Reported as always-on `Vulkan geometry over N frames: ...` and, under profiling, `core_profile_geometry_v1`.
+
+Most barriers arrive with nothing outstanding — the guest changes render state far more often than it fills a 32-op bank — and taking the worker's mutex plus two clock reads to discover that was the whole cost on those. `rhi_geometry_worker_sync()` now clears them with a producer-owned batch count and one acquire load per bank, which establishes the same ownership the drain would.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `make -C tools/multicore check` | **11/11 suites pass** on macOS arm64 |
+| Same under `-fsanitize=thread` | **Pass** — including the new lock-free barrier fast path |
+| Same under `-fsanitize=address,undefined -fno-sanitize-recover=undefined` | **Pass** |
+| `tools/multicore/geometry_worker.c` | 2,104 ordered snapshots with copied payloads verified against reused producer stack buffers; command order; partial batches drained by a barrier; bounded-bank backpressure exercised by a deliberately slow consumer; idle-barrier fast path taken without blocking; split stall accounting; affinity initialised once, on the worker; allocation failure at each of five internal allocations leaves nothing live |
+| NDK 30 ARM32/API21 and ARM64/API21 through the real root Makefile | `libretro.c`, `rhi_lib_vulkan.c`, `rhi_geometry_worker.c`, `rhi_intf.c`, `mednafen/psx/gpu.c` all clean, both ABIs |
+| Device FPS, physical audio, real Vulkan validation, thermal | **Not done.** No device profiling, no `.so` |
+
+### What this still does not establish
+
+The harness proves ordering, ownership and lifecycle. It does not prove the split is a *win*: whether decoded geometry is enough work to cover a thread handoff on a Mali-G52 is exactly what `worker_busy_us` against the two stall figures is there to answer, and that needs a capture. Two specific outcomes would say the split should be narrowed rather than widened: `barriers` per frame approaching `commands` per frame (the guest never leaves a run undisturbed), or `barrier_wait_us` dominating `worker_busy_us` (the producer spends more time reclaiming ownership than the worker spends drawing). Neither can be decided from the September 8 capture, which predates this path.
+
+Ordering correctness against real command streams still needs the generated PIO/DMA matrix (`tools/multicore/check_gpu.py`) and the queue-stress build against a built core, and real Vulkan validation layers. None of those ran here.
+
 ## Historical FIFO implementation and verification
 
 The earlier review covered a different PID 10375 session. Its performance figures and GPU-worker default are superseded by the current capture. It reported an atomic byte publishing FIFO readiness and the compatibility threshold, usable only when worker retirement covers submissions, staging is empty and no pending IRQ/setting mismatch requires a barrier. Batched queue submission uses up to two contiguous copies with one publication/wake check. This is not a complete emulation-thread shadow decoder; command-cycle progress and continuation semantics still require authoritative synchronization.
@@ -731,7 +788,7 @@ The prior session reported IDE access restrictions for GL-host sources and no us
 | **C — JIT/memory** | The exit-count problem is now addressed from the scheduler side (Phase D item 1). No JIT fast paths added, and none should be until attribution exists | Build the host attribution; only then choose guarded memory/helper/register/GTE work, with failing-before/passing-after probes on ARM32 and ARM64 and both mapping paths |
 | **D — Event scheduler** | Idle-channel fast path, idle-DMA deadline sharing and the zero-elapsed `GPU_Update` early-out implemented; differential DMA harness and a new full-frame scheduler harness cover them. 41.3% fewer CPU-loop exits with an identical emulated outcome | Watch dot-clock timer IRQ latency in game testing. Lengthening the GPU's own grid is a design (on-demand device updates plus a dot-clock-aware timer deadline), not an edit - do not start it before the exit cost is priced |
 | **E — Compiler concurrency** | Profiling and tests added; worker count unchanged. Nothing in the capture implicates compile churn in warm gameplay | Measure queue contention and cold/warm behavior before comparing worker counts |
-| **F — GPU/rendering** | Portable five-mode scanout division implemented; adaptive staging bypass and the folded barrier predicate implemented, with a policy replay harness. Worker busy time was 0.00 ms/frame in every captured window | Scanout image reuse (one `vkCreateImage` per presented frame). Run the generated PIO/DMA matrix and the queue-stress build against a built core to close the ordering gap the bypass leaves open. Pipeline/cache/resource work still pending |
+| **F — GPU/rendering** | Portable five-mode scanout division; adaptive staging bypass and the folded barrier predicate; and the split moved downstream - decoded geometry now goes to a Vulkan render worker while GP0 decoding, FIFO readiness and drawing time stay on the emulation thread. Lifecycle audited end to end; two latching bugs fixed. Whether the split pays is unmeasured | Capture `worker_busy_us` against `backpressure_wait_us` / `barrier_wait_us`; narrow the split if barriers approach commands or barrier waits dominate busy time. Scanout image reuse (one `vkCreateImage` per presented frame). Run the generated PIO/DMA matrix, the queue-stress build and Vulkan validation against a built core |
 | **G — Audio/CD** | Output accounting/WAV tooling added; the capture shows underproduction (~57% of 44.1 kHz) and a 500-permille elastic rate change; audio gate failed | Nothing here is fixable in the audio path: supply follows core speed. Execute SPU/IRQ/ENDX regressions and validate WAV/sample totals, but treat the audio gate as blocked on emulation speed |
 | **H — Broad low-end devices** | Capability matrix specified; no new devices tested | Test ARM32/ARM64 TVs across vendors, other Mali/Adreno drivers, phones, low-memory and non-Vulkan/software paths |
 | **Artifact/integration milestone** | **Deferred by user** | Do not generate, deploy or package cores now. YAGE's stale manifest pin (`scripts/libretro_cores.json:145-151`) remains unchanged and would silently undo this work if packaging ran today |

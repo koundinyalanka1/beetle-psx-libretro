@@ -276,6 +276,15 @@ bool rhi_intf_frame_skipped(void)
    return rhi_frame_skip;
 }
 
+void rhi_intf_set_render_threaded(bool enabled)
+{
+#if defined(HAVE_VULKAN)
+   rhi_vulkan_set_render_threaded(enabled && rhi_type == RHI_VULKAN);
+#else
+   (void)enabled;
+#endif
+}
+
 void rhi_intf_set_threaded_recording(bool enabled)
 {
 #if defined(HAVE_OPENGL)

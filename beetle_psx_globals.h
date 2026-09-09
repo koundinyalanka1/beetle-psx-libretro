@@ -27,6 +27,17 @@ typedef struct
    uint64_t finalize_flush_us;
    uint64_t pipeline_us;
    uint64_t pipeline_creates;
+   /* Distributed geometry. busy is worker-thread time and overlaps the
+    * emulation thread, so it must not be added to frame time; the two wait
+    * figures are emulation-thread time and are serial. Kept apart because
+    * they want opposite fixes: backpressure means the renderer is the limit,
+    * barrier means the guest keeps asking for exclusive ownership back. */
+   uint64_t geometry_busy_us;
+   uint64_t geometry_backpressure_us;
+   uint64_t geometry_barrier_us;
+   uint64_t geometry_commands;
+   uint64_t geometry_batches;
+   uint64_t geometry_barriers;
 } psx_renderer_profile_t;
 
 extern psx_renderer_profile_t psx_renderer_profile;

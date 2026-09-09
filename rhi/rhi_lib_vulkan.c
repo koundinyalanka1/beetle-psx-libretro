@@ -13,6 +13,19 @@
 
 #include "rhi_intf.h" /* FPS and audio sample rate macros */
 #include "rhi_defer.h"
+#include "rhi_geometry_worker.h"
+
+static rhi_geometry_worker_t *vk_geometry_worker;
+static unsigned vk_geometry_frames;
+static bool vk_geometry_failed;
+/* The caller's preference, kept across context rebuilds and settings changes
+ * so the worker can come back when the conditions allow it again. */
+static bool vk_geometry_requested;
+static rhi_geometry_stats_t vk_geometry_totals;
+static void vk_geometry_sync(void)
+{
+   rhi_geometry_worker_sync(vk_geometry_worker);
+}
 #include "tt_trace.h"
 #include <retro_inline.h>
 #include <math.h>
@@ -19388,6 +19401,259 @@ static uint32_t prev_frame_width = 320;
 static uint32_t prev_frame_height = 240;
 static bool show_vram = false;
 
+
+/* Decoded geometry owns all vertex/PGXP data. Guest FIFO and GPU timing
+ * stay on the emulation thread; only this worker touches Renderer until a
+ * barrier transfers ownership back. No raw GP0 worker runs in this mode. */
+static void rhi_vulkan_push_triangle_direct(
+      float p0x, float p0y, float p0w,
+      float p1x, float p1y, float p1w,
+      float p2x, float p2y, float p2w,
+      uint32_t c0,
+      uint32_t c1,
+      uint32_t c2,
+      const float *precise_rgb,
+      const float *fog,
+      uint16_t t0x, uint16_t t0y,
+      uint16_t t1x, uint16_t t1y,
+      uint16_t t2x, uint16_t t2y,
+      uint16_t min_u, uint16_t min_v,
+      uint16_t max_u, uint16_t max_v,
+      uint16_t texpage_x, uint16_t texpage_y,
+      uint16_t clut_x, uint16_t clut_y,
+      uint8_t texture_blend_mode,
+      uint8_t depth_shift,
+      bool dither,
+      int blend_mode,
+      bool mask_test, bool set_mask);
+static void rhi_vulkan_push_quad_direct(
+      float p0x, float p0y, float p0w,
+      float p1x, float p1y, float p1w,
+      float p2x, float p2y, float p2w,
+      float p3x, float p3y, float p3w,
+      uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3,
+      const float *precise_rgb,
+      const float *fog,
+      uint16_t t0x, uint16_t t0y, 
+      uint16_t t1x, uint16_t t1y,
+      uint16_t t2x, uint16_t t2y,
+      uint16_t t3x, uint16_t t3y,
+      uint16_t min_u, uint16_t min_v,
+      uint16_t max_u, uint16_t max_v,
+      uint16_t texpage_x, uint16_t texpage_y,
+      uint16_t clut_x, uint16_t clut_y,
+      uint8_t texture_blend_mode,
+      uint8_t depth_shift,
+      bool dither,
+      int blend_mode,
+      bool mask_test, bool set_mask,
+      bool is_sprite, bool may_be_2d);
+static void rhi_vulkan_push_line_direct(
+      int16_t p0x, int16_t p0y,
+      int16_t p1x, int16_t p1y,
+      uint32_t c0,
+      uint32_t c1,
+      bool dither,
+      int blend_mode,
+      bool mask_test, bool set_mask);
+static void vk_geometry_dispatch(void *user, const rhi_defer_op_t *op)
+{
+   (void)user;
+   switch (op->kind)
+   {
+      case RHI_DEFER_PUSH_TRIANGLE:
+         rhi_vulkan_push_triangle_direct(
+               op->u.push_poly.px[0], op->u.push_poly.py[0], op->u.push_poly.pw[0],
+               op->u.push_poly.px[1], op->u.push_poly.py[1], op->u.push_poly.pw[1],
+               op->u.push_poly.px[2], op->u.push_poly.py[2], op->u.push_poly.pw[2],
+               op->u.push_poly.c[0], op->u.push_poly.c[1], op->u.push_poly.c[2],
+               op->u.push_poly.has_precise_rgb ? op->u.push_poly.precise_rgb : NULL,
+               op->u.push_poly.has_fog ? op->u.push_poly.fog : NULL,
+               op->u.push_poly.tx[0], op->u.push_poly.ty[0],
+               op->u.push_poly.tx[1], op->u.push_poly.ty[1],
+               op->u.push_poly.tx[2], op->u.push_poly.ty[2],
+               op->u.push_poly.min_u, op->u.push_poly.min_v,
+               op->u.push_poly.max_u, op->u.push_poly.max_v,
+               op->u.push_poly.texpage_x, op->u.push_poly.texpage_y,
+               op->u.push_poly.clut_x, op->u.push_poly.clut_y,
+               op->u.push_poly.texture_blend_mode, op->u.push_poly.depth_shift,
+               op->u.push_poly.dither, op->u.push_poly.blend_mode,
+               op->u.push_poly.mask_test, op->u.push_poly.set_mask);
+         break;
+      case RHI_DEFER_PUSH_QUAD:
+         rhi_vulkan_push_quad_direct(
+               op->u.push_poly.px[0], op->u.push_poly.py[0], op->u.push_poly.pw[0],
+               op->u.push_poly.px[1], op->u.push_poly.py[1], op->u.push_poly.pw[1],
+               op->u.push_poly.px[2], op->u.push_poly.py[2], op->u.push_poly.pw[2],
+               op->u.push_poly.px[3], op->u.push_poly.py[3], op->u.push_poly.pw[3],
+               op->u.push_poly.c[0], op->u.push_poly.c[1],
+               op->u.push_poly.c[2], op->u.push_poly.c[3],
+               op->u.push_poly.has_precise_rgb ? op->u.push_poly.precise_rgb : NULL,
+               op->u.push_poly.has_fog ? op->u.push_poly.fog : NULL,
+               op->u.push_poly.tx[0], op->u.push_poly.ty[0],
+               op->u.push_poly.tx[1], op->u.push_poly.ty[1],
+               op->u.push_poly.tx[2], op->u.push_poly.ty[2],
+               op->u.push_poly.tx[3], op->u.push_poly.ty[3],
+               op->u.push_poly.min_u, op->u.push_poly.min_v,
+               op->u.push_poly.max_u, op->u.push_poly.max_v,
+               op->u.push_poly.texpage_x, op->u.push_poly.texpage_y,
+               op->u.push_poly.clut_x, op->u.push_poly.clut_y,
+               op->u.push_poly.texture_blend_mode, op->u.push_poly.depth_shift,
+               op->u.push_poly.dither, op->u.push_poly.blend_mode,
+               op->u.push_poly.mask_test, op->u.push_poly.set_mask,
+               op->u.push_poly.is_sprite, op->u.push_poly.may_be_2d);
+         break;
+      case RHI_DEFER_PUSH_LINE:
+         rhi_vulkan_push_line_direct(op->u.push_line.p0x, op->u.push_line.p0y,
+                          op->u.push_line.p1x, op->u.push_line.p1y,
+                          op->u.push_line.c0, op->u.push_line.c1,
+                          op->u.push_line.dither, op->u.push_line.blend_mode,
+                          op->u.push_line.mask_test, op->u.push_line.set_mask);
+         break;
+      default:
+         abort();
+   }
+}
+
+/* Everything the worker's ownership rule assumes. Texture tracking, texture
+ * replacement and the software mirror all share state with paths that are
+ * still synchronous, and the tracing/dump builds record from the producer, so
+ * none of them may run alongside a distributed renderer. Re-tested rather than
+ * latched, because refresh_variables can turn any of them on mid-session. */
+static bool vk_geometry_allowed(void)
+{
+#if defined(HAVE_TRACE) || defined(RHI_DUMP)
+   return false;
+#else
+   return renderer && !has_software_fb &&
+         !track_textures && !dump_textures && !replace_textures;
+#endif
+}
+
+/* Bring the worker in line with the request and the current settings.
+ * Emulation-thread only. A failed creation is latched so a device short of
+ * threads does not retry once per frame; the latch clears whenever the worker
+ * is not wanted, so a later settings change can try again. */
+static void vk_geometry_apply(void)
+{
+   bool want = vk_geometry_requested && vk_geometry_allowed();
+
+   if (!want)
+      vk_geometry_failed = false;
+   if (want == (vk_geometry_worker != NULL) || (want && vk_geometry_failed))
+      return;
+
+   vk_geometry_frames = 0;
+   memset(&vk_geometry_totals, 0, sizeof(vk_geometry_totals));
+   if (want)
+   {
+      vk_geometry_worker = rhi_geometry_worker_new(vk_geometry_dispatch, NULL);
+      vk_geometry_failed = !vk_geometry_worker;
+   }
+   else
+   {
+      rhi_geometry_worker_free(vk_geometry_worker);
+      vk_geometry_worker = NULL;
+   }
+   if (log_cb)
+      log_cb(RETRO_LOG_WARN, "Vulkan geometry worker %s (CPU owns GP0/FIFO timing)\n",
+            vk_geometry_worker ? "on" : "off");
+}
+
+/* Stop without forgetting that it was wanted, so a context rebuild or a
+ * settings change that turns the software mirror on does not silently retire
+ * the worker for the rest of the session. */
+static void vk_geometry_stop(void)
+{
+   bool requested = vk_geometry_requested;
+   vk_geometry_requested = false;
+   vk_geometry_apply();
+   vk_geometry_requested = requested;
+}
+
+/* Settings just changed. Stopping is the safety-critical direction and is
+ * done here; starting is not, and is deliberately left to the next
+ * GPU_Worker_Refresh() at the top of retro_run. refresh_variables is also
+ * reachable from retro_get_system_av_info, which the frontend may call on its
+ * own thread, and that is not a thread to be creating workers on. */
+static void vk_geometry_revalidate(void)
+{
+   if (vk_geometry_worker && !vk_geometry_allowed())
+      vk_geometry_stop();
+}
+
+void rhi_vulkan_set_render_threaded(bool enabled)
+{
+   vk_geometry_requested = enabled;
+   vk_geometry_apply();
+}
+
+/*
+ * End of frame: take exclusive ownership back, then account for what the split
+ * actually bought.
+ *
+ * Counters are collected every frame rather than once per reporting interval
+ * so the profile record covers the same window as the rest of the core's
+ * per-frame accounting, and so a worker stopped mid-interval does not take its
+ * numbers with it. Taking them is free here: the frame boundary is a barrier
+ * already.
+ */
+static void vk_geometry_frame_end(void)
+{
+   rhi_geometry_stats_t stats;
+
+   vk_geometry_sync();
+
+   if (!vk_geometry_worker)
+   {
+      vk_geometry_frames = 0;
+      return;
+   }
+
+   rhi_geometry_worker_stats(vk_geometry_worker, &stats);
+
+   psx_renderer_profile.geometry_commands        += stats.commands;
+   psx_renderer_profile.geometry_batches         += stats.batches;
+   psx_renderer_profile.geometry_busy_us         += stats.busy_us;
+   psx_renderer_profile.geometry_backpressure_us += stats.backpressure_us;
+   psx_renderer_profile.geometry_barrier_us      += stats.barrier_us;
+   psx_renderer_profile.geometry_barriers        += stats.barriers;
+
+   vk_geometry_totals.commands        += stats.commands;
+   vk_geometry_totals.batches         += stats.batches;
+   vk_geometry_totals.busy_us         += stats.busy_us;
+   vk_geometry_totals.backpressure_us += stats.backpressure_us;
+   vk_geometry_totals.backpressure_n  += stats.backpressure_n;
+   vk_geometry_totals.barrier_us      += stats.barrier_us;
+   vk_geometry_totals.barrier_n       += stats.barrier_n;
+   vk_geometry_totals.barriers        += stats.barriers;
+   vk_geometry_totals.eligible_cpus    = stats.eligible_cpus;
+
+   if (++vk_geometry_frames < 300)
+      return;
+
+   /* WARN like the other worker lines: a frontend filtering INFO would
+    * otherwise never show whether the split engaged. Worker busy overlaps the
+    * emulation thread and is not part of frame time; the two stalls are. */
+   if (log_cb)
+      log_cb(RETRO_LOG_WARN,
+            "Vulkan geometry over %u frames: %.1f commands/frame in %.1f batches/frame, "
+            "worker busy %.2f ms/frame (overlapped) | CPU stalls: backpressure %.2f ms/frame "
+            "(%u), barrier %.2f ms/frame (%u blocked of %u), eligible CPUs %u\n",
+            vk_geometry_frames,
+            (double)vk_geometry_totals.commands / vk_geometry_frames,
+            (double)vk_geometry_totals.batches / vk_geometry_frames,
+            (double)vk_geometry_totals.busy_us / (1000.0 * vk_geometry_frames),
+            (double)vk_geometry_totals.backpressure_us / (1000.0 * vk_geometry_frames),
+            vk_geometry_totals.backpressure_n,
+            (double)vk_geometry_totals.barrier_us / (1000.0 * vk_geometry_frames),
+            vk_geometry_totals.barrier_n, vk_geometry_totals.barriers,
+            vk_geometry_totals.eligible_cpus);
+
+   memset(&vk_geometry_totals, 0, sizeof(vk_geometry_totals));
+   vk_geometry_frames = 0;
+}
+
 static retro_video_refresh_t video_refresh_cb;
 
 static const VkApplicationInfo *get_application_info(void)
@@ -19499,6 +19765,8 @@ static void vk_defer_dispatch(void *user, const rhi_defer_op_t *op)
 
 static void vk_context_reset(void)
 {
+   /* The renderer this worker was drawing into is about to be replaced. */
+   vk_geometry_stop();
    GPU_Worker_Sync();
    inside_frame = false;
 
@@ -19607,6 +19875,7 @@ static void vk_context_reset(void)
 
 static void vk_context_destroy(void)
 {
+   vk_geometry_stop();
    GPU_Worker_Sync();
 
    /* If the context is torn down mid-frame (e.g. a scale-factor change runs
@@ -19773,6 +20042,8 @@ void rhi_vulkan_refresh_variables(void)
    unsigned old_scaling;
    struct retro_variable var = {0};
    bool requested_software_fb = false;
+   /* Owns the renderer for the rest of this function. */
+   vk_geometry_sync();
 
    var.key = BEETLE_OPT(renderer_software_fb);
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -20119,6 +20390,11 @@ void rhi_vulkan_refresh_variables(void)
          renderer_change_pending = true;
    }
    }
+
+   /* Software mirror, texture tracking and replacement can all have just been
+    * switched on, and each shares state with a path that is still
+    * synchronous. Re-test rather than assume the worker is still allowed. */
+   vk_geometry_revalidate();
 }
 
 static bool ensure_sync_index_resources(void)
@@ -20151,6 +20427,7 @@ static bool ensure_sync_index_resources(void)
  * state). */
 void rhi_vulkan_apply_pending_geometry(void)
 {
+   vk_geometry_sync();
    /* Fire a deferred geometry change recorded by refresh_variables. Called from
     * the top of retro_run BEFORE prepare_frame begins a frame, so the frontend's
     * synchronous video-driver reinit (context_destroy/context_reset) runs with
@@ -20194,6 +20471,7 @@ void rhi_vulkan_apply_pending_geometry(void)
 
 void rhi_vulkan_prepare_frame(void)
 {
+   vk_geometry_sync();
    inside_frame = false;
    if (device == NULL || renderer == NULL || vulkan == NULL)
    {
@@ -20249,6 +20527,7 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
 {
    unsigned index;
    ImageHandle scanout;
+   vk_geometry_frame_end();
    if (device == NULL || renderer == NULL || vulkan == NULL)
       return;
 
@@ -20470,6 +20749,7 @@ void rhi_vulkan_set_tex_window(uint8_t tww, uint8_t twh,
    uint8_t tex_y_mask = ~(twh << 3);
    uint8_t tex_x_or   = (twx & tww) << 3;
    uint8_t tex_y_or   = (twy & twh) << 3;
+   vk_geometry_sync();
 
    if (renderer)
       {
@@ -20482,6 +20762,7 @@ void rhi_vulkan_set_tex_window(uint8_t tww, uint8_t twh,
 
 void rhi_vulkan_set_draw_offset(int16_t x, int16_t y)
 {
+   vk_geometry_sync();
    if (renderer)
    {
       renderer->render_state.draw_offset_x = x;
@@ -20496,6 +20777,7 @@ void rhi_vulkan_set_draw_area(uint16_t x0, uint16_t y0,
 {
    int width  = x1 - x0 + 1;
    int height = y1 - y0 + 1;
+   vk_geometry_sync();
    if (width  < 0) width  = 0;
    if (height < 0) height = 0;
 
@@ -20521,6 +20803,7 @@ void rhi_vulkan_set_draw_area(uint16_t x0, uint16_t y0,
 
 void rhi_vulkan_set_vram_framebuffer_coords(uint32_t xstart, uint32_t ystart)
 {
+   vk_geometry_sync();
    if (renderer)
       renderer_set_vram_framebuffer_coords(renderer, xstart, ystart);
    else
@@ -20529,6 +20812,7 @@ void rhi_vulkan_set_vram_framebuffer_coords(uint32_t xstart, uint32_t ystart)
 
 void rhi_vulkan_set_horizontal_display_range(uint16_t x1, uint16_t x2)
 {
+   vk_geometry_sync();
    if (renderer)
       renderer_set_horizontal_display_range(renderer, x1, x2);
    else
@@ -20537,6 +20821,7 @@ void rhi_vulkan_set_horizontal_display_range(uint16_t x1, uint16_t x2)
 
 void rhi_vulkan_set_vertical_display_range(uint16_t y1, uint16_t y2)
 {
+   vk_geometry_sync();
    if (renderer)
       renderer_set_vertical_display_range(renderer, y1, y2);
    else
@@ -20548,6 +20833,7 @@ void rhi_vulkan_set_display_mode(bool depth_24bpp,
                                  bool is_480i,
                                  int width_mode)
 {
+   vk_geometry_sync();
    if (renderer)
       renderer_set_display_mode(renderer, get_scanout_mode(depth_24bpp), is_pal,
                                  is_480i, (WidthMode)(width_mode));
@@ -20660,6 +20946,45 @@ void rhi_vulkan_push_triangle(
       int blend_mode,
       bool mask_test, bool set_mask)
 {
+   if (vk_geometry_worker && inside_frame && renderer)
+   {
+      rhi_defer_op_t op;
+      rhi_defer_queue_t q = {0};
+      q.ops = &op;
+      q.capacity = 1;
+      rhi_defer_push_triangle(&q, p0x, p0y, p0w, p1x, p1y, p1w, p2x, p2y, p2w, c0, c1, c2, precise_rgb,
+         fog, t0x, t0y, t1x, t1y, t2x, t2y, min_u, min_v, max_u, max_v, texpage_x, texpage_y, clut_x,
+         clut_y, texture_blend_mode, depth_shift, dither, blend_mode, mask_test, set_mask);
+      rhi_geometry_worker_push(vk_geometry_worker, &op);
+      return;
+   }
+   rhi_vulkan_push_triangle_direct(p0x, p0y, p0w, p1x, p1y, p1w, p2x, p2y, p2w, c0, c1, c2, precise_rgb,
+         fog, t0x, t0y, t1x, t1y, t2x, t2y, min_u, min_v, max_u, max_v, texpage_x, texpage_y, clut_x,
+         clut_y, texture_blend_mode, depth_shift, dither, blend_mode, mask_test, set_mask);
+}
+
+static void rhi_vulkan_push_triangle_direct(
+      float p0x, float p0y, float p0w,
+      float p1x, float p1y, float p1w,
+      float p2x, float p2y, float p2w,
+      uint32_t c0,
+      uint32_t c1,
+      uint32_t c2,
+      const float *precise_rgb,
+      const float *fog,
+      uint16_t t0x, uint16_t t0y,
+      uint16_t t1x, uint16_t t1y,
+      uint16_t t2x, uint16_t t2y,
+      uint16_t min_u, uint16_t min_v,
+      uint16_t max_u, uint16_t max_v,
+      uint16_t texpage_x, uint16_t texpage_y,
+      uint16_t clut_x, uint16_t clut_y,
+      uint8_t texture_blend_mode,
+      uint8_t depth_shift,
+      bool dither,
+      int blend_mode,
+      bool mask_test, bool set_mask)
+{
    if (!renderer)
       return;
 
@@ -20689,6 +21014,48 @@ void rhi_vulkan_push_triangle(
 }
 
 void rhi_vulkan_push_quad(
+      float p0x, float p0y, float p0w,
+      float p1x, float p1y, float p1w,
+      float p2x, float p2y, float p2w,
+      float p3x, float p3y, float p3w,
+      uint32_t c0, uint32_t c1, uint32_t c2, uint32_t c3,
+      const float *precise_rgb,
+      const float *fog,
+      uint16_t t0x, uint16_t t0y, 
+      uint16_t t1x, uint16_t t1y,
+      uint16_t t2x, uint16_t t2y,
+      uint16_t t3x, uint16_t t3y,
+      uint16_t min_u, uint16_t min_v,
+      uint16_t max_u, uint16_t max_v,
+      uint16_t texpage_x, uint16_t texpage_y,
+      uint16_t clut_x, uint16_t clut_y,
+      uint8_t texture_blend_mode,
+      uint8_t depth_shift,
+      bool dither,
+      int blend_mode,
+      bool mask_test, bool set_mask,
+      bool is_sprite, bool may_be_2d)
+{
+   if (vk_geometry_worker && inside_frame && renderer)
+   {
+      rhi_defer_op_t op;
+      rhi_defer_queue_t q = {0};
+      q.ops = &op;
+      q.capacity = 1;
+      rhi_defer_push_quad(&q, p0x, p0y, p0w, p1x, p1y, p1w, p2x, p2y, p2w, p3x, p3y, p3w, c0, c1, c2, c3,
+         precise_rgb, fog, t0x, t0y, t1x, t1y, t2x, t2y, t3x, t3y, min_u, min_v, max_u, max_v, texpage_x,
+         texpage_y, clut_x, clut_y, texture_blend_mode, depth_shift, dither, blend_mode, mask_test,
+         set_mask, is_sprite, may_be_2d);
+      rhi_geometry_worker_push(vk_geometry_worker, &op);
+      return;
+   }
+   rhi_vulkan_push_quad_direct(p0x, p0y, p0w, p1x, p1y, p1w, p2x, p2y, p2w, p3x, p3y, p3w, c0, c1, c2, c3,
+         precise_rgb, fog, t0x, t0y, t1x, t1y, t2x, t2y, t3x, t3y, min_u, min_v, max_u, max_v, texpage_x,
+         texpage_y, clut_x, clut_y, texture_blend_mode, depth_shift, dither, blend_mode, mask_test,
+         set_mask, is_sprite, may_be_2d);
+}
+
+static void rhi_vulkan_push_quad_direct(
       float p0x, float p0y, float p0w,
       float p1x, float p1y, float p1w,
       float p2x, float p2y, float p2w,
@@ -20755,6 +21122,28 @@ void rhi_vulkan_push_line(
       int blend_mode,
       bool mask_test, bool set_mask)
 {
+   if (vk_geometry_worker && inside_frame && renderer)
+   {
+      rhi_defer_op_t op;
+      rhi_defer_queue_t q = {0};
+      q.ops = &op;
+      q.capacity = 1;
+      rhi_defer_push_line(&q, p0x, p0y, p1x, p1y, c0, c1, dither, blend_mode, mask_test, set_mask);
+      rhi_geometry_worker_push(vk_geometry_worker, &op);
+      return;
+   }
+   rhi_vulkan_push_line_direct(p0x, p0y, p1x, p1y, c0, c1, dither, blend_mode, mask_test, set_mask);
+}
+
+static void rhi_vulkan_push_line_direct(
+      int16_t p0x, int16_t p0y,
+      int16_t p1x, int16_t p1y,
+      uint32_t c0,
+      uint32_t c1,
+      bool dither,
+      int blend_mode,
+      bool mask_test, bool set_mask)
+{
    if (!renderer)
       return;
 
@@ -20783,6 +21172,7 @@ void rhi_vulkan_load_image(
       uint16_t *vram,
       bool mask_test, bool set_mask)
 {
+   vk_geometry_sync();
    if (!renderer)
    {
       /* Pre-context_reset uploads (e.g. savestate-load arriving before the
@@ -20880,6 +21270,7 @@ bool rhi_vulkan_read_vram(uint16_t x, uint16_t y,
                           uint16_t w, uint16_t h,
                           uint16_t *vram)
 {
+   vk_geometry_sync();
    if (!renderer)
       return false;
    {
@@ -20892,6 +21283,7 @@ void rhi_vulkan_fill_rect(uint32_t color,
                           uint16_t x, uint16_t y,
                           uint16_t w, uint16_t h)
 {
+   vk_geometry_sync();
    if (renderer)
    {
       TTRect _r = { x, y, w, h };
@@ -20904,6 +21296,7 @@ void rhi_vulkan_copy_rect(uint16_t src_x, uint16_t src_y,
                           uint16_t w, uint16_t h, 
                           bool mask_test, bool set_mask)
 {
+   vk_geometry_sync();
    if (!renderer)
       return;
    renderer->render_state.mask_test      = mask_test;
@@ -20917,6 +21310,7 @@ void rhi_vulkan_copy_rect(uint16_t src_x, uint16_t src_y,
 
 void rhi_vulkan_toggle_display(bool status)
 {
+   vk_geometry_sync();
    if (renderer)
    {
       bool enable = status == 0;

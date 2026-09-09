@@ -6,7 +6,7 @@ THREADS := $(ROOT)/libretro-common/rthreads/rthreads.c
 AFFINITY := $(ROOT)/mednafen/worker_affinity.c
 
 .PHONY: check
-check: $(BUILD_DIR)/spu $(BUILD_DIR)/workers $(BUILD_DIR)/affinity $(BUILD_DIR)/gpu-timing $(BUILD_DIR)/recompiler $(BUILD_DIR)/performance $(BUILD_DIR)/dma $(BUILD_DIR)/event-scheduler $(BUILD_DIR)/gpu-stage $(BUILD_DIR)/fastfifo
+check: $(BUILD_DIR)/spu $(BUILD_DIR)/workers $(BUILD_DIR)/affinity $(BUILD_DIR)/gpu-timing $(BUILD_DIR)/recompiler $(BUILD_DIR)/performance $(BUILD_DIR)/dma $(BUILD_DIR)/event-scheduler $(BUILD_DIR)/gpu-stage $(BUILD_DIR)/fastfifo $(BUILD_DIR)/geometry-worker
 	$(BUILD_DIR)/spu
 	$(BUILD_DIR)/workers
 	$(BUILD_DIR)/affinity
@@ -17,6 +17,7 @@ check: $(BUILD_DIR)/spu $(BUILD_DIR)/workers $(BUILD_DIR)/affinity $(BUILD_DIR)/
 	$(BUILD_DIR)/event-scheduler
 	$(BUILD_DIR)/gpu-stage
 	$(BUILD_DIR)/fastfifo
+	$(BUILD_DIR)/geometry-worker
 
 $(BUILD_DIR)/fastfifo: fastfifo.c $(ROOT)/mednafen/psx/FastFIFO.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) fastfifo.c -o $@
@@ -59,3 +60,6 @@ $(BUILD_DIR)/event-scheduler: event_scheduler.c $(ROOT)/mednafen/psx/dma.c $(ROO
 
 $(BUILD_DIR)/gpu-stage: gpu_stage.c $(ROOT)/mednafen/psx/gpu_stage_policy.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) gpu_stage.c -o $@
+
+$(BUILD_DIR)/geometry-worker: geometry_worker.c thread_faults.h $(ROOT)/rhi/rhi_geometry_worker.c $(ROOT)/rhi/rhi_geometry_worker.h $(ROOT)/rhi/rhi_defer.c $(ROOT)/mednafen/rthreads_worker.c $(THREADS) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) geometry_worker.c $(ROOT)/rhi/rhi_defer.c $(THREADS) -pthread -o $@
