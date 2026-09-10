@@ -2382,6 +2382,12 @@ static unsigned CalcDiscSCEx(void)
       unsigned i;
       for (i = 0; i < cdifs.count; i++)
       {
+         if (!cdifs.items[i])
+         {
+            cdifs.scex_ids[i] = NULL;
+            continue;
+         }
+
          uint8_t buf[2048];
          uint8_t fbuf[2048 + 1];
          char serial[BEETLE_DISC_SERIAL_SIZE];
@@ -4008,6 +4014,8 @@ int StateAction(StateMem *sm, int load, int data_only)
    if(load)
    {
       ForceEventUpdates(0); // FIXME to work with debugger step mode.
+      if (ret)
+         eject_state = CD_TrayOpen;
    }
 
    return(ret);
@@ -4297,9 +4305,15 @@ static bool disk_set_image_index(unsigned index)
 {
    unsigned num_images = disk_get_num_images();
 
-   /* The frontend's contract on this callback is that index is in
-    * [0, num_images). Be defensive: refuse impossible values rather
-    * than letting them flow through to CD_SelectedDisc--. */
+   /* An index of num_images is a request to eject the disc in the libretro API. */
+   if (index == num_images)
+   {
+      eject_state = true;
+      CD_SelectedDisc = -1;
+      DoSimpleCommand(MDFN_MSC_EJECT_DISK);
+      return true;
+   }
+
    if (num_images == 0)
       return false;
    if (index >= num_images)
@@ -7250,8 +7264,11 @@ void retro_run(void)
          /* Smart height geometry trigger */
          if (crop_overscan == 2)
          {
-            /* Get rid of startup logo shift */
-            if (currently_interlaced || PrevInterlaced)
+            /* Get rid of startup logo shift. Keyed on the 239-line window
+             * the BIOS programs, not on the cropped height, so user
+             * scanline crops on a 240-line title cannot trigger it. */
+            if ((currently_interlaced || PrevInterlaced) &&
+                GPU_get_vertical_range_lines() == 239)
             {
                if (height == 478 || height == 239)
                   height = (height == 239) ? 236 : 472;
@@ -7482,6 +7499,7 @@ void retro_deinit(void)
    SPU_Worker_Kill();
 
    VCD_Kill();
+   input_deinit_env();
 
    if (surf)
    {
@@ -7543,6 +7561,12 @@ void retro_deinit(void)
    libretro_supports_bitmasks          = false;
    libretro_msg_interface_version      = 0;
    enable_variable_serialization_size  = false;
+
+   /* Frontend callbacks may point into a dynamically loaded module. Do not
+    * retain them across sessions, since the frontend can be reloaded at a
+    * different address before the core is initialized again. */
+   led_state_cb = NULL;
+   memset(retro_led_state, 0, sizeof(retro_led_state));
 }
 
 unsigned retro_get_region(void)
@@ -7563,7 +7587,7 @@ unsigned retro_api_version(void)
 void retro_set_environment(retro_environment_t cb)
 {
    struct retro_vfs_interface_info vfs_iface_info;
-   struct retro_led_interface led_interface;
+   struct retro_led_interface led_interface = {0};
    environ_cb = cb;
 
    libretro_supports_option_categories = false;
@@ -7581,9 +7605,12 @@ void retro_set_environment(retro_environment_t cb)
    vfs_hybrid_init(environ_cb, NULL);
 #endif
 
-   if (environ_cb(RETRO_ENVIRONMENT_GET_LED_INTERFACE, &led_interface))
-      if (led_interface.set_led_state && !led_state_cb)
-         led_state_cb = led_interface.set_led_state;
+   /* Always refresh this frontend-owned callback. In particular, a frontend
+    * module can be unloaded and reloaded while the core remains resident. */
+   led_state_cb = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_LED_INTERFACE, &led_interface) &&
+       led_interface.set_led_state)
+      led_state_cb = led_interface.set_led_state;
 
    input_set_env(cb);
 

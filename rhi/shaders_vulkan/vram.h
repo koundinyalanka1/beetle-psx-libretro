@@ -1,11 +1,17 @@
 #ifndef VRAM_H
 #define VRAM_H
 
-layout(location = 1) in mediump vec2 vUV;
+/* vUV and vTexLimits must be highp. The rhi sends UINT16_MAX limits to
+ * disable clamping under a texture window; a driver honouring
+ * RelaxedPrecision with 16-bit integers (Adreno, Mali) folds that to -1
+ * and clamp_coord() collapses every texel to base - 1. vUV in fp16 loses
+ * the sub-texel fraction above u = 128, which mis-selects texels under
+ * upscaling. vParam, vBaseUV and vWindow stay within int16 range. */
+layout(location = 1) in highp vec2 vUV;
 layout(location = 2) flat in mediump ivec3 vParam;
 layout(location = 3) flat in mediump ivec2 vBaseUV;
 layout(location = 4) flat in mediump ivec4 vWindow;
-layout(location = 5) flat in mediump ivec4 vTexLimits;
+layout(location = 5) flat in highp ivec4 vTexLimits;
 #if defined(UNSCALED)
 layout(set = 0, binding = 0) uniform mediump usampler2D uFramebuffer;
 #else
@@ -17,6 +23,8 @@ layout(set = 0, binding = 0) uniform mediump sampler2D uFramebuffer;
 #endif
 #endif
 layout(constant_id = 4) const int SHIFT = 0;
+/* Retained copy of the selected CLUT (see fbatlas_palette_preserve). */
+layout(set = 0, binding = 5) uniform highp usampler2D uPalette;
 
 vec2 clamp_coord(vec2 coord)
 {
@@ -56,6 +64,11 @@ vec4 sample_vram_atlas(vec2 uvv)
 #endif
         int mask = (1 << bpp) - 1;
         value = (value >> align) & mask;
+
+        /* 0x1000: the row was overwritten after the palette was latched;
+         * the entries the GPU still holds live in uPalette. */
+        if ((params.z & 0x1000) != 0)
+            return abgr1555(texelFetch(uPalette, ivec2(value, 0), 0).x);
 
         params.x += value;
         coord = params.xy;

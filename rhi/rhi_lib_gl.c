@@ -764,6 +764,8 @@ struct gl_command_vertex {
    /* The primitive samples VRAM content produced by GPU rendering rather
     * than only game-uploaded texture data. */
    uint8_t framebuffer_feedback;
+   /* Read indexed colors from the retained CLUT instead of live VRAM. */
+   uint8_t palette_cached;
    /* Depth-cue sidecar: far colour (1.0 == 0xFF) in [0..2], blend factor in
     * [3]. t == 0 makes the shader mix the identity, so vertices without a
     * recovered cue cost nothing. KEEP LAST -- positional initializers above
@@ -1045,6 +1047,8 @@ struct gl_renderer {
    gl_draw_config config;
    /* gl_framebuffer used as a shader input for texturing draw commands */
    gl_texture fb_texture;
+   /* Retained copy of the selected CLUT when VRAM overwrites it. */
+   gl_texture palette_texture;
    /* gl_framebuffer used as an output when running draw commands */
    gl_texture fb_out;
 
@@ -1184,6 +1188,13 @@ struct gl_renderer {
       struct gl_vram_sync_tile tiles
             [GL_VRAM_SYNC_TILES_Y][GL_VRAM_SYNC_TILES_X];
    } vram_sync;
+
+   uint16_t palette_cache_x;
+   uint16_t palette_cache_y;
+   uint8_t palette_cache_depth;
+   bool palette_cache_gpu_written;
+   bool palette_cache_valid;
+   bool palette_cache_saved;
 };
 typedef struct gl_renderer gl_renderer;
 
@@ -2916,6 +2927,80 @@ static void gl_vram_sync_mirror_rect(gl_renderer *renderer,
 }
 #endif
 
+#ifdef GL_READ_FRAMEBUFFER
+static bool gl_palette_cache_overlaps(const gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   unsigned palette_width;
+   unsigned dx;
+   unsigned px;
+
+   if (!renderer->palette_cache_valid || !w || !h)
+      return false;
+
+   x %= VRAM_WIDTH_PIXELS;
+   y %= VRAM_HEIGHT;
+   w = w < VRAM_WIDTH_PIXELS ? w : VRAM_WIDTH_PIXELS;
+   h = h < VRAM_HEIGHT ? h : VRAM_HEIGHT;
+   if ((renderer->palette_cache_y + VRAM_HEIGHT - y) % VRAM_HEIGHT >= h)
+      return false;
+
+   palette_width = renderer->palette_cache_depth == 1 ? 256u : 16u;
+   dx = (renderer->palette_cache_x + VRAM_WIDTH_PIXELS - x) % VRAM_WIDTH_PIXELS;
+   px = (x + VRAM_WIDTH_PIXELS - renderer->palette_cache_x) % VRAM_WIDTH_PIXELS;
+   return dx < w || px < palette_width;
+}
+
+static void gl_palette_cache_preserve(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   unsigned palette_width;
+   unsigned first_width;
+
+   if (renderer->palette_cache_saved ||
+       !gl_caps.fp_glBlitFramebuffer ||
+       !gl_palette_cache_overlaps(renderer, x, y, w, h))
+      return;
+
+   palette_width = renderer->palette_cache_depth == 1 ? 256u : 16u;
+   first_width = palette_width < VRAM_WIDTH_PIXELS - renderer->palette_cache_x
+         ? palette_width : VRAM_WIDTH_PIXELS - renderer->palette_cache_x;
+
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, renderer->vram_sync_read_fbo);
+#ifdef HAVE_OPENGLES3
+   glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         GL_TEXTURE_2D, renderer->fb_texture.id, 0);
+#else
+   glFramebufferTexture(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+         renderer->fb_texture.id, 0);
+#endif
+   glReadBuffer(GL_COLOR_ATTACHMENT0);
+   glBindTexture(GL_TEXTURE_2D, renderer->palette_texture.id);
+   glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+         renderer->palette_cache_x, renderer->palette_cache_y,
+         first_width, 1);
+
+   if (first_width < palette_width)
+      glCopyTexSubImage2D(GL_TEXTURE_2D, 0, first_width, 0,
+            0, renderer->palette_cache_y,
+            palette_width - first_width, 1);
+
+   glBindTexture(GL_TEXTURE_2D, renderer->fb_texture.id);
+   glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+   renderer->palette_cache_saved = true;
+}
+#else
+static void gl_palette_cache_preserve(gl_renderer *renderer,
+      unsigned x, unsigned y, unsigned w, unsigned h)
+{
+   (void)renderer;
+   (void)x;
+   (void)y;
+   (void)w;
+   (void)h;
+}
+#endif
+
 static void gl_vram_sync_primitive(gl_renderer *renderer,
       gl_command_vertex *v, unsigned vertices)
 {
@@ -2945,6 +3030,7 @@ static void gl_vram_sync_primitive(gl_renderer *renderer,
       bool clut_dirty = false;
       bool texture_gpu_written;
       bool clut_gpu_written = false;
+      bool clut_cached = false;
 
       if (texture_rect.height && !texture_rect.width)
          texture_rect.width = 1;
@@ -2956,10 +3042,28 @@ static void gl_vram_sync_primitive(gl_renderer *renderer,
             texture_rect.width, texture_rect.height);
       if (depth == 1 || depth == 2)
       {
-         clut_dirty = gl_vram_sync_rect_is_dirty(renderer,
-               v[0].clut[0], v[0].clut[1], clut_width, 1);
-         clut_gpu_written = gl_vram_sync_rect_is_gpu_written(renderer,
-               v[0].clut[0], v[0].clut[1], clut_width, 1);
+         clut_cached = renderer->palette_cache_valid &&
+               renderer->palette_cache_depth == depth &&
+               renderer->palette_cache_x == v[0].clut[0] &&
+               renderer->palette_cache_y == v[0].clut[1];
+         if (clut_cached)
+            clut_gpu_written = renderer->palette_cache_gpu_written;
+         else
+         {
+            if (renderer->palette_cache_saved &&
+                !gl_draw_buffer_is_empty(renderer->command_buffer))
+               gl_renderer_draw(renderer);
+            renderer->palette_cache_saved = false;
+            clut_dirty = gl_vram_sync_rect_is_dirty(renderer,
+                  v[0].clut[0], v[0].clut[1], clut_width, 1);
+            clut_gpu_written = gl_vram_sync_rect_is_gpu_written(renderer,
+                  v[0].clut[0], v[0].clut[1], clut_width, 1);
+            renderer->palette_cache_x = v[0].clut[0];
+            renderer->palette_cache_y = v[0].clut[1];
+            renderer->palette_cache_depth = (uint8_t)depth;
+            renderer->palette_cache_gpu_written = clut_gpu_written;
+            renderer->palette_cache_valid = true;
+         }
       }
 
       framebuffer_feedback = texture_gpu_written || clut_gpu_written;
@@ -2984,9 +3088,6 @@ static void gl_vram_sync_primitive(gl_renderer *renderer,
       }
    }
 #endif
-
-   for (i = 0; i < vertices; i++)
-      v[i].framebuffer_feedback = framebuffer_feedback;
 
    min_x = max_x = v[0].position[0] + renderer->config.draw_offset[0];
    min_y = max_y = v[0].position[1] + renderer->config.draw_offset[1];
@@ -3021,8 +3122,18 @@ static void gl_vram_sync_primitive(gl_renderer *renderer,
    if (y1 > VRAM_HEIGHT) y1 = VRAM_HEIGHT;
 
    if (x1 > x0 && y1 > y0)
+   {
+      gl_palette_cache_preserve(renderer, (unsigned)x0, (unsigned)y0,
+            (unsigned)(x1 - x0), (unsigned)(y1 - y0));
       gl_vram_sync_mark_rect(renderer, (unsigned)x0, (unsigned)y0,
             (unsigned)(x1 - x0), (unsigned)(y1 - y0));
+   }
+
+   for (i = 0; i < vertices; i++)
+   {
+      v[i].framebuffer_feedback = framebuffer_feedback;
+      v[i].palette_cached = renderer->palette_cache_saved;
+   }
 }
 
 /* Per-primitive HD query (Vulkan renderer_get_hd_texture_index
@@ -3547,6 +3658,10 @@ static void gl_renderer_draw(gl_renderer *renderer)
       glUniform1i(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "fb_texture"), 0);
       /* HD replacement texture lives on unit 1 */
       glUniform1i(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "hd_texture"), 1);
+      glUniform1i(gl_uniform_map_get(&renderer->command_buffer->program->uniforms, "palette_texture"), 2);
+      glActiveTexture(GL_TEXTURE2);
+      glBindTexture(GL_TEXTURE_2D, renderer->palette_texture.id);
+      glActiveTexture(GL_TEXTURE0);
    }
 
    /* Bind and unmap the command buffer */
@@ -3753,6 +3868,9 @@ static void gl_renderer_upload_textures(
 
    if (!gl_draw_buffer_is_empty(renderer->command_buffer))
       gl_renderer_draw(renderer);
+
+   gl_palette_cache_preserve(renderer, top_left[0], top_left[1],
+         dimensions[0], dimensions[1]);
 
    gl_texture_set_sub_image_window(
          &renderer->fb_texture,
@@ -4071,6 +4189,7 @@ static bool gl_renderer_new(gl_renderer *renderer, gl_draw_config config)
     * meaningfully upscale it since most games use paletted
     * textures. */
    gl_texture_init(&renderer->fb_texture, native_width, native_height, GL_RGB5_A1);
+   gl_texture_init(&renderer->palette_texture, 256, 1, GL_RGB5_A1);
 
    renderer->fb_out_fp16 = psx_color_format != 0 && gl_fp16_renderable();
 
@@ -5082,6 +5201,11 @@ static void gl_renderer_free(gl_renderer *renderer)
    renderer->fb_texture.width  = 0;
    renderer->fb_texture.height = 0;
 
+   glDeleteTextures(1, &renderer->palette_texture.id);
+   renderer->palette_texture.id     = 0;
+   renderer->palette_texture.width  = 0;
+   renderer->palette_texture.height = 0;
+
    glDeleteTextures(1, &renderer->fb_out.id);
    renderer->fb_out.id     = 0;
    renderer->fb_out.width  = 0;
@@ -5278,6 +5402,16 @@ static gl_display_rect compute_gl_display_rect(gl_renderer *renderer)
             height = (h < 0 ? 0 : (uint32_t) h);
             y = (256 - renderer->config.display_area_vrange[1]) + (renderer->last_scanline - 239);
         }
+   }
+   /* Startup-logo shift, keyed on the programmed window rather than the
+    * cropped height (see the Vulkan renderer). The viewport origin is
+    * lower-left, so the bottom edge moves down by the same six lines the
+    * height loses and the top line stays where software and Vulkan put it. */
+   if (renderer->crop_overscan == 2 && renderer->config.is_480i &&
+       renderer->config.display_area_vrange[1] - renderer->config.display_area_vrange[0] == 239)
+   {
+      height = 236;
+      y -= 3;
    }
    height *= (renderer->config.is_480i ? 2 : 1);
    y *= (renderer->config.is_480i ? 2 : 1);
@@ -5994,6 +6128,8 @@ static const struct gl_attribute gl_command_vertex_attribs[] = {
    { "texture_window",     offsetof(gl_command_vertex, texture_window),     GL_UNSIGNED_BYTE,  4 },
    { "framebuffer_feedback",
       offsetof(gl_command_vertex, framebuffer_feedback), GL_UNSIGNED_BYTE, 1 },
+   { "palette_cached",
+      offsetof(gl_command_vertex, palette_cached), GL_UNSIGNED_BYTE, 1 },
    { "texture_limits",     offsetof(gl_command_vertex, texture_limits),     GL_UNSIGNED_SHORT, 4 }
 };
 
@@ -7286,6 +7422,27 @@ void rhi_gl_set_tex_window(uint8_t tww, uint8_t twh, uint8_t twx, uint8_t twy)
    renderer->tex_y_or   = (twy & twh) << 3;
 }
 
+void rhi_gl_invalidate_clut_cache(void)
+{
+   gl_renderer *renderer;
+
+   if (static_renderer.state == GL_STATE_INVALID)
+      return;
+
+   renderer = static_renderer.state_data;
+   if (!renderer)
+      return;
+
+   /* Queued draws still address the retained texture; issue them before a
+    * later preserve is allowed to overwrite it. */
+   if (renderer->palette_cache_saved &&
+       !gl_draw_buffer_is_empty(renderer->command_buffer))
+      gl_renderer_draw(renderer);
+
+   renderer->palette_cache_valid = false;
+   renderer->palette_cache_saved = false;
+}
+
 void rhi_gl_set_mask_setting(uint32_t mask_set_or, uint32_t mask_eval_and)
 {
    /* No-op for the GL backend.  The PS1 GPU's mask state
@@ -8054,6 +8211,8 @@ void rhi_gl_load_image(
 
    if (!gl_draw_buffer_is_empty(renderer->command_buffer))
       gl_renderer_draw(renderer);
+
+   gl_palette_cache_preserve(renderer, x, y, w, h);
 
    gl_texture_set_sub_image_window(
          &renderer->fb_texture,
@@ -8930,6 +9089,8 @@ void rhi_gl_fill_rect(
    if (!gl_draw_buffer_is_empty(renderer->command_buffer))
       gl_renderer_draw(renderer);
 
+   gl_palette_cache_preserve(renderer, x, y, w, h);
+
    /* Fill rect ignores the draw area. Save the previous value
     * and reconfigure the scissor box to the fill rectangle
     * instead. */
@@ -9297,6 +9458,10 @@ void rhi_gl_copy_rect(
    /* Draw pending commands */
    if (!gl_draw_buffer_is_empty(renderer->command_buffer))
       gl_renderer_draw(renderer);
+
+   /* The retained CLUT has to be rescued before the copy overwrites the
+    * VRAM row it was sourced from. */
+   gl_palette_cache_preserve(renderer, dst_x, dst_y, w, h);
 
    /* Both live surfaces move: fb_out because it is what gets displayed, and
     * fb_native because the copy is guest-visible VRAM movement that a later
