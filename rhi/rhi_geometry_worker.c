@@ -152,6 +152,10 @@ static bool geometry_op_is_queueable(rhi_defer_kind_t kind)
       case RHI_DEFER_SET_VERTICAL_DISPLAY_RANGE:
       case RHI_DEFER_SET_DISPLAY_MODE:
       case RHI_DEFER_TOGGLE_DISPLAY:
+      /* Payload-free, so trivially value-owned, and it is queued for the same
+       * reason as the state-sets above: the retained CLUT must be dropped at
+       * the guest's position in the stream, not underneath queued draws. */
+      case RHI_DEFER_INVALIDATE_CLUT_CACHE:
          return true;
       default:
          return false;

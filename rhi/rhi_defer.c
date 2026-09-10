@@ -514,3 +514,9 @@ void rhi_defer_push_toggle_display(rhi_defer_queue_t *q, bool status)
       return;
    op->u.toggle_display.status = status;
 }
+
+void rhi_defer_push_invalidate_clut_cache(rhi_defer_queue_t *q)
+{
+   /* No payload: the op is the whole message. */
+   rhi_defer_alloc_slot(q, RHI_DEFER_INVALIDATE_CLUT_CACHE);
+}

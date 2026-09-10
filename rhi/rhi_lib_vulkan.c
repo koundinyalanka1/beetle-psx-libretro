@@ -19699,6 +19699,7 @@ static void rhi_vulkan_push_line_direct(
       bool dither,
       int blend_mode,
       bool mask_test, bool set_mask);
+static void rhi_vulkan_invalidate_clut_cache_direct(void);
 static void vk_geometry_dispatch(void *user, const rhi_defer_op_t *op)
 {
    (void)user;
@@ -19804,6 +19805,9 @@ static void vk_geometry_dispatch(void *user, const rhi_defer_op_t *op)
          break;
       case RHI_DEFER_TOGGLE_DISPLAY:
          rhi_vulkan_toggle_display_direct(op->u.toggle_display.status);
+         break;
+      case RHI_DEFER_INVALIDATE_CLUT_CACHE:
+         rhi_vulkan_invalidate_clut_cache_direct();
          break;
       default:
          abort();
@@ -20054,6 +20058,9 @@ static void vk_defer_dispatch(void *user, const rhi_defer_op_t *op)
       }
       case RHI_DEFER_TOGGLE_DISPLAY:
          rhi_vulkan_toggle_display(op->u.toggle_display.status);
+         break;
+      case RHI_DEFER_INVALIDATE_CLUT_CACHE:
+         rhi_vulkan_invalidate_clut_cache();
          break;
    }
 }
@@ -21037,12 +21044,32 @@ void rhi_vulkan_finalize_frame(const void *fb, unsigned width,
 
 /* Draw commands */
 
-void rhi_vulkan_invalidate_clut_cache(void)
+static void rhi_vulkan_invalidate_clut_cache_direct(void)
 {
-   /* Nothing to defer: before the renderer exists no palette has been
-    * latched, so there is nothing to drop. */
+   /* Before the renderer exists no palette has been latched, so there is
+    * nothing to drop. */
    if (renderer)
       fbatlas_invalidate_palette_cache(&renderer->atlas);
+}
+
+void rhi_vulkan_invalidate_clut_cache(void)
+{
+   /* Ordered rather than exclusive, for the same reason as the state setters:
+    * geometry already queued behind the worker still samples the retained
+    * palette, so dropping it underneath that work would recolour draws that
+    * were recorded while it was still live. */
+   if (vk_geometry_worker && inside_frame && renderer)
+   {
+      rhi_defer_op_t op;
+      rhi_defer_queue_t q = {0};
+      q.ops = &op;
+      q.capacity = 1;
+      rhi_defer_push_invalidate_clut_cache(&q);
+      if (rhi_geometry_worker_queue_if_busy(vk_geometry_worker, &op))
+         return;
+   }
+   vk_geometry_sync();
+   rhi_vulkan_invalidate_clut_cache_direct();
 }
 
 void rhi_vulkan_set_tex_window(uint8_t tww, uint8_t twh,

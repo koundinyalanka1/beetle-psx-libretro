@@ -6609,6 +6609,9 @@ static void gl_defer_dispatch(void *user, const rhi_defer_op_t *op)
                           op->u.copy_rect.w, op->u.copy_rect.h,
                           op->u.copy_rect.mask_test, op->u.copy_rect.set_mask);
          break;
+      case RHI_DEFER_INVALIDATE_CLUT_CACHE:
+         rhi_gl_invalidate_clut_cache();
+         break;
    }
 }
 
@@ -7430,8 +7433,15 @@ void rhi_gl_invalidate_clut_cache(void)
       return;
 
    renderer = static_renderer.state_data;
-   if (!renderer)
+   /* GP0(01) is executed by the GPU worker, and the flush below is a real GL
+    * call, so this has to travel the same journal as every other recorded
+    * entry point - both to stay off the worker thread and to keep the drop
+    * at its own point in the command stream. */
+   if (gl_should_defer(renderer))
+   {
+      rhi_defer_push_invalidate_clut_cache(&gl_defer_queue);
       return;
+   }
 
    /* Queued draws still address the retained texture; issue them before a
     * later preserve is allowed to overwrite it. */

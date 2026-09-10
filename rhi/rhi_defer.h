@@ -73,7 +73,12 @@ typedef enum
    RHI_DEFER_PUSH_QUAD,
    RHI_DEFER_PUSH_LINE,
    RHI_DEFER_FILL_RECT,
-   RHI_DEFER_COPY_RECT
+   RHI_DEFER_COPY_RECT,
+
+   /* GP0(01)/reset dropping a retained CLUT.  Recorded rather than applied
+    * at the call site: it arrives from the GPU worker, and draws already
+    * queued ahead of it still sample the retained palette. */
+   RHI_DEFER_INVALIDATE_CLUT_CACHE
 } rhi_defer_kind_t;
 
 /* Vertex attributes carried by a recorded triangle/quad.  precise_rgb is
@@ -351,6 +356,7 @@ void rhi_defer_stage_load_image(const rhi_defer_op_t *op,
 const uint16_t *rhi_defer_pixels(const rhi_defer_queue_t *q, size_t offset);
 
 void rhi_defer_push_toggle_display(rhi_defer_queue_t *q, bool status);
+void rhi_defer_push_invalidate_clut_cache(rhi_defer_queue_t *q);
 
 /* Drawing.  `precise_rgb` and `fog` may be NULL; when present they are copied
  * (nverts*3 and nverts*4 floats respectively), never aliased - they point at
