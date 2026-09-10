@@ -31,6 +31,9 @@ retro_time_t cpu_features_get_time_usec(void)
  * arrive. */
 static unsigned applied_clip;
 static bool check_interleave = true;
+/* Value of `consumed` when the CLUT drop was dispatched, so its position in
+ * the stream can be asserted rather than just its arrival. -1 = never seen. */
+static int invalidate_at = -1;
 
 static void draw(void *user, const rhi_defer_op_t *op)
 {
@@ -43,6 +46,11 @@ static void draw(void *user, const rhi_defer_op_t *op)
       if (check_interleave)
          assert(op->u.set_draw_area.x0 == (uint16_t)consumed);
       applied_clip = op->u.set_draw_area.x0;
+      return;
+   }
+   if (op->kind == RHI_DEFER_INVALIDATE_CLUT_CACHE)
+   {
+      invalidate_at = (int)consumed;
       return;
    }
    if (check_interleave)
@@ -213,6 +221,42 @@ int main(void)
    rhi_geometry_worker_stats(w, &stats);
    assert(stats.commands == 2 && stats.batches == 1);
 
+   /* GP0(01) dropping a retained CLUT rides the stream like the other state
+    * ops: draws already queued still sample that palette, so applying the drop
+    * ahead of them would recolour work recorded while it was still live. */
+   {
+      rhi_defer_op_t sop;
+      rhi_defer_queue_t sq = {0};
+      float rgb[9] = {0}, fog[12];
+      unsigned j;
+      sq.ops = &sop;
+      sq.capacity = 1;
+      consumed = 0;
+      invalidate_at = -1;
+      for (j = 0; j < 12; j++)
+         fog[j] = (float)j;
+
+      /* Payload-free and value-owned, so the worker will accept it. */
+      assert(geometry_op_is_queueable(RHI_DEFER_INVALIDATE_CLUT_CACHE));
+
+      /* Idle: the caller owns the backend and applies it directly. */
+      sq.count = 0;
+      rhi_defer_push_invalidate_clut_cache(&sq);
+      assert(!rhi_geometry_worker_queue_if_busy(w, &sop));
+
+      /* Busy: it must land after the primitive queued ahead of it. */
+      sq.count = 0;
+      rhi_defer_push_triangle(&sq, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 10, 11, rgb, fog,
+            13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 2, 1,
+            true, 2, true, true);
+      rhi_geometry_worker_push(w, &sop);
+      sq.count = 0;
+      rhi_defer_push_invalidate_clut_cache(&sq);
+      assert(rhi_geometry_worker_queue_if_busy(w, &sop));
+      rhi_geometry_worker_sync(w);
+      assert(consumed == 1 && invalidate_at == 1);
+   }
+
    rhi_geometry_worker_free(w);
    assert(!live_locks && !live_conds && !live_threads);
 
@@ -221,6 +265,6 @@ int main(void)
    assert(w);
    rhi_geometry_worker_free(w);
    assert(!live_locks && !live_conds && !live_threads);
-   puts("Geometry worker: 2104 ordered snapshots interleaved with in-stream state changes, queue-only-when-busy, backpressure, barriers, idle-barrier fast path, split stall accounting and startup failures passed");
+   puts("Geometry worker: 2104 ordered snapshots interleaved with in-stream state changes, queue-only-when-busy, in-stream CLUT invalidation, backpressure, barriers, idle-barrier fast path, split stall accounting and startup failures passed");
    return 0;
 }
